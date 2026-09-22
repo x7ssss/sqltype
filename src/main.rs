@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use sqltype::analyzer::analyze_query;
 use sqltype::catalog::{Catalog, DriverTarget};
 use sqltype::codegen::{CodegenOptions, generate_file_ts_with_options};
+use sqltype::ts_scanner::{is_query_file, is_ts_js_file, scan_ts_queries};
 use std::path::{Path, PathBuf};
 use std::process;
 use walkdir::WalkDir;
@@ -49,7 +50,7 @@ enum Commands {
 
         /// Directory where .ts files will be emitted
         #[arg(long, short = 'o')]
-        out: PathBuf,
+        out: Option<PathBuf>,
 
         /// Watch for file changes and re-generate TypeScript types incrementally
         #[arg(long, short = 'W')]
@@ -71,7 +72,7 @@ enum Commands {
     },
 }
 
-fn discover_sql_files<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, String> {
+fn discover_query_files<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, String> {
     let dir_path = dir.as_ref();
     if !dir_path.exists() {
         return Err(format!("Directory does not exist: {}", dir_path.display()));
@@ -81,10 +82,7 @@ fn discover_sql_files<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, String> {
     for entry in WalkDir::new(dir_path).follow_links(true) {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
-        if path.is_file()
-            && let Some(ext) = path.extension()
-            && ext.eq_ignore_ascii_case("sql")
-        {
+        if path.is_file() && is_query_file(path) {
             files.push(path.to_path_buf());
         }
     }
@@ -108,7 +106,7 @@ fn run_check(
         }
     };
 
-    let query_files = match discover_sql_files(queries_dir) {
+    let query_files = match discover_query_files(queries_dir) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("[Error] Failed to discover queries: {}", e);
@@ -117,11 +115,13 @@ fn run_check(
     };
 
     if query_files.is_empty() {
-        println!("No query .sql files found in {}", queries_dir.display());
+        println!("No query files found in {}", queries_dir.display());
         return Ok(());
     }
 
     let mut has_errors = false;
+    let mut total_queries = 0;
+
     for file in &query_files {
         let content = match std::fs::read_to_string(file) {
             Ok(c) => c,
@@ -136,30 +136,79 @@ fn run_check(
             }
         };
 
-        let filename = file
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("query.sql");
-
-        match analyze_query(&content, &catalog, Some(filename)) {
-            Ok(analyzed) => {
-                if wrappers {
-                    let options = CodegenOptions::new(driver, true);
-                    let _ =
-                        generate_file_ts_with_options(std::slice::from_ref(&analyzed), &options);
-                }
-                println!(
-                    "  ✓ [{}] {} ({} params, {} fields{})",
-                    analyzed.name,
-                    file.display(),
-                    analyzed.params.len(),
-                    analyzed.fields.len(),
-                    if wrappers { ", wrapper enabled" } else { "" }
-                );
+        if is_ts_js_file(file) {
+            let extracted = scan_ts_queries(&content);
+            if extracted.is_empty() {
+                continue;
             }
-            Err(e) => {
-                eprintln!("  ✗ [Error] {}: {}", file.display(), e);
-                has_errors = true;
+            for q in extracted {
+                total_queries += 1;
+                let fallback = q
+                    .name
+                    .as_deref()
+                    .or_else(|| file.file_stem().and_then(|s| s.to_str()));
+                match analyze_query(&q.sql, &catalog, fallback) {
+                    Ok(analyzed) => {
+                        if wrappers {
+                            let options = CodegenOptions::new(driver, true);
+                            let _ = generate_file_ts_with_options(
+                                std::slice::from_ref(&analyzed),
+                                &options,
+                            );
+                        }
+                        println!(
+                            "  ✓ [{}] {}:{}:{} ({} params, {} fields{})",
+                            analyzed.name,
+                            file.display(),
+                            q.line,
+                            q.column,
+                            analyzed.params.len(),
+                            analyzed.fields.len(),
+                            if wrappers { ", wrapper enabled" } else { "" }
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  ✗ [Error] {}:{}:{}: in query '{}': {}",
+                            file.display(),
+                            q.line,
+                            q.column,
+                            fallback.unwrap_or("Query"),
+                            e
+                        );
+                        has_errors = true;
+                    }
+                }
+            }
+        } else {
+            total_queries += 1;
+            let filename = file
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("query.sql");
+
+            match analyze_query(&content, &catalog, Some(filename)) {
+                Ok(analyzed) => {
+                    if wrappers {
+                        let options = CodegenOptions::new(driver, true);
+                        let _ = generate_file_ts_with_options(
+                            std::slice::from_ref(&analyzed),
+                            &options,
+                        );
+                    }
+                    println!(
+                        "  ✓ [{}] {} ({} params, {} fields{})",
+                        analyzed.name,
+                        file.display(),
+                        analyzed.params.len(),
+                        analyzed.fields.len(),
+                        if wrappers { ", wrapper enabled" } else { "" }
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  ✗ [Error] {}: {}", file.display(), e);
+                    has_errors = true;
+                }
             }
         }
     }
@@ -169,7 +218,8 @@ fn run_check(
         Err(())
     } else {
         println!(
-            "\n✓ All {} queries validated successfully against migration schema.",
+            "\n✓ All {} queries across {} files validated successfully against migration schema.",
+            total_queries,
             query_files.len()
         );
         Ok(())
@@ -179,7 +229,7 @@ fn run_check(
 fn run_generate(
     migrations_dir: &Path,
     queries_dir: &Path,
-    out_dir: &Path,
+    out_dir: Option<&Path>,
     driver: DriverTarget,
     wrappers: bool,
 ) -> Result<(), ()> {
@@ -191,7 +241,7 @@ fn run_generate(
         }
     };
 
-    let query_files = match discover_sql_files(queries_dir) {
+    let query_files = match discover_query_files(queries_dir) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("[Error] Failed to discover queries: {}", e);
@@ -200,12 +250,14 @@ fn run_generate(
     };
 
     if query_files.is_empty() {
-        println!("No query .sql files found in {}", queries_dir.display());
+        println!("No query files found in {}", queries_dir.display());
         return Ok(());
     }
 
-    let mut analyzed_queries = Vec::new();
+    let mut file_analyzed_queries: Vec<(PathBuf, Vec<sqltype::analyzer::AnalyzedQuery>)> =
+        Vec::new();
     let mut has_errors = false;
+    let mut total_query_count = 0;
 
     for file in &query_files {
         let content = match std::fs::read_to_string(file) {
@@ -221,18 +273,53 @@ fn run_generate(
             }
         };
 
-        let filename = file
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("query.sql");
-
-        match analyze_query(&content, &catalog, Some(filename)) {
-            Ok(analyzed) => {
-                analyzed_queries.push((file.clone(), analyzed));
+        if is_ts_js_file(file) {
+            let extracted = scan_ts_queries(&content);
+            if extracted.is_empty() {
+                continue;
             }
-            Err(e) => {
-                eprintln!("  ✗ [Error] {}: {}", file.display(), e);
-                has_errors = true;
+            let mut analyzed_list = Vec::new();
+            for q in extracted {
+                let fallback = q
+                    .name
+                    .as_deref()
+                    .or_else(|| file.file_stem().and_then(|s| s.to_str()));
+                match analyze_query(&q.sql, &catalog, fallback) {
+                    Ok(analyzed) => {
+                        analyzed_list.push(analyzed);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  ✗ [Error] {}:{}:{}: in query '{}': {}",
+                            file.display(),
+                            q.line,
+                            q.column,
+                            fallback.unwrap_or("Query"),
+                            e
+                        );
+                        has_errors = true;
+                    }
+                }
+            }
+            if !analyzed_list.is_empty() {
+                total_query_count += analyzed_list.len();
+                file_analyzed_queries.push((file.clone(), analyzed_list));
+            }
+        } else {
+            let filename = file
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("query.sql");
+
+            match analyze_query(&content, &catalog, Some(filename)) {
+                Ok(analyzed) => {
+                    total_query_count += 1;
+                    file_analyzed_queries.push((file.clone(), vec![analyzed]));
+                }
+                Err(e) => {
+                    eprintln!("  ✗ [Error] {}: {}", file.display(), e);
+                    has_errors = true;
+                }
             }
         }
     }
@@ -243,39 +330,79 @@ fn run_generate(
     }
 
     let options = CodegenOptions::new(driver, wrappers);
+    let mut generated_file_count = 0;
 
     // Write generated .ts files
-    for (file, analyzed) in &analyzed_queries {
-        let rel_path = file.strip_prefix(queries_dir).unwrap_or(file);
-        let out_file_path = out_dir.join(rel_path).with_extension("ts");
+    for (file, queries) in &file_analyzed_queries {
+        let ts_code = generate_file_ts_with_options(queries, &options);
 
-        if let Some(parent) = out_file_path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            eprintln!(
-                "[Error] Failed to create output directory {}: {}",
-                parent.display(),
-                e
-            );
-            return Err(());
-        }
+        if is_ts_js_file(file) {
+            // Sibling declaration file (e.g. users.ts -> users.sqltype.ts)
+            let sibling_path = file.with_extension("sqltype.ts");
+            if let Err(e) = std::fs::write(&sibling_path, &ts_code) {
+                eprintln!(
+                    "[Error] Failed to write TypeScript file {}: {}",
+                    sibling_path.display(),
+                    e
+                );
+                return Err(());
+            }
+            println!("  Generated: {}", sibling_path.display());
+            generated_file_count += 1;
 
-        let ts_code = generate_file_ts_with_options(std::slice::from_ref(analyzed), &options);
-        if let Err(e) = std::fs::write(&out_file_path, ts_code) {
-            eprintln!(
-                "[Error] Failed to write TypeScript file {}: {}",
-                out_file_path.display(),
-                e
-            );
-            return Err(());
+            // If out_dir is specified and not the same directory, also write to out_dir
+            if let Some(out) = out_dir {
+                let rel_path = file.strip_prefix(queries_dir).unwrap_or(file);
+                let out_file_path = out.join(rel_path).with_extension("sqltype.ts");
+                if out_file_path != sibling_path {
+                    if let Some(parent) = out_file_path.parent()
+                        && let Err(e) = std::fs::create_dir_all(parent)
+                    {
+                        eprintln!(
+                            "[Error] Failed to create output directory {}: {}",
+                            parent.display(),
+                            e
+                        );
+                        return Err(());
+                    }
+                    let _ = std::fs::write(&out_file_path, &ts_code);
+                }
+            }
+        } else {
+            let out_file_path = if let Some(out) = out_dir {
+                let rel_path = file.strip_prefix(queries_dir).unwrap_or(file);
+                out.join(rel_path).with_extension("ts")
+            } else {
+                file.with_extension("ts")
+            };
+
+            if let Some(parent) = out_file_path.parent()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                eprintln!(
+                    "[Error] Failed to create output directory {}: {}",
+                    parent.display(),
+                    e
+                );
+                return Err(());
+            }
+
+            if let Err(e) = std::fs::write(&out_file_path, &ts_code) {
+                eprintln!(
+                    "[Error] Failed to write TypeScript file {}: {}",
+                    out_file_path.display(),
+                    e
+                );
+                return Err(());
+            }
+            println!("  Generated: {}", out_file_path.display());
+            generated_file_count += 1;
         }
-        println!("  Generated: {}", out_file_path.display());
     }
 
     println!(
-        "\n✓ Successfully generated {} TypeScript files in {}.",
-        analyzed_queries.len(),
-        out_dir.display()
+        "\n✓ Successfully generated {} queries across {} files.",
+        total_query_count, generated_file_count
     );
     Ok(())
 }
@@ -298,10 +425,11 @@ fn main() {
             driver,
             wrappers,
         } => {
-            let res = run_generate(&migrations, &queries, &out, driver, wrappers);
+            let res = run_generate(&migrations, &queries, out.as_deref(), driver, wrappers);
             if res.is_ok() && watch {
+                let watch_out = out.as_deref().unwrap_or(&queries);
                 if let Err(e) =
-                    sqltype::watcher::run_watch(&migrations, &queries, &out, driver, wrappers)
+                    sqltype::watcher::run_watch(&migrations, &queries, watch_out, driver, wrappers)
                 {
                     eprintln!("[Watch Error] {}", e);
                     Err(())

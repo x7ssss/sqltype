@@ -1,6 +1,7 @@
 use crate::analyzer::analyze_query;
 use crate::catalog::{Catalog, DriverTarget};
 use crate::codegen::{CodegenOptions, generate_file_ts_with_options};
+use crate::ts_scanner::{is_query_file, is_ts_js_file, scan_ts_queries};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
-fn discover_sql_files<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, String> {
+fn discover_query_files<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, String> {
     let dir_path = dir.as_ref();
     if !dir_path.exists() {
         return Err(format!("Directory does not exist: {}", dir_path.display()));
@@ -18,16 +19,86 @@ fn discover_sql_files<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, String> {
     for entry in WalkDir::new(dir_path).follow_links(true) {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
-        if path.is_file()
-            && let Some(ext) = path.extension()
-            && ext.eq_ignore_ascii_case("sql")
-        {
+        if path.is_file() && is_query_file(path) {
             files.push(path.to_path_buf());
         }
     }
 
     files.sort();
     Ok(files)
+}
+
+fn process_and_generate_query_file(
+    q_path: &Path,
+    abs_queries: &Path,
+    abs_out: &Path,
+    catalog: &Catalog,
+    options: &CodegenOptions,
+) -> Result<usize, String> {
+    let content = std::fs::read_to_string(q_path)
+        .map_err(|e| format!("Failed to read {}: {}", q_path.display(), e))?;
+
+    let (analyzed_queries, is_ts) = if is_ts_js_file(q_path) {
+        let extracted = scan_ts_queries(&content);
+        if extracted.is_empty() {
+            return Ok(0);
+        }
+        let mut list = Vec::new();
+        for q in extracted {
+            let fallback = q
+                .name
+                .as_deref()
+                .or_else(|| q_path.file_stem().and_then(|s| s.to_str()));
+            let analyzed = analyze_query(&q.sql, catalog, fallback).map_err(|e| {
+                format!(
+                    "{}:{}:{}: in query '{}': {}",
+                    q_path.display(),
+                    q.line,
+                    q.column,
+                    fallback.unwrap_or("Query"),
+                    e
+                )
+            })?;
+            list.push(analyzed);
+        }
+        (list, true)
+    } else {
+        let filename = q_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("query.sql");
+        let analyzed = analyze_query(&content, catalog, Some(filename))
+            .map_err(|e| format!("{}: {}", q_path.display(), e))?;
+        (vec![analyzed], false)
+    };
+
+    let count = analyzed_queries.len();
+    let ts_code = generate_file_ts_with_options(&analyzed_queries, options);
+
+    if is_ts {
+        let sibling = q_path.with_extension("sqltype.ts");
+        std::fs::write(&sibling, &ts_code)
+            .map_err(|e| format!("Failed to write {}: {}", sibling.display(), e))?;
+
+        let rel = q_path.strip_prefix(abs_queries).unwrap_or(q_path);
+        let out_file = abs_out.join(rel).with_extension("sqltype.ts");
+        if out_file != sibling {
+            if let Some(parent) = out_file.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&out_file, &ts_code);
+        }
+    } else {
+        let rel = q_path.strip_prefix(abs_queries).unwrap_or(q_path);
+        let out_file = abs_out.join(rel).with_extension("ts");
+        if let Some(parent) = out_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&out_file, &ts_code)
+            .map_err(|e| format!("Failed to write {}: {}", out_file.display(), e))?;
+    }
+
+    Ok(count)
 }
 
 /// Runs watch mode on migrations and queries directories with sub-5ms incremental re-generation.
@@ -94,14 +165,14 @@ pub fn run_watch(
             match event.kind {
                 EventKind::Create(_) | EventKind::Modify(_) => {
                     for path in event.paths {
-                        if let Some(ext) = path.extension()
-                            && ext.eq_ignore_ascii_case("sql")
-                        {
-                            if path.starts_with(&abs_migrations) {
+                        if path.starts_with(&abs_migrations) {
+                            if let Some(ext) = path.extension()
+                                && ext.eq_ignore_ascii_case("sql")
+                            {
                                 changed_migrations = true;
-                            } else if path.starts_with(&abs_queries) {
-                                changed_query_paths.insert(path);
                             }
+                        } else if path.starts_with(&abs_queries) && is_query_file(&path) {
+                            changed_query_paths.insert(path);
                         }
                     }
                 }
@@ -116,29 +187,18 @@ pub fn run_watch(
             match Catalog::load_from_dir_with_driver(&abs_migrations, driver) {
                 Ok(new_catalog) => {
                     catalog = new_catalog;
-                    let query_files = discover_sql_files(&abs_queries).unwrap_or_default();
+                    let query_files = discover_query_files(&abs_queries).unwrap_or_default();
                     let mut success_count = 0;
                     let options = CodegenOptions::new(driver, wrappers);
                     for q_path in &query_files {
-                        if let Ok(content) = std::fs::read_to_string(q_path) {
-                            let filename = q_path
-                                .file_name()
-                                .and_then(|f| f.to_str())
-                                .unwrap_or("query.sql");
-                            if let Ok(analyzed) = analyze_query(&content, &catalog, Some(filename))
-                            {
-                                let rel = q_path.strip_prefix(&abs_queries).unwrap_or(q_path);
-                                let out_file = abs_out.join(rel).with_extension("ts");
-                                if let Some(parent) = out_file.parent() {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-                                let ts_code = generate_file_ts_with_options(
-                                    std::slice::from_ref(&analyzed),
-                                    &options,
-                                );
-                                let _ = std::fs::write(&out_file, ts_code);
-                                success_count += 1;
-                            }
+                        if let Ok(count) = process_and_generate_query_file(
+                            q_path,
+                            &abs_queries,
+                            &abs_out,
+                            &catalog,
+                            &options,
+                        ) {
+                            success_count += count;
                         }
                     }
                     let elapsed = start.elapsed();
@@ -161,44 +221,24 @@ pub fn run_watch(
                     continue;
                 }
 
-                let content = match std::fs::read_to_string(&q_path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("  ✗ [Error] Failed to read {}: {}", q_path.display(), e);
-                        continue;
-                    }
-                };
-
-                let filename = q_path
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .unwrap_or("query.sql");
-
-                match analyze_query(&content, &catalog, Some(filename)) {
-                    Ok(analyzed) => {
-                        let rel = q_path.strip_prefix(&abs_queries).unwrap_or(&q_path);
-                        let out_file = abs_out.join(rel).with_extension("ts");
-                        if let Some(parent) = out_file.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        let ts_code = generate_file_ts_with_options(
-                            std::slice::from_ref(&analyzed),
-                            &options,
+                match process_and_generate_query_file(
+                    &q_path,
+                    &abs_queries,
+                    &abs_out,
+                    &catalog,
+                    &options,
+                ) {
+                    Ok(count) => {
+                        let elapsed = start.elapsed();
+                        println!(
+                            "⚡ [Watch] {} queries from {} updated in {:.2}ms",
+                            count,
+                            q_path.display(),
+                            elapsed.as_secs_f64() * 1000.0
                         );
-                        if let Err(e) = std::fs::write(&out_file, ts_code) {
-                            eprintln!("  ✗ [Error] Failed to write {}: {}", out_file.display(), e);
-                        } else {
-                            let elapsed = start.elapsed();
-                            println!(
-                                "⚡ [Watch] {} -> {} in {:.2}ms",
-                                analyzed.name,
-                                out_file.display(),
-                                elapsed.as_secs_f64() * 1000.0
-                            );
-                        }
                     }
                     Err(e) => {
-                        eprintln!("  ✗ [Error] {}: {}", q_path.display(), e);
+                        eprintln!("  ✗ [Error] {}", e);
                     }
                 }
             }

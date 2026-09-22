@@ -497,3 +497,213 @@ DELETE FROM accounts WHERE id = $1;
     assert!(bun_ts_insert.contains("export async function createAccount(sql: import(\"bun\").SQL, params: CreateAccountParams): Promise<CreateAccountRow[]> {"));
     assert!(bun_ts_insert.contains("return await sql<CreateAccountRow[]>`${sql.raw(createAccountSql, [params.username, params.balance ?? null])}`;"));
 }
+
+#[test]
+fn test_inline_typescript_query_extraction_and_codegen() {
+    use sqltype::ts_scanner::scan_ts_queries;
+
+    let base_dir = std::env::temp_dir().join(format!(
+        "sqltype_inline_ts_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let migrations_dir = base_dir.join("migrations");
+    let queries_dir = base_dir.join("src").join("queries");
+
+    fs::create_dir_all(&migrations_dir).unwrap();
+    fs::create_dir_all(&queries_dir).unwrap();
+
+    // 1. Write migration
+    fs::write(
+        migrations_dir.join("001_create_users.sql"),
+        r#"
+        CREATE TABLE users (
+            id UUID PRIMARY KEY,
+            email TEXT NOT NULL,
+            status VARCHAR(20) NOT NULL
+        );
+        "#,
+    )
+    .unwrap();
+
+    // 2. Write TypeScript file containing inline SQL tagged template
+    let ts_file_path = queries_dir.join("users.ts");
+    fs::write(
+        &ts_file_path,
+        r#"
+        import { sql } from 'bun';
+
+        export const findActiveUsers = sql`
+          SELECT id, email FROM users WHERE status = 'active' AND id = $1;
+        `;
+        "#,
+    )
+    .unwrap();
+
+    // 3. Verify extraction directly via scanner
+    let ts_content = fs::read_to_string(&ts_file_path).unwrap();
+    let extracted = scan_ts_queries(&ts_content);
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].name.as_deref(), Some("FindActiveUsers"));
+    assert!(
+        extracted[0]
+            .sql
+            .contains("SELECT id, email FROM users WHERE status = 'active' AND id = $1;")
+    );
+
+    // 4. Verify catalog and query analysis
+    let catalog = Catalog::load_from_dir(&migrations_dir).unwrap();
+    let analyzed =
+        analyze_query(&extracted[0].sql, &catalog, extracted[0].name.as_deref()).unwrap();
+
+    assert_eq!(analyzed.name, "FindActiveUsers");
+    assert_eq!(analyzed.params.len(), 1);
+    assert_eq!(analyzed.params[0].name, "id");
+    assert_eq!(analyzed.params[0].ts_type, "string");
+    assert_eq!(analyzed.fields.len(), 2);
+    assert_eq!(analyzed.fields[0].name, "id");
+    assert_eq!(analyzed.fields[0].ts_type, "string");
+    assert_eq!(analyzed.fields[1].name, "email");
+    assert_eq!(analyzed.fields[1].ts_type, "string");
+
+    // 5. Verify codegen output with wrappers
+    let options = CodegenOptions::new(DriverTarget::Bun, true);
+    let ts_code = generate_file_ts_with_options(&[analyzed], &options);
+
+    assert!(ts_code.contains("export interface FindActiveUsersParams {\n  id: string;\n}"));
+    assert!(
+        ts_code
+            .contains("export interface FindActiveUsersRow {\n  id: string;\n  email: string;\n}")
+    );
+    assert!(ts_code.contains("export const findActiveUsersSql = `"));
+    assert!(ts_code.contains("export type FindActiveUsersQuery = {"));
+    assert!(ts_code.contains("export async function findActiveUsers(sql: import(\"bun\").SQL, params: FindActiveUsersParams): Promise<FindActiveUsersRow[]> {"));
+
+    // 6. Write sibling file and verify existence and content
+    let sibling_file_path = ts_file_path.with_extension("sqltype.ts");
+    fs::write(&sibling_file_path, &ts_code).unwrap();
+    assert!(sibling_file_path.exists());
+    let read_back = fs::read_to_string(&sibling_file_path).unwrap();
+    assert!(read_back.contains("FindActiveUsersRow"));
+
+    // Cleanup
+    let _ = fs::remove_dir_all(base_dir);
+}
+
+#[test]
+fn test_cli_commands_with_inline_typescript_files() {
+    let base_dir = std::env::temp_dir().join(format!(
+        "sqltype_cli_ts_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let migrations_dir = base_dir.join("migrations");
+    let queries_dir = base_dir.join("src").join("queries");
+
+    fs::create_dir_all(&migrations_dir).unwrap();
+    fs::create_dir_all(&queries_dir).unwrap();
+
+    fs::write(
+        migrations_dir.join("001_create_users.sql"),
+        r#"
+        CREATE TABLE users (
+            id UUID PRIMARY KEY,
+            email TEXT NOT NULL,
+            status VARCHAR(20) NOT NULL
+        );
+        "#,
+    )
+    .unwrap();
+
+    let ts_file = queries_dir.join("users.ts");
+    fs::write(
+        &ts_file,
+        r#"
+        import { sql } from 'bun';
+
+        export const findActiveUsers = sql`
+          SELECT id, email FROM users WHERE status = 'active' AND id = $1;
+        `;
+        "#,
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_sqltype");
+
+    // 1. Run `sqltype check` via CLI
+    let check_status = std::process::Command::new(binary)
+        .arg("check")
+        .arg("--migrations")
+        .arg(&migrations_dir)
+        .arg("--queries")
+        .arg(&queries_dir)
+        .arg("--wrappers")
+        .status()
+        .expect("failed to execute sqltype check");
+
+    assert!(
+        check_status.success(),
+        "sqltype check should succeed on valid inline query"
+    );
+
+    // 2. Run `sqltype generate` via CLI
+    let gen_status = std::process::Command::new(binary)
+        .arg("generate")
+        .arg("--migrations")
+        .arg(&migrations_dir)
+        .arg("--queries")
+        .arg(&queries_dir)
+        .arg("--wrappers")
+        .status()
+        .expect("failed to execute sqltype generate");
+
+    assert!(
+        gen_status.success(),
+        "sqltype generate should succeed on valid inline query"
+    );
+
+    // Sibling file users.sqltype.ts must exist
+    let sibling_file = queries_dir.join("users.sqltype.ts");
+    assert!(
+        sibling_file.exists(),
+        "sibling users.sqltype.ts must be generated"
+    );
+    let generated_content = fs::read_to_string(&sibling_file).unwrap();
+    assert!(generated_content.contains("export interface FindActiveUsersParams"));
+    assert!(generated_content.contains("export interface FindActiveUsersRow"));
+    assert!(generated_content.contains("export async function findActiveUsers"));
+
+    // 3. Test invalid query failure
+    let bad_ts_file = queries_dir.join("bad.ts");
+    fs::write(
+        &bad_ts_file,
+        r#"
+        const getNonExistent = sql`
+          SELECT * FROM non_existent_table;
+        `;
+        "#,
+    )
+    .unwrap();
+
+    let bad_check_status = std::process::Command::new(binary)
+        .arg("check")
+        .arg("--migrations")
+        .arg(&migrations_dir)
+        .arg("--queries")
+        .arg(&queries_dir)
+        .status()
+        .expect("failed to execute sqltype check on bad query");
+
+    assert!(
+        !bad_check_status.success(),
+        "sqltype check should fail when query references missing table"
+    );
+
+    let _ = fs::remove_dir_all(base_dir);
+}

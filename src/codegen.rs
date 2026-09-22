@@ -265,6 +265,17 @@ pub fn generate_file_ts_with_options(
     out
 }
 
+/// Helper to determine the output file name for a given query source file.
+/// For TS/JS files (.ts, .tsx, .js), returns sibling declaration file with ".sqltype.ts".
+/// For .sql files, returns file with ".ts".
+pub fn get_output_file_name(source_file: &std::path::Path) -> std::path::PathBuf {
+    if crate::ts_scanner::is_ts_js_file(source_file) {
+        source_file.with_extension("sqltype.ts")
+    } else {
+        source_file.with_extension("ts")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
