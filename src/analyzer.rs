@@ -1,7 +1,203 @@
-use crate::catalog::{Catalog, ColumnMetadata, TableMetadata, extract_type_name};
+use crate::catalog::{Catalog, ColumnMetadata, DriverTarget, TableMetadata, extract_type_name};
 use pg_query::NodeEnum;
-use pg_query::protobuf::{AExprKind, BoolExprType, JoinType, NullTestType};
+use pg_query::protobuf::{AExprKind, BoolExprType, JoinType, NullTestType, SubLinkType};
 use std::collections::HashMap;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PgType {
+    Unknown,
+    Bool,
+    Int2,
+    Int4,
+    Int8,
+    Float4,
+    Float8,
+    Numeric,
+    Text,
+    Varchar,
+    Uuid,
+    Date,
+    Timestamp,
+    Timestamptz,
+    Time,
+    Timetz,
+    Bytea,
+    Json,
+    Jsonb,
+    Custom(String),
+    Array(Box<PgType>),
+}
+
+impl PgType {
+    pub fn from_pg_str(s: &str) -> Self {
+        let lower = s.to_ascii_lowercase();
+        let trimmed = lower.trim();
+        if let Some(inner) = trimmed.strip_suffix("[]") {
+            return PgType::Array(Box::new(PgType::from_pg_str(inner)));
+        }
+        match trimmed {
+            "int2" | "smallint" | "smallserial" => PgType::Int2,
+            "int4" | "integer" | "int" | "serial" => PgType::Int4,
+            "int8" | "bigint" | "bigserial" | "serial8" => PgType::Int8,
+            "float4" | "real" => PgType::Float4,
+            "float8" | "double precision" => PgType::Float8,
+            "numeric" | "decimal" => PgType::Numeric,
+            "bool" | "boolean" => PgType::Bool,
+            "text" | "citext" => PgType::Text,
+            "varchar" | "character varying" | "char" | "character" | "bpchar" => PgType::Varchar,
+            "uuid" => PgType::Uuid,
+            "date" => PgType::Date,
+            "timestamp" | "timestamp without time zone" => PgType::Timestamp,
+            "timestamptz" | "timestamp with time zone" => PgType::Timestamptz,
+            "time" | "time without time zone" => PgType::Time,
+            "timetz" | "time with time zone" => PgType::Timetz,
+            "bytea" => PgType::Bytea,
+            "json" => PgType::Json,
+            "jsonb" => PgType::Jsonb,
+            "unknown" => PgType::Unknown,
+            other => PgType::Custom(other.to_string()),
+        }
+    }
+
+    pub fn to_ts(&self, catalog: &Catalog) -> String {
+        match self {
+            PgType::Unknown => "unknown".to_string(),
+            PgType::Bool => "boolean".to_string(),
+            PgType::Int2 | PgType::Int4 | PgType::Float4 | PgType::Float8 | PgType::Numeric => {
+                "number".to_string()
+            }
+            PgType::Int8 => match catalog.driver {
+                DriverTarget::Bun => "bigint".to_string(),
+                DriverTarget::Postgres | DriverTarget::Pg => "string".to_string(),
+            },
+            PgType::Bytea => match catalog.driver {
+                DriverTarget::Bun => "Uint8Array".to_string(),
+                DriverTarget::Postgres | DriverTarget::Pg => "Buffer".to_string(),
+            },
+            PgType::Text | PgType::Varchar | PgType::Uuid => "string".to_string(),
+            PgType::Date => "string".to_string(),
+            PgType::Timestamp | PgType::Timestamptz => "Date".to_string(),
+            PgType::Time | PgType::Timetz => "string".to_string(),
+            PgType::Json | PgType::Jsonb => "unknown".to_string(),
+            PgType::Custom(name) => catalog.resolve_type(name),
+            PgType::Array(inner) => {
+                let inner_ts = inner.to_ts(catalog);
+                if inner_ts.contains('|') {
+                    format!("({})[]", inner_ts)
+                } else {
+                    format!("{}[]", inner_ts)
+                }
+            }
+        }
+    }
+}
+
+pub fn is_numeric_type(t: &PgType) -> bool {
+    matches!(
+        t,
+        PgType::Int2
+            | PgType::Int4
+            | PgType::Int8
+            | PgType::Float4
+            | PgType::Float8
+            | PgType::Numeric
+    )
+}
+
+fn unify_numeric_types(a: &PgType, b: &PgType) -> PgType {
+    if a == b {
+        return a.clone();
+    }
+    if *a == PgType::Numeric || *b == PgType::Numeric {
+        return PgType::Numeric;
+    }
+
+    let is_int_a = matches!(a, PgType::Int2 | PgType::Int4 | PgType::Int8);
+    let is_int_b = matches!(b, PgType::Int2 | PgType::Int4 | PgType::Int8);
+
+    if is_int_a && is_int_b {
+        if *a == PgType::Int8 || *b == PgType::Int8 {
+            return PgType::Int8;
+        }
+        if *a == PgType::Int4 || *b == PgType::Int4 {
+            return PgType::Int4;
+        }
+        return PgType::Int2;
+    }
+
+    let is_float_a = matches!(a, PgType::Float4 | PgType::Float8);
+    let is_float_b = matches!(b, PgType::Float4 | PgType::Float8);
+
+    if is_float_a && is_float_b {
+        return PgType::Float8;
+    }
+
+    if *a == PgType::Float8 || *b == PgType::Float8 {
+        return PgType::Float8;
+    }
+    let int_type = if is_int_a { a } else { b };
+    if *int_type == PgType::Int2 {
+        PgType::Float4
+    } else {
+        PgType::Float8
+    }
+}
+
+pub fn unify_types(a: &PgType, b: &PgType) -> Result<PgType, String> {
+    if a == b {
+        return Ok(a.clone());
+    }
+
+    // Unknown unifies to the concrete companion type
+    if *a == PgType::Unknown {
+        return Ok(b.clone());
+    }
+    if *b == PgType::Unknown {
+        return Ok(a.clone());
+    }
+
+    // String hierarchy: Varchar / Uuid widen to Text
+    let is_string_a = matches!(a, PgType::Text | PgType::Varchar | PgType::Uuid);
+    let is_string_b = matches!(b, PgType::Text | PgType::Varchar | PgType::Uuid);
+    if is_string_a && is_string_b {
+        return Ok(PgType::Text);
+    }
+
+    // Datetime hierarchy: Date -> Timestamp -> Timestamptz
+    let is_dt_a = matches!(a, PgType::Date | PgType::Timestamp | PgType::Timestamptz);
+    let is_dt_b = matches!(b, PgType::Date | PgType::Timestamp | PgType::Timestamptz);
+    if is_dt_a && is_dt_b {
+        if *a == PgType::Timestamptz || *b == PgType::Timestamptz {
+            return Ok(PgType::Timestamptz);
+        }
+        if *a == PgType::Timestamp || *b == PgType::Timestamp {
+            return Ok(PgType::Timestamp);
+        }
+        return Ok(PgType::Date);
+    }
+
+    // Numeric hierarchy: Int2 -> Int4 -> Int8 -> Numeric; Float4 -> Float8 -> Numeric
+    if is_numeric_type(a) && is_numeric_type(b) {
+        return Ok(unify_numeric_types(a, b));
+    }
+
+    // Array types
+    if let (PgType::Array(inner_a), PgType::Array(inner_b)) = (a, b) {
+        let inner = unify_types(inner_a, inner_b)?;
+        return Ok(PgType::Array(Box::new(inner)));
+    }
+
+    Err(format!(
+        "Cannot unify incompatible types: {:?} and {:?}",
+        a, b
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferredExpr {
+    pub pg_type: PgType,
+    pub is_nullable: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryParam {
@@ -278,6 +474,9 @@ fn analyze_select_stmt(
     for target in &select.target_list {
         if let Some(NodeEnum::ResTarget(rt)) = &target.node {
             resolve_target(rt, &scoped_catalog, &tables_in_scope, &mut fields)?;
+            if let Some(val) = &rt.val {
+                resolve_params_in_expr(val, &scoped_catalog, &tables_in_scope, param_map)?;
+            }
         }
     }
 
@@ -448,6 +647,9 @@ fn analyze_insert_stmt(
     for rt_node in &insert.returning_list {
         if let Some(NodeEnum::ResTarget(rt)) = &rt_node.node {
             resolve_target(rt, &scoped_catalog, &tables_in_scope, &mut fields)?;
+            if let Some(val) = &rt.val {
+                resolve_params_in_expr(val, &scoped_catalog, &tables_in_scope, param_map)?;
+            }
         }
     }
 
@@ -531,6 +733,9 @@ fn analyze_update_stmt(
     for rt_node in &update.returning_list {
         if let Some(NodeEnum::ResTarget(rt)) = &rt_node.node {
             resolve_target(rt, &scoped_catalog, &tables_in_scope, &mut fields)?;
+            if let Some(val) = &rt.val {
+                resolve_params_in_expr(val, &scoped_catalog, &tables_in_scope, param_map)?;
+            }
         }
     }
 
@@ -585,6 +790,9 @@ fn analyze_delete_stmt(
     for rt_node in &delete.returning_list {
         if let Some(NodeEnum::ResTarget(rt)) = &rt_node.node {
             resolve_target(rt, &scoped_catalog, &tables_in_scope, &mut fields)?;
+            if let Some(val) = &rt.val {
+                resolve_params_in_expr(val, &scoped_catalog, &tables_in_scope, param_map)?;
+            }
         }
     }
 
@@ -638,6 +846,445 @@ fn collect_from_node(
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+fn infer_expr(
+    node: &pg_query::protobuf::Node,
+    catalog: &Catalog,
+    tables: &[TableInScope],
+) -> Result<InferredExpr, String> {
+    match &node.node {
+        Some(NodeEnum::ColumnRef(cr)) => {
+            if cr.fields.len() == 2 {
+                let alias_str = extract_string(&cr.fields[0])
+                    .ok_or_else(|| "Invalid column reference alias".to_string())?;
+                let col_str = extract_string(&cr.fields[1])
+                    .ok_or_else(|| "Invalid column reference name".to_string())?;
+
+                let table = tables
+                    .iter()
+                    .find(|t| t.alias.eq_ignore_ascii_case(&alias_str))
+                    .ok_or_else(|| {
+                        format!("Unknown table alias \"{}\" in column reference", alias_str)
+                    })?;
+
+                let table_meta = catalog.get_table(&table.table_name).ok_or_else(|| {
+                    format!("Table \"{}\" not found in catalog", table.table_name)
+                })?;
+
+                let col = table_meta.get_column(&col_str).ok_or_else(|| {
+                    format!(
+                        "Column \"{}\" not found on table \"{}\"",
+                        col_str, table.table_name
+                    )
+                })?;
+
+                let is_nullable = col.is_nullable || table.is_nullable;
+                let pg_type = if col.pg_type == "unknown" && !col.ts_type.is_empty() {
+                    match col.ts_type.as_str() {
+                        "string" => PgType::Text,
+                        "number" => PgType::Int4,
+                        "boolean" => PgType::Bool,
+                        "Date" => PgType::Timestamp,
+                        "bigint" => PgType::Int8,
+                        "Buffer" | "Uint8Array" => PgType::Bytea,
+                        other => PgType::Custom(other.to_string()),
+                    }
+                } else {
+                    PgType::from_pg_str(&col.pg_type)
+                };
+                Ok(InferredExpr {
+                    pg_type,
+                    is_nullable,
+                })
+            } else if cr.fields.len() == 1 {
+                let col_str = extract_string(&cr.fields[0])
+                    .ok_or_else(|| "Invalid column reference name".to_string())?;
+
+                let mut matched: Vec<(&TableInScope, &crate::catalog::ColumnMetadata)> = Vec::new();
+                for table in tables {
+                    if let Some(table_meta) = catalog.get_table(&table.table_name)
+                        && let Some(col) = table_meta.get_column(&col_str)
+                    {
+                        matched.push((table, col));
+                    }
+                }
+
+                if matched.is_empty() {
+                    return Err(format!(
+                        "Column \"{}\" not found in any table in scope",
+                        col_str
+                    ));
+                }
+                if matched.len() > 1 {
+                    return Err(format!(
+                        "Column \"{}\" is ambiguous across multiple tables in scope",
+                        col_str
+                    ));
+                }
+
+                let (table, col) = matched[0];
+                let is_nullable = col.is_nullable || table.is_nullable;
+                let pg_type = if col.pg_type == "unknown" && !col.ts_type.is_empty() {
+                    match col.ts_type.as_str() {
+                        "string" => PgType::Text,
+                        "number" => PgType::Int4,
+                        "boolean" => PgType::Bool,
+                        "Date" => PgType::Timestamp,
+                        "bigint" => PgType::Int8,
+                        "Buffer" | "Uint8Array" => PgType::Bytea,
+                        other => PgType::Custom(other.to_string()),
+                    }
+                } else {
+                    PgType::from_pg_str(&col.pg_type)
+                };
+                Ok(InferredExpr {
+                    pg_type,
+                    is_nullable,
+                })
+            } else {
+                Err("Unsupported column reference format".to_string())
+            }
+        }
+        Some(NodeEnum::AConst(ac)) => {
+            if ac.isnull {
+                Ok(InferredExpr {
+                    pg_type: PgType::Unknown,
+                    is_nullable: true,
+                })
+            } else if let Some(val) = &ac.val {
+                match val {
+                    pg_query::protobuf::a_const::Val::Ival(_) => Ok(InferredExpr {
+                        pg_type: PgType::Int4,
+                        is_nullable: false,
+                    }),
+                    pg_query::protobuf::a_const::Val::Fval(_) => Ok(InferredExpr {
+                        pg_type: PgType::Numeric,
+                        is_nullable: false,
+                    }),
+                    pg_query::protobuf::a_const::Val::Sval(_) => Ok(InferredExpr {
+                        pg_type: PgType::Text,
+                        is_nullable: false,
+                    }),
+                    pg_query::protobuf::a_const::Val::Boolval(_) => Ok(InferredExpr {
+                        pg_type: PgType::Bool,
+                        is_nullable: false,
+                    }),
+                    _ => Ok(InferredExpr {
+                        pg_type: PgType::Unknown,
+                        is_nullable: false,
+                    }),
+                }
+            } else {
+                Ok(InferredExpr {
+                    pg_type: PgType::Unknown,
+                    is_nullable: false,
+                })
+            }
+        }
+        Some(NodeEnum::TypeCast(tc)) => {
+            let pg_type_str = tc
+                .type_name
+                .as_ref()
+                .map(extract_type_name)
+                .unwrap_or_else(|| "unknown".to_string());
+            let pg_type = PgType::from_pg_str(&pg_type_str);
+            let is_nullable = if let Some(arg) = &tc.arg {
+                if let Some(NodeEnum::AConst(ac)) = &arg.node {
+                    ac.isnull
+                } else {
+                    infer_expr(arg, catalog, tables)
+                        .map(|inf| inf.is_nullable)
+                        .unwrap_or(false)
+                }
+            } else {
+                false
+            };
+            Ok(InferredExpr {
+                pg_type,
+                is_nullable,
+            })
+        }
+        Some(NodeEnum::CaseExpr(ce)) => {
+            let mut unified_type = PgType::Unknown;
+            let mut is_nullable = false;
+
+            for arg in &ce.args {
+                if let Some(NodeEnum::CaseWhen(cw)) = arg.node.as_ref()
+                    && let Some(res_node) = &cw.result
+                {
+                    let inferred = infer_expr(res_node, catalog, tables)?;
+                    unified_type = unify_types(&unified_type, &inferred.pg_type)?;
+                    if inferred.is_nullable {
+                        is_nullable = true;
+                    }
+                }
+            }
+
+            if let Some(def_node) = &ce.defresult {
+                let inferred = infer_expr(def_node, catalog, tables)?;
+                unified_type = unify_types(&unified_type, &inferred.pg_type)?;
+                if inferred.is_nullable {
+                    is_nullable = true;
+                }
+            } else {
+                // If defresult (ELSE) is omitted, nullable = true
+                is_nullable = true;
+            }
+
+            Ok(InferredExpr {
+                pg_type: unified_type,
+                is_nullable,
+            })
+        }
+        Some(NodeEnum::CoalesceExpr(ce)) => {
+            let mut unified_type = PgType::Unknown;
+            let mut has_non_nullable = false;
+
+            for arg in &ce.args {
+                let inferred = infer_expr(arg, catalog, tables)?;
+                unified_type = unify_types(&unified_type, &inferred.pg_type)?;
+                if !inferred.is_nullable {
+                    has_non_nullable = true;
+                }
+            }
+
+            Ok(InferredExpr {
+                pg_type: unified_type,
+                is_nullable: !has_non_nullable,
+            })
+        }
+        Some(NodeEnum::NullTest(_)) => Ok(InferredExpr {
+            pg_type: PgType::Bool,
+            is_nullable: false,
+        }),
+        Some(NodeEnum::BooleanTest(_)) => Ok(InferredExpr {
+            pg_type: PgType::Bool,
+            is_nullable: false,
+        }),
+        Some(NodeEnum::FuncCall(fc)) => {
+            let func_name = extract_func_name(&fc.funcname);
+
+            if fc.over.is_some() {
+                // Window functions
+                match func_name.as_str() {
+                    "row_number" | "rank" | "dense_rank" | "count" => Ok(InferredExpr {
+                        pg_type: PgType::Int8,
+                        is_nullable: false,
+                    }),
+                    "percent_rank" | "cume_dist" => Ok(InferredExpr {
+                        pg_type: PgType::Float8,
+                        is_nullable: false,
+                    }),
+                    "ntile" => Ok(InferredExpr {
+                        pg_type: PgType::Int4,
+                        is_nullable: false,
+                    }),
+                    "sum" | "avg" => {
+                        let arg_type = if let Some(arg) = fc.args.first() {
+                            infer_expr(arg, catalog, tables)?.pg_type
+                        } else {
+                            PgType::Numeric
+                        };
+                        let pg_type = if is_numeric_type(&arg_type) {
+                            arg_type
+                        } else {
+                            PgType::Numeric
+                        };
+                        Ok(InferredExpr {
+                            pg_type,
+                            is_nullable: true,
+                        })
+                    }
+                    "min" | "max" => {
+                        let arg_type = if let Some(arg) = fc.args.first() {
+                            infer_expr(arg, catalog, tables)?.pg_type
+                        } else {
+                            PgType::Unknown
+                        };
+                        Ok(InferredExpr {
+                            pg_type: arg_type,
+                            is_nullable: true,
+                        })
+                    }
+                    _ => {
+                        let arg_type = if let Some(arg) = fc.args.first() {
+                            infer_expr(arg, catalog, tables)?.pg_type
+                        } else {
+                            PgType::Unknown
+                        };
+                        Ok(InferredExpr {
+                            pg_type: arg_type,
+                            is_nullable: true,
+                        })
+                    }
+                }
+            } else {
+                // Regular function call
+                match func_name.as_str() {
+                    "count" => Ok(InferredExpr {
+                        pg_type: PgType::Int4,
+                        is_nullable: false,
+                    }),
+                    "sum" | "avg" => {
+                        let arg_type = if let Some(arg) = fc.args.first() {
+                            infer_expr(arg, catalog, tables)?.pg_type
+                        } else {
+                            PgType::Numeric
+                        };
+                        let pg_type = if is_numeric_type(&arg_type) {
+                            arg_type
+                        } else {
+                            PgType::Numeric
+                        };
+                        Ok(InferredExpr {
+                            pg_type,
+                            is_nullable: true,
+                        })
+                    }
+                    "min" | "max" => {
+                        let arg_type = if let Some(arg) = fc.args.first() {
+                            infer_expr(arg, catalog, tables)?.pg_type
+                        } else {
+                            PgType::Unknown
+                        };
+                        Ok(InferredExpr {
+                            pg_type: arg_type,
+                            is_nullable: true,
+                        })
+                    }
+                    "coalesce" => {
+                        let mut unified_type = PgType::Unknown;
+                        let mut has_non_nullable = false;
+                        for arg in &fc.args {
+                            let inferred = infer_expr(arg, catalog, tables)?;
+                            unified_type = unify_types(&unified_type, &inferred.pg_type)?;
+                            if !inferred.is_nullable {
+                                has_non_nullable = true;
+                            }
+                        }
+                        Ok(InferredExpr {
+                            pg_type: unified_type,
+                            is_nullable: !has_non_nullable,
+                        })
+                    }
+                    _ => Ok(InferredExpr {
+                        pg_type: PgType::Unknown,
+                        is_nullable: true,
+                    }),
+                }
+            }
+        }
+        Some(NodeEnum::SubLink(sl)) => {
+            if sl.sub_link_type == SubLinkType::ExprSublink as i32 {
+                let subselect_node = sl
+                    .subselect
+                    .as_ref()
+                    .ok_or_else(|| "SubLink missing subselect".to_string())?;
+                let sub_select = match &subselect_node.node {
+                    Some(NodeEnum::SelectStmt(s)) => s,
+                    _ => return Err("SubLink subselect is not a SelectStmt".to_string()),
+                };
+
+                if sub_select.target_list.len() != 1 {
+                    return Err("Scalar subquery must have exactly one target column".to_string());
+                }
+
+                let mut sub_catalog = catalog.clone();
+                if let Some(wc) = &sub_select.with_clause {
+                    let mut dummy_params = HashMap::new();
+                    register_ctes(wc, &mut sub_catalog, &mut dummy_params)?;
+                }
+
+                let mut sub_tables = tables.to_vec();
+                for from_item in &sub_select.from_clause {
+                    collect_from_node(from_item, false, &sub_catalog, &mut sub_tables)?;
+                }
+
+                let target = &sub_select.target_list[0];
+                let target_rt = match &target.node {
+                    Some(NodeEnum::ResTarget(rt)) => rt,
+                    _ => return Err("Subquery target is not a ResTarget".to_string()),
+                };
+
+                let val = target_rt
+                    .val
+                    .as_ref()
+                    .ok_or_else(|| "Subquery target missing expression".to_string())?;
+                let inner_inferred = infer_expr(val, &sub_catalog, &sub_tables)?;
+
+                // Scalar subqueries strictly evaluate to SQL NULL if zero rows match
+                Ok(InferredExpr {
+                    pg_type: inner_inferred.pg_type,
+                    is_nullable: true,
+                })
+            } else if sl.sub_link_type == SubLinkType::ExistsSublink as i32 {
+                Ok(InferredExpr {
+                    pg_type: PgType::Bool,
+                    is_nullable: false,
+                })
+            } else {
+                Ok(InferredExpr {
+                    pg_type: PgType::Unknown,
+                    is_nullable: true,
+                })
+            }
+        }
+        Some(NodeEnum::AExpr(ae)) => {
+            let op = ae.name.first().and_then(extract_string).unwrap_or_default();
+            let l_inf = if let Some(l) = &ae.lexpr {
+                infer_expr(l, catalog, tables)?
+            } else {
+                InferredExpr {
+                    pg_type: PgType::Unknown,
+                    is_nullable: false,
+                }
+            };
+            let r_inf = if let Some(r) = &ae.rexpr {
+                infer_expr(r, catalog, tables)?
+            } else {
+                InferredExpr {
+                    pg_type: PgType::Unknown,
+                    is_nullable: false,
+                }
+            };
+            let is_nullable = l_inf.is_nullable || r_inf.is_nullable;
+
+            let pg_type = if matches!(op.as_str(), "+" | "-" | "*" | "/" | "%") {
+                if is_numeric_type(&l_inf.pg_type) && is_numeric_type(&r_inf.pg_type) {
+                    unify_types(&l_inf.pg_type, &r_inf.pg_type).unwrap_or(PgType::Numeric)
+                } else {
+                    PgType::Numeric
+                }
+            } else if op == "||" {
+                PgType::Text
+            } else if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+                PgType::Bool
+            } else {
+                PgType::Unknown
+            };
+
+            Ok(InferredExpr {
+                pg_type,
+                is_nullable,
+            })
+        }
+        Some(NodeEnum::AArrayExpr(aae)) => {
+            let elem_type = if let Some(first) = aae.elements.first() {
+                infer_expr(first, catalog, tables)?.pg_type
+            } else {
+                PgType::Unknown
+            };
+            Ok(InferredExpr {
+                pg_type: PgType::Array(Box::new(elem_type)),
+                is_nullable: false,
+            })
+        }
+        _ => Ok(InferredExpr {
+            pg_type: PgType::Unknown,
+            is_nullable: true,
+        }),
     }
 }
 
@@ -711,299 +1358,45 @@ fn resolve_target(
                 return Ok(());
             }
 
-            // Qualified or unqualified column ref
-            if cr.fields.len() == 2 {
-                let alias_str = extract_string(&cr.fields[0])
-                    .ok_or_else(|| "Invalid column reference alias".to_string())?;
-                let col_str = extract_string(&cr.fields[1])
-                    .ok_or_else(|| "Invalid column reference name".to_string())?;
-
-                let table = tables
-                    .iter()
-                    .find(|t| t.alias.eq_ignore_ascii_case(&alias_str))
-                    .ok_or_else(|| {
-                        format!("Unknown table alias \"{}\" in column reference", alias_str)
-                    })?;
-
-                let table_meta = catalog.get_table(&table.table_name).ok_or_else(|| {
-                    format!("Table \"{}\" not found in catalog", table.table_name)
-                })?;
-
-                let col = table_meta.get_column(&col_str).ok_or_else(|| {
-                    format!(
-                        "Column \"{}\" not found on table \"{}\"",
-                        col_str, table.table_name
-                    )
-                })?;
-
-                let is_null = col.is_nullable || table.is_nullable;
-                let ts_type = if is_null {
-                    format_nullable(&col.ts_type)
-                } else {
-                    col.ts_type.clone()
-                };
-
-                fields.push(QueryField {
-                    name: explicit_alias.unwrap_or(col.name.clone()),
-                    ts_type,
-                });
-            } else if cr.fields.len() == 1 {
-                let col_str = extract_string(&cr.fields[0])
-                    .ok_or_else(|| "Invalid column reference name".to_string())?;
-
-                let mut matched: Vec<(&TableInScope, &crate::catalog::ColumnMetadata)> = Vec::new();
-                for table in tables {
-                    if let Some(table_meta) = catalog.get_table(&table.table_name)
-                        && let Some(col) = table_meta.get_column(&col_str)
-                    {
-                        matched.push((table, col));
-                    }
-                }
-
-                if matched.is_empty() {
-                    return Err(format!(
-                        "Column \"{}\" not found in any table in scope",
-                        col_str
-                    ));
-                }
-                if matched.len() > 1 {
-                    return Err(format!(
-                        "Column \"{}\" is ambiguous across multiple tables in scope",
-                        col_str
-                    ));
-                }
-
-                let (table, col) = matched[0];
-                let is_null = col.is_nullable || table.is_nullable;
-                let ts_type = if is_null {
-                    format_nullable(&col.ts_type)
-                } else {
-                    col.ts_type.clone()
-                };
-
-                fields.push(QueryField {
-                    name: explicit_alias.unwrap_or(col.name.clone()),
-                    ts_type,
-                });
-            }
-            Ok(())
-        }
-        Some(NodeEnum::FuncCall(fc)) => {
-            let func_name = extract_func_name(&fc.funcname);
-            let name = explicit_alias.unwrap_or_else(|| func_name.clone());
-
-            let ts_type = match func_name.as_str() {
-                // COUNT is strictly non-nullable number
-                "count" => "number".to_string(),
-                // SUM and AVG are nullable (number | null)
-                "sum" | "avg" => "number | null".to_string(),
-                "min" | "max" => {
-                    // Try to resolve argument column type
-                    let mut inner_type = "unknown".to_string();
-                    if let Some(arg) = fc.args.first() {
-                        let mut sub_fields = Vec::new();
-                        let dummy_rt = pg_query::protobuf::ResTarget {
-                            name: String::new(),
-                            indirection: Vec::new(),
-                            val: Some(Box::new(arg.clone())),
-                            location: 0,
-                        };
-                        if resolve_target(&dummy_rt, catalog, tables, &mut sub_fields).is_ok()
-                            && let Some(first_field) = sub_fields.first()
-                        {
-                            inner_type = first_field.ts_type.clone();
-                        }
-                    }
-                    format_nullable(&inner_type)
-                }
-                "coalesce" => {
-                    // If any argument is non-nullable, coalesce is non-nullable
-                    let mut is_nullable = true;
-                    let mut resolved_type = "unknown".to_string();
-                    for arg in &fc.args {
-                        let mut sub_fields = Vec::new();
-                        let dummy_rt = pg_query::protobuf::ResTarget {
-                            name: String::new(),
-                            indirection: Vec::new(),
-                            val: Some(Box::new(arg.clone())),
-                            location: 0,
-                        };
-                        if resolve_target(&dummy_rt, catalog, tables, &mut sub_fields).is_ok()
-                            && let Some(f) = sub_fields.first()
-                        {
-                            let arg_is_nullable = f.ts_type.contains("| null");
-                            let base = f.ts_type.replace(" | null", "").trim().to_string();
-                            if base != "unknown" {
-                                resolved_type = base;
-                            }
-                            if !arg_is_nullable {
-                                is_nullable = false;
-                                break;
-                            }
-                        }
-                    }
-                    if is_nullable {
-                        format_nullable(&resolved_type)
-                    } else {
-                        resolved_type
-                    }
-                }
-                _ => "unknown".to_string(),
-            };
-
-            fields.push(QueryField { name, ts_type });
-            Ok(())
-        }
-        Some(NodeEnum::CoalesceExpr(ce)) => {
-            let name = explicit_alias.unwrap_or_else(|| "coalesce".to_string());
-            let mut is_nullable = true;
-            let mut resolved_type = "unknown".to_string();
-
-            for arg in &ce.args {
-                let mut sub_fields = Vec::new();
-                let dummy_rt = pg_query::protobuf::ResTarget {
-                    name: String::new(),
-                    indirection: Vec::new(),
-                    val: Some(Box::new(arg.clone())),
-                    location: 0,
-                };
-                if resolve_target(&dummy_rt, catalog, tables, &mut sub_fields).is_ok()
-                    && let Some(f) = sub_fields.first()
-                {
-                    let arg_is_nullable = f.ts_type.contains("| null");
-                    let base = f.ts_type.replace(" | null", "").trim().to_string();
-                    if base != "unknown" {
-                        resolved_type = base;
-                    }
-                    if !arg_is_nullable {
-                        is_nullable = false;
-                        break;
-                    }
-                }
-            }
-
-            let ts_type = if is_nullable {
-                format_nullable(&resolved_type)
-            } else {
-                resolved_type
-            };
-
-            fields.push(QueryField { name, ts_type });
-            Ok(())
-        }
-        Some(NodeEnum::AConst(ac)) => {
-            let name = explicit_alias.unwrap_or_else(|| "constant".to_string());
-            let ts_type = if ac.isnull {
-                "unknown | null".to_string()
-            } else if let Some(val) = &ac.val {
-                match val {
-                    pg_query::protobuf::a_const::Val::Ival(_) => "number".to_string(),
-                    pg_query::protobuf::a_const::Val::Fval(_) => "number".to_string(),
-                    pg_query::protobuf::a_const::Val::Sval(_) => "string".to_string(),
-                    pg_query::protobuf::a_const::Val::Boolval(_) => "boolean".to_string(),
-                    _ => "unknown".to_string(),
-                }
-            } else {
-                "unknown".to_string()
-            };
-            fields.push(QueryField { name, ts_type });
-            Ok(())
-        }
-        Some(NodeEnum::TypeCast(tc)) => {
-            let name = explicit_alias.unwrap_or_else(|| "cast".to_string());
-            let pg_type = tc
-                .type_name
-                .as_ref()
-                .map(extract_type_name)
-                .unwrap_or_else(|| "unknown".to_string());
-            let ts_type = catalog.resolve_type(&pg_type);
-            fields.push(QueryField { name, ts_type });
-            Ok(())
-        }
-        Some(NodeEnum::AExpr(ae)) => {
-            let name = explicit_alias.unwrap_or_else(|| "expr".to_string());
-            let op = ae.name.first().and_then(extract_string).unwrap_or_default();
-
-            let resolve_operand =
-                |operand_node: &Option<Box<pg_query::protobuf::Node>>| -> (String, bool) {
-                    if let Some(op_node) = operand_node {
-                        let mut sub_fields = Vec::new();
-                        let dummy_rt = pg_query::protobuf::ResTarget {
-                            name: String::new(),
-                            indirection: Vec::new(),
-                            val: Some(op_node.clone()),
-                            location: 0,
-                        };
-                        if resolve_target(&dummy_rt, catalog, tables, &mut sub_fields).is_ok()
-                            && let Some(f) = sub_fields.first()
-                        {
-                            let is_null = f.ts_type.contains("| null");
-                            let base = f.ts_type.replace(" | null", "").trim().to_string();
-                            return (base, is_null);
-                        }
-                    }
-                    ("unknown".to_string(), true)
-                };
-
-            let (_l_type, l_null) = resolve_operand(&ae.lexpr);
-            let (_r_type, r_null) = resolve_operand(&ae.rexpr);
-
-            let is_arithmetic = matches!(op.as_str(), "+" | "-" | "*" | "/" | "%");
-            let is_concat = op == "||";
-
-            let ts_type = if is_arithmetic {
-                if l_null || r_null {
-                    "number | null".to_string()
-                } else {
-                    "number".to_string()
-                }
-            } else if is_concat {
-                if l_null || r_null {
-                    "string | null".to_string()
-                } else {
-                    "string".to_string()
-                }
-            } else if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
-                if l_null || r_null {
-                    "boolean | null".to_string()
-                } else {
-                    "boolean".to_string()
-                }
-            } else {
-                "unknown".to_string()
-            };
-
-            fields.push(QueryField { name, ts_type });
-            Ok(())
-        }
-        Some(NodeEnum::AArrayExpr(aae)) => {
-            let name = explicit_alias.unwrap_or_else(|| "arr".to_string());
-            let mut elem_type = "unknown".to_string();
-            if let Some(first) = aae.elements.first() {
-                let mut sub_fields = Vec::new();
-                let dummy_rt = pg_query::protobuf::ResTarget {
-                    name: String::new(),
-                    indirection: Vec::new(),
-                    val: Some(Box::new(first.clone())),
-                    location: 0,
-                };
-                if resolve_target(&dummy_rt, catalog, tables, &mut sub_fields).is_ok()
-                    && let Some(f) = sub_fields.first()
-                {
-                    elem_type = f.ts_type.replace(" | null", "").trim().to_string();
-                }
-            }
-            fields.push(QueryField {
-                name,
-                ts_type: format!("{}[]", elem_type),
+            // Single column reference
+            let inferred = infer_expr(val_node, catalog, tables)?;
+            let name = explicit_alias.unwrap_or_else(|| {
+                cr.fields
+                    .last()
+                    .and_then(extract_string)
+                    .unwrap_or_else(|| "column".to_string())
             });
+            let ts_type = if inferred.is_nullable {
+                format_nullable(&inferred.pg_type.to_ts(catalog))
+            } else {
+                inferred.pg_type.to_ts(catalog)
+            };
+            fields.push(QueryField { name, ts_type });
             Ok(())
         }
         _ => {
-            let name = explicit_alias.unwrap_or_else(|| "column".to_string());
+            let inferred = infer_expr(val_node, catalog, tables)?;
+            let ts_type = if inferred.is_nullable {
+                format_nullable(&inferred.pg_type.to_ts(catalog))
+            } else {
+                inferred.pg_type.to_ts(catalog)
+            };
+            let default_name = match &val_node.node {
+                Some(NodeEnum::FuncCall(fc)) => extract_func_name(&fc.funcname),
+                Some(NodeEnum::CaseExpr(_)) => "case".to_string(),
+                Some(NodeEnum::CoalesceExpr(_)) => "coalesce".to_string(),
+                Some(NodeEnum::NullTest(_)) => "null_test".to_string(),
+                Some(NodeEnum::BooleanTest(_)) => "bool_test".to_string(),
+                Some(NodeEnum::SubLink(_)) => "subquery".to_string(),
+                Some(NodeEnum::AConst(_)) => "constant".to_string(),
+                Some(NodeEnum::AExpr(_)) => "expr".to_string(),
+                Some(NodeEnum::TypeCast(_)) => "cast".to_string(),
+                Some(NodeEnum::AArrayExpr(_)) => "arr".to_string(),
+                _ => "column".to_string(),
+            };
             fields.push(QueryField {
-                name,
-                ts_type: "unknown".to_string(),
+                name: explicit_alias.unwrap_or(default_name),
+                ts_type,
             });
             Ok(())
         }
@@ -1219,6 +1612,69 @@ fn resolve_params_in_expr(
         Some(NodeEnum::NullTest(nt)) => {
             if let Some(arg) = &nt.arg {
                 resolve_params_in_expr(arg, catalog, tables, param_map)?;
+            }
+        }
+        Some(NodeEnum::BooleanTest(bt)) => {
+            if let Some(arg) = &bt.arg {
+                resolve_params_in_expr(arg, catalog, tables, param_map)?;
+            }
+        }
+        Some(NodeEnum::CaseExpr(ce)) => {
+            for arg in &ce.args {
+                resolve_params_in_expr(arg, catalog, tables, param_map)?;
+            }
+            if let Some(def) = &ce.defresult {
+                resolve_params_in_expr(def, catalog, tables, param_map)?;
+            }
+        }
+        Some(NodeEnum::CaseWhen(cw)) => {
+            if let Some(expr) = &cw.expr {
+                resolve_params_in_expr(expr, catalog, tables, param_map)?;
+            }
+            if let Some(res) = &cw.result {
+                resolve_params_in_expr(res, catalog, tables, param_map)?;
+            }
+        }
+        Some(NodeEnum::CoalesceExpr(ce)) => {
+            for arg in &ce.args {
+                resolve_params_in_expr(arg, catalog, tables, param_map)?;
+            }
+        }
+        Some(NodeEnum::FuncCall(fc)) => {
+            for arg in &fc.args {
+                resolve_params_in_expr(arg, catalog, tables, param_map)?;
+            }
+        }
+        Some(NodeEnum::SubLink(sl)) => {
+            if let Some(testexpr) = &sl.testexpr {
+                resolve_params_in_expr(testexpr, catalog, tables, param_map)?;
+            }
+            if let Some(sub_node) = &sl.subselect
+                && let Some(NodeEnum::SelectStmt(sub_select)) = &sub_node.node
+            {
+                let mut sub_catalog = catalog.clone();
+                if let Some(wc) = &sub_select.with_clause {
+                    let _ = register_ctes(wc, &mut sub_catalog, param_map);
+                }
+                let mut sub_tables = tables.to_vec();
+                for from_item in &sub_select.from_clause {
+                    let _ = collect_from_node(from_item, false, &sub_catalog, &mut sub_tables);
+                }
+                for target in &sub_select.target_list {
+                    if let Some(NodeEnum::ResTarget(rt)) = &target.node
+                        && let Some(val) = &rt.val
+                    {
+                        resolve_params_in_expr(val, &sub_catalog, &sub_tables, param_map)?;
+                    }
+                }
+                if let Some(where_node) = &sub_select.where_clause {
+                    resolve_params_in_expr(where_node, &sub_catalog, &sub_tables, param_map)?;
+                }
+            }
+        }
+        Some(NodeEnum::ResTarget(rt)) => {
+            if let Some(val) = &rt.val {
+                resolve_params_in_expr(val, catalog, tables, param_map)?;
             }
         }
         _ => {}
@@ -1683,5 +2139,215 @@ RIGHT JOIN posts p ON p.user_id = u.id;
 
         // No row return projection
         assert!(analyzed.fields.is_empty());
+    }
+
+    #[test]
+    fn test_unify_types() {
+        assert_eq!(
+            unify_types(&PgType::Int2, &PgType::Int4).unwrap(),
+            PgType::Int4
+        );
+        assert_eq!(
+            unify_types(&PgType::Int4, &PgType::Int8).unwrap(),
+            PgType::Int8
+        );
+        assert_eq!(
+            unify_types(&PgType::Int8, &PgType::Numeric).unwrap(),
+            PgType::Numeric
+        );
+        assert_eq!(
+            unify_types(&PgType::Float4, &PgType::Float8).unwrap(),
+            PgType::Float8
+        );
+        assert_eq!(
+            unify_types(&PgType::Float4, &PgType::Numeric).unwrap(),
+            PgType::Numeric
+        );
+        assert_eq!(
+            unify_types(&PgType::Int4, &PgType::Float4).unwrap(),
+            PgType::Float8
+        );
+
+        // String hierarchy: Varchar / Uuid widen to Text
+        assert_eq!(
+            unify_types(&PgType::Varchar, &PgType::Text).unwrap(),
+            PgType::Text
+        );
+        assert_eq!(
+            unify_types(&PgType::Uuid, &PgType::Text).unwrap(),
+            PgType::Text
+        );
+        assert_eq!(
+            unify_types(&PgType::Varchar, &PgType::Uuid).unwrap(),
+            PgType::Text
+        );
+
+        // Datetime hierarchy: Date -> Timestamp -> Timestamptz
+        assert_eq!(
+            unify_types(&PgType::Date, &PgType::Timestamp).unwrap(),
+            PgType::Timestamp
+        );
+        assert_eq!(
+            unify_types(&PgType::Timestamp, &PgType::Timestamptz).unwrap(),
+            PgType::Timestamptz
+        );
+        assert_eq!(
+            unify_types(&PgType::Date, &PgType::Timestamptz).unwrap(),
+            PgType::Timestamptz
+        );
+
+        // Unknown unifies to concrete companion
+        assert_eq!(
+            unify_types(&PgType::Unknown, &PgType::Text).unwrap(),
+            PgType::Text
+        );
+        assert_eq!(
+            unify_types(&PgType::Int8, &PgType::Unknown).unwrap(),
+            PgType::Int8
+        );
+
+        // Incompatible types
+        assert!(unify_types(&PgType::Bool, &PgType::Int4).is_err());
+    }
+
+    #[test]
+    fn test_advanced_coalesce_inference() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "
+            CREATE TABLE users (
+                id UUID PRIMARY KEY,
+                nickname TEXT,
+                alt_name VARCHAR(100)
+            );
+        ",
+            )
+            .unwrap();
+
+        // Statically non-nullable because literal 'anonymous' is non-null
+        let sql = "SELECT COALESCE(users.nickname, 'anonymous') AS display_name FROM users;";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.fields.len(), 1);
+        assert_eq!(analyzed.fields[0].name, "display_name");
+        assert_eq!(analyzed.fields[0].ts_type, "string");
+
+        // Nullable because both operands are nullable columns
+        let sql2 = "SELECT COALESCE(users.nickname, users.alt_name) AS display_name FROM users;";
+        let analyzed2 = analyze_query(sql2, &catalog, None).unwrap();
+        assert_eq!(analyzed2.fields.len(), 1);
+        assert_eq!(analyzed2.fields[0].name, "display_name");
+        assert_eq!(analyzed2.fields[0].ts_type, "string | null");
+    }
+
+    #[test]
+    fn test_advanced_case_inference() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "
+            CREATE TABLE users (
+                id UUID PRIMARY KEY,
+                status INT NOT NULL
+            );
+        ",
+            )
+            .unwrap();
+
+        // Non-nullable string because both branches are non-null and ELSE is present
+        let sql = "SELECT CASE WHEN status = 1 THEN 'active' ELSE 'inactive' END AS status_text FROM users;";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.fields.len(), 1);
+        assert_eq!(analyzed.fields[0].name, "status_text");
+        assert_eq!(analyzed.fields[0].ts_type, "string");
+
+        // Nullable string because ELSE is omitted
+        let sql2 = "SELECT CASE WHEN status = 1 THEN 'active' END AS status_text FROM users;";
+        let analyzed2 = analyze_query(sql2, &catalog, None).unwrap();
+        assert_eq!(analyzed2.fields.len(), 1);
+        assert_eq!(analyzed2.fields[0].name, "status_text");
+        assert_eq!(analyzed2.fields[0].ts_type, "string | null");
+    }
+
+    #[test]
+    fn test_advanced_window_functions_inference() {
+        let mut catalog_pg = Catalog::default();
+        catalog_pg
+            .apply_sql(
+                "
+            CREATE TABLE users (
+                id UUID PRIMARY KEY
+            );
+        ",
+            )
+            .unwrap();
+
+        let sql = "SELECT ROW_NUMBER() OVER (ORDER BY id) AS row_num FROM users;";
+        let analyzed_pg = analyze_query(sql, &catalog_pg, None).unwrap();
+        assert_eq!(analyzed_pg.fields.len(), 1);
+        assert_eq!(analyzed_pg.fields[0].name, "row_num");
+        // Under postgres/pg driver, Int8 maps to string
+        assert_eq!(analyzed_pg.fields[0].ts_type, "string");
+
+        // Under bun driver, Int8 maps to bigint
+        let catalog_bun = catalog_pg.clone().with_driver(DriverTarget::Bun);
+        let analyzed_bun = analyze_query(sql, &catalog_bun, None).unwrap();
+        assert_eq!(analyzed_bun.fields.len(), 1);
+        assert_eq!(analyzed_bun.fields[0].name, "row_num");
+        assert_eq!(analyzed_bun.fields[0].ts_type, "bigint");
+    }
+
+    #[test]
+    fn test_advanced_scalar_subquery_inference() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "
+            CREATE TABLE users (
+                id UUID PRIMARY KEY,
+                email TEXT NOT NULL
+            );
+        ",
+            )
+            .unwrap();
+
+        let sql = "SELECT (SELECT id FROM users WHERE email = $1) AS user_id;";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.fields.len(), 1);
+        assert_eq!(analyzed.fields[0].name, "user_id");
+        // Scalar subquery is strictly nullable because 0 matching rows yields SQL NULL
+        assert_eq!(analyzed.fields[0].ts_type, "string | null");
+
+        // Parameter $1 inferred from subquery's WHERE email = $1
+        assert_eq!(analyzed.params.len(), 1);
+        assert_eq!(analyzed.params[0].index, 1);
+        assert_eq!(analyzed.params[0].name, "email");
+        assert_eq!(analyzed.params[0].ts_type, "string");
+        assert!(!analyzed.params[0].is_optional);
+    }
+
+    #[test]
+    fn test_null_test_and_boolean_test() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "
+            CREATE TABLE users (
+                id UUID PRIMARY KEY,
+                nickname TEXT,
+                active BOOLEAN NOT NULL
+            );
+        ",
+            )
+            .unwrap();
+
+        let sql =
+            "SELECT (nickname IS NULL) AS is_missing, (active IS TRUE) AS is_active FROM users;";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.fields.len(), 2);
+        assert_eq!(analyzed.fields[0].name, "is_missing");
+        assert_eq!(analyzed.fields[0].ts_type, "boolean");
+        assert_eq!(analyzed.fields[1].name, "is_active");
+        assert_eq!(analyzed.fields[1].ts_type, "boolean");
     }
 }

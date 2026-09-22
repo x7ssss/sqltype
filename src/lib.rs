@@ -5,6 +5,7 @@ pub mod lsp;
 pub mod ts_scanner;
 pub mod watcher;
 
+pub use analyzer::{PgType, unify_types};
 pub use catalog::DriverTarget;
 pub use codegen::{CodegenOptions, get_output_file_name};
 pub use ts_scanner::{ExtractedQuery, is_query_file, is_ts_js_file, scan_ts_queries};
