@@ -1,7 +1,7 @@
 use crate::catalog::{Catalog, ColumnMetadata, DriverTarget, TableMetadata, extract_type_name};
 use pg_query::NodeEnum;
 use pg_query::protobuf::{
-    AExprKind, BoolExprType, JoinType, NullTestType, SetOperation, SubLinkType,
+    AExprKind, BoolExprType, JoinType, NullTestType, OnConflictAction, SetOperation, SubLinkType,
 };
 use std::collections::HashMap;
 
@@ -608,6 +608,16 @@ impl QueryScope {
                 ));
             }
             if matched.len() > 1 {
+                let non_excluded: Vec<_> = matched
+                    .iter()
+                    .filter(|(b, _)| !b.exposed_name.eq_ignore_ascii_case("excluded"))
+                    .collect();
+                if non_excluded.len() == 1 {
+                    let (binding, col) = non_excluded[0];
+                    let is_nullable = col.is_nullable || binding.is_null_padded;
+                    return Ok((col, is_nullable));
+                }
+
                 let tables: Vec<String> = matched
                     .iter()
                     .map(|(b, _)| b.exposed_name.clone())
@@ -1383,6 +1393,90 @@ fn analyze_select_stmt(
     Ok(fields)
 }
 
+fn collect_param_refs(node: &pg_query::protobuf::Node, out: &mut Vec<i32>) {
+    match &node.node {
+        Some(NodeEnum::ParamRef(p)) => {
+            out.push(p.number);
+        }
+        Some(NodeEnum::AExpr(ae)) => {
+            if let Some(l) = &ae.lexpr {
+                collect_param_refs(l, out);
+            }
+            if let Some(r) = &ae.rexpr {
+                collect_param_refs(r, out);
+            }
+        }
+        Some(NodeEnum::TypeCast(tc)) => {
+            if let Some(arg) = &tc.arg {
+                collect_param_refs(arg, out);
+            }
+        }
+        Some(NodeEnum::FuncCall(fc)) => {
+            for arg in &fc.args {
+                collect_param_refs(arg, out);
+            }
+        }
+        Some(NodeEnum::CoalesceExpr(ce)) => {
+            for arg in &ce.args {
+                collect_param_refs(arg, out);
+            }
+        }
+        Some(NodeEnum::CaseExpr(ce)) => {
+            for arg in &ce.args {
+                collect_param_refs(arg, out);
+            }
+            if let Some(def) = &ce.defresult {
+                collect_param_refs(def, out);
+            }
+        }
+        Some(NodeEnum::CaseWhen(cw)) => {
+            if let Some(expr) = &cw.expr {
+                collect_param_refs(expr, out);
+            }
+            if let Some(res) = &cw.result {
+                collect_param_refs(res, out);
+            }
+        }
+        Some(NodeEnum::BoolExpr(be)) => {
+            for arg in &be.args {
+                collect_param_refs(arg, out);
+            }
+        }
+        Some(NodeEnum::NullTest(nt)) => {
+            if let Some(arg) = &nt.arg {
+                collect_param_refs(arg, out);
+            }
+        }
+        Some(NodeEnum::BooleanTest(bt)) => {
+            if let Some(arg) = &bt.arg {
+                collect_param_refs(arg, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn bind_untyped_params_in_node(
+    node: &pg_query::protobuf::Node,
+    target_col: &ColumnMeta,
+    param_map: &mut HashMap<i32, ParamInfo>,
+) {
+    let mut param_nums = Vec::new();
+    collect_param_refs(node, &mut param_nums);
+    for num in param_nums {
+        let entry = param_map.entry(num).or_default();
+        if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
+            entry.inferred_type = Some(target_col.ts_type.clone());
+        }
+        if entry.suggested_name.is_none() {
+            entry.suggested_name = Some(target_col.name.clone());
+        }
+        if target_col.is_nullable {
+            entry.is_optional = true;
+        }
+    }
+}
+
 fn analyze_insert_stmt(
     insert: &pg_query::protobuf::InsertStmt,
     catalog: &Catalog,
@@ -1470,6 +1564,9 @@ fn analyze_insert_stmt(
                                 )?;
                             } else {
                                 resolve_params_in_expr(val_node, catalog, &scope, param_map)?;
+                                if let Some(target_col) = col_meta {
+                                    bind_untyped_params_in_node(val_node, target_col, param_map);
+                                }
                             }
                         }
                     }
@@ -1482,13 +1579,42 @@ fn analyze_insert_stmt(
 
     // Process on_conflict_clause if present
     if let Some(occ) = &insert.on_conflict_clause {
+        let is_update = occ.action == OnConflictAction::OnconflictUpdate as i32;
+        let conflict_scope = if is_update {
+            let mut cs = scope.clone();
+            let mut excluded_cols = HashMap::new();
+            for col in &table_meta.columns {
+                excluded_cols.insert(col.name.to_ascii_lowercase(), col.clone());
+            }
+            let excluded_binding = TableBinding {
+                base_table: "excluded".to_string(),
+                exposed_name: "excluded".to_string(),
+                has_explicit_alias: false,
+                is_null_padded: false,
+                columns: excluded_cols,
+            };
+            cs.add_binding(excluded_binding)?;
+            cs
+        } else {
+            scope.clone()
+        };
+
+        if let Some(infer) = &occ.infer
+            && let Some(where_node) = &infer.where_clause
+        {
+            resolve_params_in_expr(where_node, catalog, &scope, param_map)?;
+        }
+
         for target in &occ.target_list {
             if let Some(NodeEnum::ResTarget(rt)) = &target.node {
                 let col_name = &rt.name;
-                let is_optional = table_meta
-                    .get_column(col_name)
-                    .map(|c| c.is_nullable)
-                    .unwrap_or(false);
+                let target_col = table_meta.get_column(col_name).ok_or_else(|| {
+                    format!(
+                        "Column \"{}\" does not exist on table \"{}\"",
+                        col_name, table_name
+                    )
+                })?;
+                let is_optional = target_col.is_nullable;
                 if let Some(val_node) = &rt.val {
                     if let Some((param_num, cast_opt)) = extract_param_info(val_node) {
                         record_param(
@@ -1497,18 +1623,19 @@ fn analyze_insert_stmt(
                             None,
                             col_name,
                             catalog,
-                            &scope,
+                            &conflict_scope,
                             param_map,
                             is_optional,
                         )?;
                     } else {
-                        resolve_params_in_expr(val_node, catalog, &scope, param_map)?;
+                        resolve_params_in_expr(val_node, catalog, &conflict_scope, param_map)?;
+                        bind_untyped_params_in_node(val_node, target_col, param_map);
                     }
                 }
             }
         }
         if let Some(where_node) = &occ.where_clause {
-            resolve_params_in_expr(where_node, catalog, &scope, param_map)?;
+            resolve_params_in_expr(where_node, catalog, &conflict_scope, param_map)?;
         }
     }
 
@@ -1577,16 +1704,15 @@ fn analyze_update_stmt(
     for target in &update.target_list {
         if let Some(NodeEnum::ResTarget(rt)) = &target.node {
             let col_name = &rt.name;
-            if table_meta.get_column(col_name).is_none() {
-                return Err(format!(
+            let target_col = table_meta.get_column(col_name).ok_or_else(|| {
+                format!(
                     "Column \"{}\" does not exist on table \"{}\"",
                     col_name, table_name
-                ));
-            }
+                )
+            })?;
+            let is_optional = target_col.is_nullable;
             if let Some(val_node) = &rt.val {
                 if let Some((param_num, cast_opt)) = extract_param_info(val_node) {
-                    let col = table_meta.get_column(col_name);
-                    let is_optional = col.map(|c| c.is_nullable).unwrap_or(false);
                     record_param(
                         param_num,
                         cast_opt,
@@ -1599,6 +1725,7 @@ fn analyze_update_stmt(
                     )?;
                 } else {
                     resolve_params_in_expr(val_node, catalog, &scope, param_map)?;
+                    bind_untyped_params_in_node(val_node, target_col, param_map);
                 }
             }
         }
@@ -4373,5 +4500,133 @@ FROM users u;
         ";
         let analyzed_dyn = analyze_query(query_dyn, &catalog, None).unwrap();
         assert_eq!(analyzed_dyn.fields[0].ts_type, "Record<string, unknown>");
+    }
+
+    #[test]
+    fn test_dml_insert_values_and_returning_wildcard() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "
+                CREATE TABLE users (
+                    id UUID PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    email TEXT NOT NULL
+                );
+            ",
+            )
+            .unwrap();
+
+        let sql = "
+            -- name: InsertUser
+            INSERT INTO users (id, name, email) VALUES ($1, $2, $3) RETURNING *;
+        ";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.name, "InsertUser");
+        assert_eq!(analyzed.params.len(), 3);
+        assert_eq!(analyzed.params[0].name, "id");
+        assert_eq!(analyzed.params[0].ts_type, "string");
+        assert_eq!(analyzed.params[1].name, "name");
+        assert_eq!(analyzed.params[1].ts_type, "string");
+        assert_eq!(analyzed.params[2].name, "email");
+        assert_eq!(analyzed.params[2].ts_type, "string");
+
+        assert_eq!(analyzed.fields.len(), 3);
+        assert_eq!(analyzed.fields[0].name, "id");
+        assert_eq!(analyzed.fields[0].ts_type, "string");
+        assert_eq!(analyzed.fields[1].name, "name");
+        assert_eq!(analyzed.fields[1].ts_type, "string");
+        assert_eq!(analyzed.fields[2].name, "email");
+        assert_eq!(analyzed.fields[2].ts_type, "string");
+    }
+
+    #[test]
+    fn test_dml_upsert_with_excluded() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "
+                CREATE TABLE counters (
+                    key TEXT PRIMARY KEY,
+                    val INT NOT NULL
+                );
+            ",
+            )
+            .unwrap();
+
+        let sql = "
+            -- name: UpsertCounter
+            INSERT INTO counters (key, val) VALUES ($1, $2)
+            ON CONFLICT (key) DO UPDATE SET val = EXCLUDED.val + 1
+            RETURNING val;
+        ";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.name, "UpsertCounter");
+        assert_eq!(analyzed.params.len(), 2);
+        assert_eq!(analyzed.params[0].name, "key");
+        assert_eq!(analyzed.params[0].ts_type, "string");
+        assert_eq!(analyzed.params[1].name, "val");
+        assert_eq!(analyzed.params[1].ts_type, "number");
+
+        assert_eq!(analyzed.fields.len(), 1);
+        assert_eq!(analyzed.fields[0].name, "val");
+        assert_eq!(analyzed.fields[0].ts_type, "number");
+    }
+
+    #[test]
+    fn test_dml_update_with_set_parameters() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "
+                CREATE TABLE accounts (
+                    id UUID PRIMARY KEY,
+                    balance NUMERIC NOT NULL
+                );
+            ",
+            )
+            .unwrap();
+
+        let sql = "
+            -- name: DebitAccount
+            UPDATE accounts SET balance = balance - $1 WHERE id = $2 RETURNING balance;
+        ";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.name, "DebitAccount");
+        assert_eq!(analyzed.params.len(), 2);
+        assert_eq!(analyzed.params[0].name, "balance");
+        assert_eq!(analyzed.params[0].ts_type, "number");
+        assert_eq!(analyzed.params[1].name, "id");
+        assert_eq!(analyzed.params[1].ts_type, "string");
+
+        assert_eq!(analyzed.fields.len(), 1);
+        assert_eq!(analyzed.fields[0].name, "balance");
+        assert_eq!(analyzed.fields[0].ts_type, "number");
+    }
+
+    #[test]
+    fn test_dml_delete_with_where() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "
+                CREATE TABLE sessions (
+                    id UUID PRIMARY KEY,
+                    expires_at TIMESTAMPTZ NOT NULL
+                );
+            ",
+            )
+            .unwrap();
+
+        let sql = "
+            -- name: CleanSessions
+            DELETE FROM sessions WHERE expires_at < $1;
+        ";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.name, "CleanSessions");
+        assert_eq!(analyzed.params.len(), 1);
+        assert_eq!(analyzed.params[0].name, "expires_at");
+        assert_eq!(analyzed.params[0].ts_type, "Date");
+        assert_eq!(analyzed.fields.len(), 0);
     }
 }
