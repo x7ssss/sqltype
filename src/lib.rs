@@ -5,3 +5,4 @@ pub mod watcher;
 pub mod lsp;
 
 pub use catalog::DriverTarget;
+pub use codegen::CodegenOptions;

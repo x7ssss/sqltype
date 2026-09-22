@@ -1,4 +1,5 @@
 use crate::analyzer::AnalyzedQuery;
+use crate::catalog::DriverTarget;
 
 /// Converts PascalCase or general string to camelCase.
 pub fn to_camel_case(s: &str) -> String {
@@ -57,8 +58,131 @@ fn sanitize_sql_template(sql: &str) -> String {
         .replace("${", "\\${")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CodegenOptions {
+    pub driver: DriverTarget,
+    pub wrappers: bool,
+}
+
+impl CodegenOptions {
+    pub fn new(driver: DriverTarget, wrappers: bool) -> Self {
+        Self { driver, wrappers }
+    }
+}
+
+/// Formats the argument expressions to pass to the query execution wrapper in strict $1, $2, ... numerical order.
+fn format_wrapper_param_args(query: &AnalyzedQuery) -> String {
+    let mut sorted_params = query.params.clone();
+    sorted_params.sort_by_key(|p| p.index);
+
+    let args: Vec<String> = sorted_params
+        .iter()
+        .map(|param| {
+            let key = if is_valid_js_identifier(&param.name) {
+                format!("params.{}", param.name)
+            } else {
+                format!("params[\"{}\"]", param.name.replace('"', "\\\""))
+            };
+            if param.is_optional {
+                format!("{} ?? null", key)
+            } else {
+                key
+            }
+        })
+        .collect();
+
+    args.join(", ")
+}
+
+/// Generates a typed query execution wrapper function for a single analyzed query.
+pub fn generate_query_wrapper(query: &AnalyzedQuery, driver: DriverTarget) -> String {
+    let name = &query.name;
+    let camel_name = to_camel_case(name);
+    let sql_const_name = format!("{}Sql", camel_name);
+
+    let has_rows = !query.fields.is_empty();
+    let has_params = !query.params.is_empty();
+
+    let client_arg = match driver {
+        DriverTarget::Postgres => "sql: postgres.Sql",
+        DriverTarget::Pg => "client: pg.ClientBase | pg.Pool",
+        DriverTarget::Bun => "sql: import(\"bun\").SQL",
+    };
+
+    let params_arg = if has_params {
+        format!(", params: {}Params", name)
+    } else {
+        String::new()
+    };
+
+    let return_type = if has_rows {
+        format!("Promise<{}Row[]>", name)
+    } else {
+        "Promise<void>".to_string()
+    };
+
+    let args_str = format_wrapper_param_args(query);
+
+    let mut out = String::new();
+    let full_args = format!("{}{}", client_arg, params_arg);
+    out.push_str(&format!(
+        "export async function {}({}): {} {{\n",
+        camel_name, full_args, return_type
+    ));
+
+    match driver {
+        DriverTarget::Postgres => {
+            if has_rows {
+                out.push_str(&format!(
+                    "  return await sql<{}Row[]>`${{sql.unsafe({}, [{}])}}`;\n",
+                    name, sql_const_name, args_str
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  await sql.unsafe({}, [{}]);\n",
+                    sql_const_name, args_str
+                ));
+            }
+        }
+        DriverTarget::Pg => {
+            if has_rows {
+                out.push_str(&format!(
+                    "  const res = await client.query<{}Row>({}, [{}]);\n  return res.rows;\n",
+                    name, sql_const_name, args_str
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  await client.query({}, [{}]);\n",
+                    sql_const_name, args_str
+                ));
+            }
+        }
+        DriverTarget::Bun => {
+            if has_rows {
+                out.push_str(&format!(
+                    "  return await sql<{}Row[]>`${{sql.raw({}, [{}])}}`;\n",
+                    name, sql_const_name, args_str
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  await sql.raw({}, [{}]);\n",
+                    sql_const_name, args_str
+                ));
+            }
+        }
+    }
+
+    out.push_str("}\n");
+    out
+}
+
 /// Generates TypeScript code for a single analyzed query.
 pub fn generate_query_ts(query: &AnalyzedQuery) -> String {
+    generate_query_ts_with_options(query, &CodegenOptions::default())
+}
+
+/// Generates TypeScript code for a single analyzed query with specified options.
+pub fn generate_query_ts_with_options(query: &AnalyzedQuery, options: &CodegenOptions) -> String {
     let name = &query.name;
     let camel_name = to_camel_case(name);
     let sql_const_name = format!("{}Sql", camel_name);
@@ -111,11 +235,22 @@ pub fn generate_query_ts(query: &AnalyzedQuery) -> String {
     }
     out.push_str("};\n");
 
+    // 5. Execution Wrapper (if enabled)
+    if options.wrappers {
+        out.push('\n');
+        out.push_str(&generate_query_wrapper(query, options.driver));
+    }
+
     out
 }
 
 /// Generates a complete TypeScript file for one or more analyzed queries.
 pub fn generate_file_ts(queries: &[AnalyzedQuery]) -> String {
+    generate_file_ts_with_options(queries, &CodegenOptions::default())
+}
+
+/// Generates a complete TypeScript file for one or more analyzed queries with specified options.
+pub fn generate_file_ts_with_options(queries: &[AnalyzedQuery], options: &CodegenOptions) -> String {
     let mut out = String::new();
     out.push_str("// Autogenerated by sqltype. DO NOT EDIT.\n\n");
 
@@ -123,7 +258,7 @@ pub fn generate_file_ts(queries: &[AnalyzedQuery]) -> String {
         if i > 0 {
             out.push('\n');
         }
-        out.push_str(&generate_query_ts(query));
+        out.push_str(&generate_query_ts_with_options(query, options));
     }
 
     out
@@ -355,5 +490,197 @@ GROUP BY u.id, u.email, p.title;
         assert!(!ts.contains("DeleteUserRow"));
         assert!(!ts.contains("row:"));
         assert!(ts.contains("export type DeleteUserQuery = {\n  sql: string;\n  params: DeleteUserParams;\n};"));
+    }
+
+    #[test]
+    fn test_wrappers_postgres_driver() {
+        use crate::catalog::DriverTarget;
+
+        let query_with_rows = AnalyzedQuery {
+            name: "GetUser".to_string(),
+            raw_sql: "SELECT id, name FROM users WHERE id = $1;".to_string(),
+            params: vec![QueryParam {
+                index: 1,
+                name: "id".to_string(),
+                ts_type: "string".to_string(),
+                is_optional: false,
+            }],
+            fields: vec![
+                QueryField {
+                    name: "id".to_string(),
+                    ts_type: "string".to_string(),
+                },
+                QueryField {
+                    name: "name".to_string(),
+                    ts_type: "string".to_string(),
+                },
+            ],
+        };
+
+        let options = CodegenOptions::new(DriverTarget::Postgres, true);
+        let ts = generate_file_ts_with_options(&[query_with_rows], &options);
+
+        let expected_wrapper = "export async function getUser(sql: postgres.Sql, params: GetUserParams): Promise<GetUserRow[]> {\n  return await sql<GetUserRow[]>`${sql.unsafe(getUserSql, [params.id])}`;\n}";
+        assert!(ts.contains(expected_wrapper), "Expected wrapper:\n{}\n\nFound:\n{}", expected_wrapper, ts);
+
+        // Mutation without rows
+        let query_mutation = AnalyzedQuery {
+            name: "DeleteUser".to_string(),
+            raw_sql: "DELETE FROM users WHERE id = $1;".to_string(),
+            params: vec![QueryParam {
+                index: 1,
+                name: "id".to_string(),
+                ts_type: "string".to_string(),
+                is_optional: false,
+            }],
+            fields: vec![],
+        };
+
+        let ts_mut = generate_file_ts_with_options(&[query_mutation], &options);
+        let expected_mut_wrapper = "export async function deleteUser(sql: postgres.Sql, params: DeleteUserParams): Promise<void> {\n  await sql.unsafe(deleteUserSql, [params.id]);\n}";
+        assert!(ts_mut.contains(expected_mut_wrapper), "Expected wrapper:\n{}\n\nFound:\n{}", expected_mut_wrapper, ts_mut);
+    }
+
+    #[test]
+    fn test_wrappers_pg_driver() {
+        use crate::catalog::DriverTarget;
+
+        let query_with_rows = AnalyzedQuery {
+            name: "GetUser".to_string(),
+            raw_sql: "SELECT id FROM users WHERE id = $1;".to_string(),
+            params: vec![QueryParam {
+                index: 1,
+                name: "id".to_string(),
+                ts_type: "string".to_string(),
+                is_optional: false,
+            }],
+            fields: vec![QueryField {
+                name: "id".to_string(),
+                ts_type: "string".to_string(),
+            }],
+        };
+
+        let options = CodegenOptions::new(DriverTarget::Pg, true);
+        let ts = generate_file_ts_with_options(&[query_with_rows], &options);
+
+        let expected_wrapper = "export async function getUser(client: pg.ClientBase | pg.Pool, params: GetUserParams): Promise<GetUserRow[]> {\n  const res = await client.query<GetUserRow>(getUserSql, [params.id]);\n  return res.rows;\n}";
+        assert!(ts.contains(expected_wrapper), "Expected wrapper:\n{}\n\nFound:\n{}", expected_wrapper, ts);
+
+        // Mutation without rows
+        let query_mutation = AnalyzedQuery {
+            name: "DeleteUser".to_string(),
+            raw_sql: "DELETE FROM users WHERE id = $1;".to_string(),
+            params: vec![QueryParam {
+                index: 1,
+                name: "id".to_string(),
+                ts_type: "string".to_string(),
+                is_optional: false,
+            }],
+            fields: vec![],
+        };
+
+        let ts_mut = generate_file_ts_with_options(&[query_mutation], &options);
+        let expected_mut_wrapper = "export async function deleteUser(client: pg.ClientBase | pg.Pool, params: DeleteUserParams): Promise<void> {\n  await client.query(deleteUserSql, [params.id]);\n}";
+        assert!(ts_mut.contains(expected_mut_wrapper), "Expected wrapper:\n{}\n\nFound:\n{}", expected_mut_wrapper, ts_mut);
+    }
+
+    #[test]
+    fn test_wrappers_bun_driver() {
+        use crate::catalog::DriverTarget;
+
+        let query_with_rows = AnalyzedQuery {
+            name: "GetUser".to_string(),
+            raw_sql: "SELECT id FROM users WHERE id = $1;".to_string(),
+            params: vec![QueryParam {
+                index: 1,
+                name: "id".to_string(),
+                ts_type: "string".to_string(),
+                is_optional: false,
+            }],
+            fields: vec![QueryField {
+                name: "id".to_string(),
+                ts_type: "string".to_string(),
+            }],
+        };
+
+        let options = CodegenOptions::new(DriverTarget::Bun, true);
+        let ts = generate_file_ts_with_options(&[query_with_rows], &options);
+
+        let expected_wrapper = "export async function getUser(sql: import(\"bun\").SQL, params: GetUserParams): Promise<GetUserRow[]> {\n  return await sql<GetUserRow[]>`${sql.raw(getUserSql, [params.id])}`;\n}";
+        assert!(ts.contains(expected_wrapper), "Expected wrapper:\n{}\n\nFound:\n{}", expected_wrapper, ts);
+
+        // Mutation without rows
+        let query_mutation = AnalyzedQuery {
+            name: "DeleteUser".to_string(),
+            raw_sql: "DELETE FROM users WHERE id = $1;".to_string(),
+            params: vec![QueryParam {
+                index: 1,
+                name: "id".to_string(),
+                ts_type: "string".to_string(),
+                is_optional: false,
+            }],
+            fields: vec![],
+        };
+
+        let ts_mut = generate_file_ts_with_options(&[query_mutation], &options);
+        let expected_mut_wrapper = "export async function deleteUser(sql: import(\"bun\").SQL, params: DeleteUserParams): Promise<void> {\n  await sql.raw(deleteUserSql, [params.id]);\n}";
+        assert!(ts_mut.contains(expected_mut_wrapper), "Expected wrapper:\n{}\n\nFound:\n{}", expected_mut_wrapper, ts_mut);
+    }
+
+    #[test]
+    fn test_wrappers_no_params() {
+        use crate::catalog::DriverTarget;
+
+        let query = AnalyzedQuery {
+            name: "GetActiveUsers".to_string(),
+            raw_sql: "SELECT id FROM users WHERE active = true;".to_string(),
+            params: vec![],
+            fields: vec![QueryField {
+                name: "id".to_string(),
+                ts_type: "string".to_string(),
+            }],
+        };
+
+        let options = CodegenOptions::new(DriverTarget::Postgres, true);
+        let ts = generate_file_ts_with_options(&[query], &options);
+
+        let expected_wrapper = "export async function getActiveUsers(sql: postgres.Sql): Promise<GetActiveUsersRow[]> {\n  return await sql<GetActiveUsersRow[]>`${sql.unsafe(getActiveUsersSql, [])}`;\n}";
+        assert!(ts.contains(expected_wrapper), "Expected wrapper:\n{}\n\nFound:\n{}", expected_wrapper, ts);
+    }
+
+    #[test]
+    fn test_wrappers_optional_param_and_ordering() {
+        use crate::catalog::DriverTarget;
+
+        let query = AnalyzedQuery {
+            name: "FindUsers".to_string(),
+            raw_sql: "SELECT id FROM users WHERE ($1::text IS NULL OR name = $1) AND id = $2;".to_string(),
+            // Deliberately put param 2 before param 1 to test numerical sorting
+            params: vec![
+                QueryParam {
+                    index: 2,
+                    name: "id".to_string(),
+                    ts_type: "string".to_string(),
+                    is_optional: false,
+                },
+                QueryParam {
+                    index: 1,
+                    name: "name".to_string(),
+                    ts_type: "string".to_string(),
+                    is_optional: true,
+                },
+            ],
+            fields: vec![QueryField {
+                name: "id".to_string(),
+                ts_type: "string".to_string(),
+            }],
+        };
+
+        let options = CodegenOptions::new(DriverTarget::Postgres, true);
+        let ts = generate_file_ts_with_options(&[query], &options);
+
+        // Strict $1, $2 ordering with params.name ?? null for optional param
+        let expected_wrapper = "export async function findUsers(sql: postgres.Sql, params: FindUsersParams): Promise<FindUsersRow[]> {\n  return await sql<FindUsersRow[]>`${sql.unsafe(findUsersSql, [params.name ?? null, params.id])}`;\n}";
+        assert!(ts.contains(expected_wrapper), "Expected wrapper:\n{}\n\nFound:\n{}", expected_wrapper, ts);
     }
 }

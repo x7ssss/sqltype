@@ -1,6 +1,6 @@
 use crate::analyzer::analyze_query;
 use crate::catalog::{Catalog, DriverTarget};
-use crate::codegen::generate_file_ts;
+use crate::codegen::{generate_file_ts_with_options, CodegenOptions};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -35,6 +35,7 @@ pub fn run_watch(
     queries_dir: &Path,
     out_dir: &Path,
     driver: DriverTarget,
+    wrappers: bool,
 ) -> Result<(), String> {
     // Canonicalize paths for robust comparison
     let abs_migrations = migrations_dir
@@ -111,6 +112,7 @@ pub fn run_watch(
                     catalog = new_catalog;
                     let query_files = discover_sql_files(&abs_queries).unwrap_or_default();
                     let mut success_count = 0;
+                    let options = CodegenOptions::new(driver, wrappers);
                     for q_path in &query_files {
                         if let Ok(content) = std::fs::read_to_string(q_path) {
                             let filename = q_path.file_name().and_then(|f| f.to_str()).unwrap_or("query.sql");
@@ -120,7 +122,7 @@ pub fn run_watch(
                                 if let Some(parent) = out_file.parent() {
                                     let _ = std::fs::create_dir_all(parent);
                                 }
-                                let ts_code = generate_file_ts(std::slice::from_ref(&analyzed));
+                                let ts_code = generate_file_ts_with_options(std::slice::from_ref(&analyzed), &options);
                                 let _ = std::fs::write(&out_file, ts_code);
                                 success_count += 1;
                             }
@@ -139,6 +141,7 @@ pub fn run_watch(
             }
         } else if !changed_query_paths.is_empty() {
             // Incremental sub-5ms query re-generation
+            let options = CodegenOptions::new(driver, wrappers);
             for q_path in changed_query_paths {
                 let start = Instant::now();
                 if !q_path.exists() {
@@ -165,7 +168,7 @@ pub fn run_watch(
                         if let Some(parent) = out_file.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        let ts_code = generate_file_ts(std::slice::from_ref(&analyzed));
+                        let ts_code = generate_file_ts_with_options(std::slice::from_ref(&analyzed), &options);
                         if let Err(e) = std::fs::write(&out_file, ts_code) {
                             eprintln!("  ✗ [Error] Failed to write {}: {}", out_file.display(), e);
                         } else {

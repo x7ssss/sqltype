@@ -1,7 +1,7 @@
 use lsp_types::{HoverContents, Position};
 use sqltype::analyzer::analyze_query;
-use sqltype::catalog::Catalog;
-use sqltype::codegen::generate_file_ts;
+use sqltype::catalog::{Catalog, DriverTarget};
+use sqltype::codegen::{generate_file_ts, generate_file_ts_with_options, CodegenOptions};
 use sqltype::lsp::{resolve_hover, validate_sql};
 use std::fs;
 
@@ -411,4 +411,55 @@ fn test_lsp_integration_pipeline() {
     }
 
     let _ = fs::remove_dir_all(base_dir);
+}
+
+#[test]
+fn test_wrappers_integration_pipeline() {
+    let mut catalog = Catalog::default();
+    catalog
+        .apply_sql(
+            r#"
+            CREATE TABLE accounts (
+                id UUID PRIMARY KEY,
+                username VARCHAR(50) NOT NULL,
+                balance INT NOT NULL DEFAULT 0
+            );
+            "#,
+        )
+        .unwrap();
+
+    let query_insert = r#"
+-- name: CreateAccount
+INSERT INTO accounts (username, balance) VALUES ($1, $2) RETURNING id;
+    "#;
+    let analyzed_insert = analyze_query(query_insert, &catalog, None).unwrap();
+
+    let query_delete = r#"
+-- name: DeleteAccount
+DELETE FROM accounts WHERE id = $1;
+    "#;
+    let analyzed_delete = analyze_query(query_delete, &catalog, None).unwrap();
+
+    // 1. Postgres driver wrappers
+    let pg_options = CodegenOptions::new(DriverTarget::Postgres, true);
+    let pg_ts_insert = generate_file_ts_with_options(std::slice::from_ref(&analyzed_insert), &pg_options);
+    assert!(pg_ts_insert.contains("export async function createAccount(sql: postgres.Sql, params: CreateAccountParams): Promise<CreateAccountRow[]> {"));
+    assert!(pg_ts_insert.contains("return await sql<CreateAccountRow[]>`${sql.unsafe(createAccountSql, [params.username, params.balance ?? null])}`;"));
+
+    let pg_ts_delete = generate_file_ts_with_options(std::slice::from_ref(&analyzed_delete), &pg_options);
+    assert!(pg_ts_delete.contains("export async function deleteAccount(sql: postgres.Sql, params: DeleteAccountParams): Promise<void> {"));
+    assert!(pg_ts_delete.contains("await sql.unsafe(deleteAccountSql, [params.id]);"));
+
+    // 2. Node-postgres driver wrappers
+    let node_pg_options = CodegenOptions::new(DriverTarget::Pg, true);
+    let node_pg_ts_insert = generate_file_ts_with_options(std::slice::from_ref(&analyzed_insert), &node_pg_options);
+    assert!(node_pg_ts_insert.contains("export async function createAccount(client: pg.ClientBase | pg.Pool, params: CreateAccountParams): Promise<CreateAccountRow[]> {"));
+    assert!(node_pg_ts_insert.contains("const res = await client.query<CreateAccountRow>(createAccountSql, [params.username, params.balance ?? null]);"));
+    assert!(node_pg_ts_insert.contains("return res.rows;"));
+
+    // 3. Bun driver wrappers
+    let bun_options = CodegenOptions::new(DriverTarget::Bun, true);
+    let bun_ts_insert = generate_file_ts_with_options(std::slice::from_ref(&analyzed_insert), &bun_options);
+    assert!(bun_ts_insert.contains("export async function createAccount(sql: import(\"bun\").SQL, params: CreateAccountParams): Promise<CreateAccountRow[]> {"));
+    assert!(bun_ts_insert.contains("return await sql<CreateAccountRow[]>`${sql.raw(createAccountSql, [params.username, params.balance ?? null])}`;"));
 }

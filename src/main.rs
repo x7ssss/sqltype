@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use sqltype::analyzer::analyze_query;
 use sqltype::catalog::{Catalog, DriverTarget};
-use sqltype::codegen::generate_file_ts;
+use sqltype::codegen::{generate_file_ts_with_options, CodegenOptions};
 use std::path::{Path, PathBuf};
 use std::process;
 use walkdir::WalkDir;
@@ -32,6 +32,10 @@ enum Commands {
         /// Driver target profile (postgres, pg, bun)
         #[arg(long, short = 'd', value_enum, default_value_t = DriverTarget::Postgres)]
         driver: DriverTarget,
+
+        /// Generate type-safe query execution wrappers
+        #[arg(long, short = 'w', default_value_t = false)]
+        wrappers: bool,
     },
     /// Emits .ts files for all valid queries
     Generate {
@@ -48,12 +52,16 @@ enum Commands {
         out: PathBuf,
 
         /// Watch for file changes and re-generate TypeScript types incrementally
-        #[arg(long, short = 'w')]
+        #[arg(long, short = 'W')]
         watch: bool,
 
         /// Driver target profile (postgres, pg, bun)
         #[arg(long, short = 'd', value_enum, default_value_t = DriverTarget::Postgres)]
         driver: DriverTarget,
+
+        /// Generate type-safe query execution wrappers
+        #[arg(long, short = 'w', default_value_t = false)]
+        wrappers: bool,
     },
     /// Starts the Language Server Protocol (LSP) server for real-time diagnostics and hover inspection
     Lsp {
@@ -85,7 +93,12 @@ fn discover_sql_files<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-fn run_check(migrations_dir: &Path, queries_dir: &Path, driver: DriverTarget) -> Result<(), ()> {
+fn run_check(
+    migrations_dir: &Path,
+    queries_dir: &Path,
+    driver: DriverTarget,
+    wrappers: bool,
+) -> Result<(), ()> {
     let catalog = match Catalog::load_from_dir_with_driver(migrations_dir, driver) {
         Ok(c) => c,
         Err(e) => {
@@ -125,12 +138,17 @@ fn run_check(migrations_dir: &Path, queries_dir: &Path, driver: DriverTarget) ->
 
         match analyze_query(&content, &catalog, Some(filename)) {
             Ok(analyzed) => {
+                if wrappers {
+                    let options = CodegenOptions::new(driver, true);
+                    let _ = generate_file_ts_with_options(std::slice::from_ref(&analyzed), &options);
+                }
                 println!(
-                    "  ✓ [{}] {} ({} params, {} fields)",
+                    "  ✓ [{}] {} ({} params, {} fields{})",
                     analyzed.name,
                     file.display(),
                     analyzed.params.len(),
-                    analyzed.fields.len()
+                    analyzed.fields.len(),
+                    if wrappers { ", wrapper enabled" } else { "" }
                 );
             }
             Err(e) => {
@@ -157,6 +175,7 @@ fn run_generate(
     queries_dir: &Path,
     out_dir: &Path,
     driver: DriverTarget,
+    wrappers: bool,
 ) -> Result<(), ()> {
     let catalog = match Catalog::load_from_dir_with_driver(migrations_dir, driver) {
         Ok(c) => c,
@@ -213,6 +232,8 @@ fn run_generate(
         return Err(());
     }
 
+    let options = CodegenOptions::new(driver, wrappers);
+
     // Write generated .ts files
     for (file, analyzed) in &analyzed_queries {
         let rel_path = file.strip_prefix(queries_dir).unwrap_or(file);
@@ -228,7 +249,7 @@ fn run_generate(
                 return Err(());
             }
 
-        let ts_code = generate_file_ts(std::slice::from_ref(analyzed));
+        let ts_code = generate_file_ts_with_options(std::slice::from_ref(analyzed), &options);
         if let Err(e) = std::fs::write(&out_file_path, ts_code) {
             eprintln!(
                 "[Error] Failed to write TypeScript file {}: {}",
@@ -256,17 +277,19 @@ fn main() {
             migrations,
             queries,
             driver,
-        } => run_check(&migrations, &queries, driver),
+            wrappers,
+        } => run_check(&migrations, &queries, driver, wrappers),
         Commands::Generate {
             migrations,
             queries,
             out,
             watch,
             driver,
+            wrappers,
         } => {
-            let res = run_generate(&migrations, &queries, &out, driver);
+            let res = run_generate(&migrations, &queries, &out, driver, wrappers);
             if res.is_ok() && watch {
-                if let Err(e) = sqltype::watcher::run_watch(&migrations, &queries, &out, driver) {
+                if let Err(e) = sqltype::watcher::run_watch(&migrations, &queries, &out, driver, wrappers) {
                     eprintln!("[Watch Error] {}", e);
                     Err(())
                 } else {
