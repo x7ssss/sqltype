@@ -1,0 +1,8 @@
+{
+  "name": "@sqltype/linux-arm64",
+  "version": "0.1.0",
+  "description": "Native sqltype binary for Linux arm64 (aarch64)",
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "license": "MIT"
+}

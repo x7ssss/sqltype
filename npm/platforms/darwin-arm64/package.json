@@ -1,0 +1,8 @@
+{
+  "name": "@sqltype/darwin-arm64",
+  "version": "0.1.0",
+  "description": "Native sqltype binary for macOS arm64 (Apple Silicon)",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "license": "MIT"
+}

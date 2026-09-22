@@ -1,0 +1,35 @@
+{
+  "name": "sqltype",
+  "version": "0.1.0",
+  "description": "Ultra-fast, zero-runtime SQL-to-TypeScript compiler CLI",
+  "bin": {
+    "sqltype": "./bin/sqltype"
+  },
+  "main": "./bin/sqltype",
+  "scripts": {
+    "test": "node ./bin/sqltype --help"
+  },
+  "keywords": [
+    "sql",
+    "typescript",
+    "compiler",
+    "postgres",
+    "postgresql",
+    "codegen",
+    "type-safe",
+    "zero-runtime"
+  ],
+  "author": "Antigravity Systems Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sqltype/sqltype"
+  },
+  "optionalDependencies": {
+    "@sqltype/linux-x64": "0.1.0",
+    "@sqltype/linux-arm64": "0.1.0",
+    "@sqltype/darwin-x64": "0.1.0",
+    "@sqltype/darwin-arm64": "0.1.0",
+    "@sqltype/win32-x64": "0.1.0"
+  }
+}

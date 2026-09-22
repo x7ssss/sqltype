@@ -1,0 +1,102 @@
+#!/usr/bin/env node
+
+const { spawnSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+
+const PLATFORM_PACKAGES = {
+  "linux-x64": { pkg: "@sqltype/linux-x64", bin: "sqltype" },
+  "linux-arm64": { pkg: "@sqltype/linux-arm64", bin: "sqltype" },
+  "darwin-x64": { pkg: "@sqltype/darwin-x64", bin: "sqltype" },
+  "darwin-arm64": { pkg: "@sqltype/darwin-arm64", bin: "sqltype" },
+  "win32-x64": { pkg: "@sqltype/win32-x64", bin: "sqltype.exe" },
+};
+
+function resolveBinary() {
+  const platformKey = `${process.platform}-${process.arch}`;
+  const target = PLATFORM_PACKAGES[platformKey];
+
+  if (!target) {
+    console.error(
+      `[sqltype] Unsupported platform or architecture: ${process.platform} ${process.arch}`
+    );
+    console.error(`Supported platforms: ${Object.keys(PLATFORM_PACKAGES).join(", ")}`);
+    process.exit(1);
+  }
+
+  // 1. Try resolving through installed optionalDependency package
+  try {
+    const pkgPath = require.resolve(`${target.pkg}/package.json`);
+    const binPath = path.join(path.dirname(pkgPath), target.bin);
+    if (fs.existsSync(binPath)) {
+      return binPath;
+    }
+  } catch (err) {
+    // Optional dependency not installed or resolved
+  }
+
+  // 2. Check direct platform folder if run in monorepo/local structure
+  const localPlatformPath = path.join(
+    __dirname,
+    "..",
+    "..",
+    "platforms",
+    platformKey,
+    target.bin
+  );
+  if (fs.existsSync(localPlatformPath)) {
+    return localPlatformPath;
+  }
+
+  // 3. Check cargo target release directory (local developer checkout)
+  const cargoReleasePath = path.join(
+    __dirname,
+    "..",
+    "..",
+    "..",
+    "target",
+    "release",
+    target.bin
+  );
+  if (fs.existsSync(cargoReleasePath)) {
+    return cargoReleasePath;
+  }
+
+  // 4. Check cargo target debug directory
+  const cargoDebugPath = path.join(
+    __dirname,
+    "..",
+    "..",
+    "..",
+    "target",
+    "debug",
+    target.bin
+  );
+  if (fs.existsSync(cargoDebugPath)) {
+    return cargoDebugPath;
+  }
+
+  console.error(`[sqltype] Could not find native binary for ${platformKey}.`);
+  console.error(
+    `Make sure the optional dependency "${target.pkg}" was installed during npm/pnpm/yarn install.`
+  );
+  console.error(
+    `If you are on an unsupported platform, you can compile from source with: cargo install sqltype`
+  );
+  process.exit(1);
+}
+
+const binaryPath = resolveBinary();
+const args = process.argv.slice(2);
+
+const result = spawnSync(binaryPath, args, {
+  stdio: "inherit",
+  windowsHide: false,
+});
+
+if (result.error) {
+  console.error(`[sqltype] Failed to execute ${binaryPath}:`, result.error.message);
+  process.exit(1);
+}
+
+process.exit(result.status ?? 0);
