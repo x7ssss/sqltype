@@ -1,6 +1,6 @@
 use crate::analyzer::analyze_query;
 use crate::catalog::{Catalog, DriverTarget};
-use crate::codegen::{generate_file_ts_with_options, CodegenOptions};
+use crate::codegen::{CodegenOptions, generate_file_ts_with_options};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -20,9 +20,10 @@ fn discover_sql_files<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, String> {
         let path = entry.path();
         if path.is_file()
             && let Some(ext) = path.extension()
-            && ext.eq_ignore_ascii_case("sql") {
-                files.push(path.to_path_buf());
-            }
+            && ext.eq_ignore_ascii_case("sql")
+        {
+            files.push(path.to_path_buf());
+        }
     }
 
     files.sort();
@@ -45,10 +46,14 @@ pub fn run_watch(
         .canonicalize()
         .map_err(|e| format!("Failed to canonicalize queries dir: {}", e))?;
     let abs_out = if out_dir.exists() {
-        out_dir.canonicalize().unwrap_or_else(|_| out_dir.to_path_buf())
+        out_dir
+            .canonicalize()
+            .unwrap_or_else(|_| out_dir.to_path_buf())
     } else {
         std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
-        out_dir.canonicalize().unwrap_or_else(|_| out_dir.to_path_buf())
+        out_dir
+            .canonicalize()
+            .unwrap_or_else(|_| out_dir.to_path_buf())
     };
 
     println!("\n👀 Watching for changes in:");
@@ -90,13 +95,14 @@ pub fn run_watch(
                 EventKind::Create(_) | EventKind::Modify(_) => {
                     for path in event.paths {
                         if let Some(ext) = path.extension()
-                            && ext.eq_ignore_ascii_case("sql") {
-                                if path.starts_with(&abs_migrations) {
-                                    changed_migrations = true;
-                                } else if path.starts_with(&abs_queries) {
-                                    changed_query_paths.insert(path);
-                                }
+                            && ext.eq_ignore_ascii_case("sql")
+                        {
+                            if path.starts_with(&abs_migrations) {
+                                changed_migrations = true;
+                            } else if path.starts_with(&abs_queries) {
+                                changed_query_paths.insert(path);
                             }
+                        }
                     }
                 }
                 _ => {}
@@ -115,14 +121,21 @@ pub fn run_watch(
                     let options = CodegenOptions::new(driver, wrappers);
                     for q_path in &query_files {
                         if let Ok(content) = std::fs::read_to_string(q_path) {
-                            let filename = q_path.file_name().and_then(|f| f.to_str()).unwrap_or("query.sql");
-                            if let Ok(analyzed) = analyze_query(&content, &catalog, Some(filename)) {
+                            let filename = q_path
+                                .file_name()
+                                .and_then(|f| f.to_str())
+                                .unwrap_or("query.sql");
+                            if let Ok(analyzed) = analyze_query(&content, &catalog, Some(filename))
+                            {
                                 let rel = q_path.strip_prefix(&abs_queries).unwrap_or(q_path);
                                 let out_file = abs_out.join(rel).with_extension("ts");
                                 if let Some(parent) = out_file.parent() {
                                     let _ = std::fs::create_dir_all(parent);
                                 }
-                                let ts_code = generate_file_ts_with_options(std::slice::from_ref(&analyzed), &options);
+                                let ts_code = generate_file_ts_with_options(
+                                    std::slice::from_ref(&analyzed),
+                                    &options,
+                                );
                                 let _ = std::fs::write(&out_file, ts_code);
                                 success_count += 1;
                             }
@@ -168,7 +181,10 @@ pub fn run_watch(
                         if let Some(parent) = out_file.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        let ts_code = generate_file_ts_with_options(std::slice::from_ref(&analyzed), &options);
+                        let ts_code = generate_file_ts_with_options(
+                            std::slice::from_ref(&analyzed),
+                            &options,
+                        );
                         if let Err(e) = std::fs::write(&out_file, ts_code) {
                             eprintln!("  ✗ [Error] Failed to write {}: {}", out_file.display(), e);
                         } else {

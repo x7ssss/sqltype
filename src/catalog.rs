@@ -1,5 +1,5 @@
-use pg_query::protobuf::{AlterTableType, ConstrType};
 use pg_query::NodeEnum;
+use pg_query::protobuf::{AlterTableType, ConstrType};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -21,15 +21,29 @@ pub struct TableMetadata {
 
 impl TableMetadata {
     pub fn get_column(&self, name: &str) -> Option<&ColumnMetadata> {
-        self.columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+        self.columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
     }
 
     pub fn get_column_mut(&mut self, name: &str) -> Option<&mut ColumnMetadata> {
-        self.columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(name))
+        self.columns
+            .iter_mut()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum DriverTarget {
     #[default]
@@ -86,9 +100,8 @@ pub fn normalize_pg_type_to_ts(pg_type: &str, driver: DriverTarget) -> String {
         },
 
         // text, varchar, uuid -> string
-        "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" | "uuid" | "citext" => {
-            "string".to_string()
-        }
+        "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" | "uuid"
+        | "citext" => "string".to_string(),
 
         // bool -> boolean
         "bool" | "boolean" => "boolean".to_string(),
@@ -102,7 +115,9 @@ pub fn normalize_pg_type_to_ts(pg_type: &str, driver: DriverTarget) -> String {
         | "timestamp"
         | "timestamp without time zone" => "Date".to_string(),
 
-        "time" | "timetz" | "time with time zone" | "time without time zone" => "string".to_string(),
+        "time" | "timetz" | "time with time zone" | "time without time zone" => {
+            "string".to_string()
+        }
 
         // json, jsonb -> unknown
         "json" | "jsonb" => "unknown".to_string(),
@@ -148,10 +163,16 @@ impl Catalog {
     }
 
     /// Loads and executes all `.sql` migration files in `dir` sorted alphanumerically with specified driver target.
-    pub fn load_from_dir_with_driver<P: AsRef<Path>>(dir: P, driver: DriverTarget) -> Result<Self, String> {
+    pub fn load_from_dir_with_driver<P: AsRef<Path>>(
+        dir: P,
+        driver: DriverTarget,
+    ) -> Result<Self, String> {
         let dir_path = dir.as_ref();
         if !dir_path.exists() {
-            return Err(format!("Migrations directory does not exist: {}", dir_path.display()));
+            return Err(format!(
+                "Migrations directory does not exist: {}",
+                dir_path.display()
+            ));
         }
 
         let mut catalog = Catalog::new(driver);
@@ -162,9 +183,10 @@ impl Catalog {
             let path = entry.path();
             if path.is_file()
                 && let Some(ext) = path.extension()
-                && ext.eq_ignore_ascii_case("sql") {
-                    files.push(path.to_path_buf());
-                }
+                && ext.eq_ignore_ascii_case("sql")
+            {
+                files.push(path.to_path_buf());
+            }
         }
 
         // Migrations MUST be sorted deterministically by filename/path before building the catalog
@@ -264,20 +286,24 @@ impl Catalog {
                     });
                 }
                 Some(NodeEnum::Constraint(constr))
-                    if constr.contype == ConstrType::ConstrPrimary as i32 => {
-                        for key in &constr.keys {
-                            if let Some(NodeEnum::String(s)) = &key.node {
-                                table_pk_cols.push(s.sval.clone());
-                            }
+                    if constr.contype == ConstrType::ConstrPrimary as i32 =>
+                {
+                    for key in &constr.keys {
+                        if let Some(NodeEnum::String(s)) = &key.node {
+                            table_pk_cols.push(s.sval.clone());
                         }
                     }
+                }
                 _ => {}
             }
         }
 
         // Apply table-level primary key constraints
         for pk_col in table_pk_cols {
-            if let Some(col) = columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(&pk_col)) {
+            if let Some(col) = columns
+                .iter_mut()
+                .find(|c| c.name.eq_ignore_ascii_case(&pk_col))
+            {
                 col.is_nullable = false;
             }
         }
@@ -292,7 +318,10 @@ impl Catalog {
         Ok(())
     }
 
-    fn handle_alter_table_stmt(&mut self, stmt: &pg_query::protobuf::AlterTableStmt) -> Result<(), String> {
+    fn handle_alter_table_stmt(
+        &mut self,
+        stmt: &pg_query::protobuf::AlterTableStmt,
+    ) -> Result<(), String> {
         let rel = match &stmt.relation {
             Some(r) => r,
             None => return Ok(()),
@@ -308,79 +337,98 @@ impl Catalog {
             if let Some(NodeEnum::AlterTableCmd(cmd)) = &cmd_node.node {
                 if cmd.subtype == AlterTableType::AtAddColumn as i32 {
                     if let Some(def_node) = &cmd.def
-                        && let Some(NodeEnum::ColumnDef(col)) = &def_node.node {
-                            let col_name = col.colname.clone();
-                            let pg_type = col
-                                .type_name
-                                .as_ref()
-                                .map(extract_type_name)
-                                .unwrap_or_else(|| "text".to_string());
-                            let ts_type = normalize_pg_type_to_ts(&pg_type, self.driver);
-                            let mut is_not_null = col.is_not_null;
-                            let mut has_default = matches!(
-                                pg_type.to_ascii_lowercase().as_str(),
-                                "serial" | "bigserial" | "smallserial" | "serial8" | "serial4" | "serial2"
-                            );
-                            for c in &col.constraints {
-                                if let Some(NodeEnum::Constraint(constr)) = &c.node {
-                                    if constr.contype == ConstrType::ConstrPrimary as i32
-                                        || constr.contype == ConstrType::ConstrNotnull as i32
-                                    {
-                                        is_not_null = true;
-                                    } else if constr.contype == ConstrType::ConstrDefault as i32 {
-                                        has_default = true;
-                                    }
+                        && let Some(NodeEnum::ColumnDef(col)) = &def_node.node
+                    {
+                        let col_name = col.colname.clone();
+                        let pg_type = col
+                            .type_name
+                            .as_ref()
+                            .map(extract_type_name)
+                            .unwrap_or_else(|| "text".to_string());
+                        let ts_type = normalize_pg_type_to_ts(&pg_type, self.driver);
+                        let mut is_not_null = col.is_not_null;
+                        let mut has_default = matches!(
+                            pg_type.to_ascii_lowercase().as_str(),
+                            "serial"
+                                | "bigserial"
+                                | "smallserial"
+                                | "serial8"
+                                | "serial4"
+                                | "serial2"
+                        );
+                        for c in &col.constraints {
+                            if let Some(NodeEnum::Constraint(constr)) = &c.node {
+                                if constr.contype == ConstrType::ConstrPrimary as i32
+                                    || constr.contype == ConstrType::ConstrNotnull as i32
+                                {
+                                    is_not_null = true;
+                                } else if constr.contype == ConstrType::ConstrDefault as i32 {
+                                    has_default = true;
                                 }
                             }
-
-                            // If column existed previously, replace it; otherwise append
-                            table.columns.retain(|c| !c.name.eq_ignore_ascii_case(&col_name));
-                            table.columns.push(ColumnMetadata {
-                                name: col_name,
-                                pg_type,
-                                ts_type,
-                                is_nullable: !is_not_null,
-                                has_default,
-                            });
                         }
+
+                        // If column existed previously, replace it; otherwise append
+                        table
+                            .columns
+                            .retain(|c| !c.name.eq_ignore_ascii_case(&col_name));
+                        table.columns.push(ColumnMetadata {
+                            name: col_name,
+                            pg_type,
+                            ts_type,
+                            is_nullable: !is_not_null,
+                            has_default,
+                        });
+                    }
                 } else if cmd.subtype == AlterTableType::AtDropColumn as i32 {
                     let col_name = &cmd.name;
-                    table.columns.retain(|c| !c.name.eq_ignore_ascii_case(col_name));
+                    table
+                        .columns
+                        .retain(|c| !c.name.eq_ignore_ascii_case(col_name));
                 } else if cmd.subtype == AlterTableType::AtAlterColumnType as i32 {
                     let col_name = &cmd.name;
                     if let Some(def_node) = &cmd.def
-                        && let Some(NodeEnum::ColumnDef(col)) = &def_node.node {
-                            let pg_type = col
-                                .type_name
-                                .as_ref()
-                                .map(extract_type_name)
-                                .unwrap_or_else(|| "text".to_string());
-                            let ts_type = normalize_pg_type_to_ts(&pg_type, self.driver);
-                            if let Some(existing_col) =
-                                table.columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(col_name))
-                            {
-                                existing_col.pg_type = pg_type;
-                                existing_col.ts_type = ts_type;
-                            }
+                        && let Some(NodeEnum::ColumnDef(col)) = &def_node.node
+                    {
+                        let pg_type = col
+                            .type_name
+                            .as_ref()
+                            .map(extract_type_name)
+                            .unwrap_or_else(|| "text".to_string());
+                        let ts_type = normalize_pg_type_to_ts(&pg_type, self.driver);
+                        if let Some(existing_col) = table
+                            .columns
+                            .iter_mut()
+                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                        {
+                            existing_col.pg_type = pg_type;
+                            existing_col.ts_type = ts_type;
                         }
+                    }
                 } else if cmd.subtype == AlterTableType::AtSetNotNull as i32 {
                     let col_name = &cmd.name;
-                    if let Some(existing_col) =
-                        table.columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(col_name))
+                    if let Some(existing_col) = table
+                        .columns
+                        .iter_mut()
+                        .find(|c| c.name.eq_ignore_ascii_case(col_name))
                     {
                         existing_col.is_nullable = false;
                     }
                 } else if cmd.subtype == AlterTableType::AtDropNotNull as i32 {
                     let col_name = &cmd.name;
-                    if let Some(existing_col) =
-                        table.columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(col_name))
+                    if let Some(existing_col) = table
+                        .columns
+                        .iter_mut()
+                        .find(|c| c.name.eq_ignore_ascii_case(col_name))
                     {
                         existing_col.is_nullable = true;
                     }
                 } else if cmd.subtype == AlterTableType::AtColumnDefault as i32 {
                     let col_name = &cmd.name;
-                    if let Some(existing_col) =
-                        table.columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(col_name))
+                    if let Some(existing_col) = table
+                        .columns
+                        .iter_mut()
+                        .find(|c| c.name.eq_ignore_ascii_case(col_name))
                     {
                         existing_col.has_default = cmd.def.is_some();
                     }
@@ -397,9 +445,10 @@ impl Catalog {
             return Some(t);
         }
         if let Some((_, table_part)) = lower.rsplit_once('.')
-            && let Some(t) = self.tables.get(table_part) {
-                return Some(t);
-            }
+            && let Some(t) = self.tables.get(table_part)
+        {
+            return Some(t);
+        }
         None
     }
 }
@@ -424,7 +473,9 @@ mod tests {
         let mut catalog = Catalog::default();
         catalog.apply_sql(sql).unwrap();
 
-        let table = catalog.get_table("users").expect("users table should exist");
+        let table = catalog
+            .get_table("users")
+            .expect("users table should exist");
         assert_eq!(table.name, "users");
         assert_eq!(table.columns.len(), 7);
 
@@ -500,19 +551,31 @@ mod tests {
         catalog
             .apply_sql("ALTER TABLE products ADD COLUMN views INT;")
             .unwrap();
-        let views_col = catalog.get_table("products").unwrap().get_column("views").unwrap();
+        let views_col = catalog
+            .get_table("products")
+            .unwrap()
+            .get_column("views")
+            .unwrap();
         assert!(views_col.is_nullable);
 
         catalog
             .apply_sql("ALTER TABLE products ALTER COLUMN views SET NOT NULL;")
             .unwrap();
-        let views_col = catalog.get_table("products").unwrap().get_column("views").unwrap();
+        let views_col = catalog
+            .get_table("products")
+            .unwrap()
+            .get_column("views")
+            .unwrap();
         assert!(!views_col.is_nullable);
 
         catalog
             .apply_sql("ALTER TABLE products ALTER COLUMN views DROP NOT NULL;")
             .unwrap();
-        let views_col = catalog.get_table("products").unwrap().get_column("views").unwrap();
+        let views_col = catalog
+            .get_table("products")
+            .unwrap()
+            .get_column("views")
+            .unwrap();
         assert!(views_col.is_nullable);
     }
 
@@ -538,15 +601,31 @@ mod tests {
     #[test]
     fn test_load_from_dir_deterministic_sorting() {
         use std::fs;
-        let temp_dir = std::env::temp_dir().join(format!("sqltype_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sqltype_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         fs::create_dir_all(&temp_dir).unwrap();
 
         // Write migration 002 first, then 001
-        fs::write(temp_dir.join("002_add_col.sql"), "ALTER TABLE items ADD COLUMN price INT NOT NULL;").unwrap();
-        fs::write(temp_dir.join("001_create.sql"), "CREATE TABLE items (id UUID PRIMARY KEY);").unwrap();
+        fs::write(
+            temp_dir.join("002_add_col.sql"),
+            "ALTER TABLE items ADD COLUMN price INT NOT NULL;",
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.join("001_create.sql"),
+            "CREATE TABLE items (id UUID PRIMARY KEY);",
+        )
+        .unwrap();
 
         let catalog = Catalog::load_from_dir(&temp_dir).unwrap();
-        let table = catalog.get_table("items").expect("items table should exist");
+        let table = catalog
+            .get_table("items")
+            .expect("items table should exist");
         assert_eq!(table.columns.len(), 2);
         assert!(!table.get_column("id").unwrap().is_nullable);
         assert!(!table.get_column("price").unwrap().is_nullable);

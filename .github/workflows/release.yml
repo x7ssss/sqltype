@@ -54,7 +54,7 @@ jobs:
 
       - name: Install Cross (if needed)
         if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        uses: taiki-e/install-action@cross
 
       - name: Build Binary
         run: |
@@ -82,12 +82,12 @@ jobs:
           name: binary-${{ matrix.platform_pkg }}
           path: dist/${{ matrix.platform_pkg }}/${{ matrix.artifact_name }}
 
-  publish-npm:
-    name: Publish to NPM
+  publish-and-release:
+    name: Publish NPM Packages & GitHub Release
     needs: build-binaries
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       id-token: write
 
     steps:
@@ -108,7 +108,9 @@ jobs:
       - name: Extract Tag Version
         id: get_version
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
         shell: bash
 
@@ -118,22 +120,23 @@ jobs:
           PLATFORMS=("linux-x64" "linux-arm64" "darwin-x64" "darwin-arm64" "win32-x64")
 
           for PLATFORM in "${PLATFORMS[@]}"; do
-            echo "Preparing package for @sqltype/$PLATFORM..."
+            echo "Preparing package for @x7ssss/sqltype-$PLATFORM..."
             PKG_DIR="npm/platforms/$PLATFORM"
+            mkdir -p "$PKG_DIR/bin"
 
-            # Copy binary into platform package directory
+            # Copy binary into platform package bin directory
             if [ "$PLATFORM" = "win32-x64" ]; then
-              cp artifacts/binary-$PLATFORM/sqltype.exe "$PKG_DIR/sqltype.exe"
+              cp artifacts/binary-$PLATFORM/sqltype.exe "$PKG_DIR/bin/sqltype.exe"
             else
-              cp artifacts/binary-$PLATFORM/sqltype "$PKG_DIR/sqltype"
-              chmod +x "$PKG_DIR/sqltype"
+              cp artifacts/binary-$PLATFORM/sqltype "$PKG_DIR/bin/sqltype"
+              chmod +x "$PKG_DIR/bin/sqltype"
             fi
 
             # Update package.json version
-            npm version "$VERSION" --prefix "$PKG_DIR" --no-git-tag-version
+            npm version "$VERSION" --prefix "$PKG_DIR" --no-git-tag-version --allow-same-version
 
-            # Publish platform package
-            npm publish "$PKG_DIR" --access public
+            # Publish platform package with provenance
+            npm publish "$PKG_DIR" --access public --provenance
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -145,7 +148,7 @@ jobs:
           PKG_DIR="npm/sqltype"
 
           # Update root package.json version
-          npm version "$VERSION" --prefix "$PKG_DIR" --no-git-tag-version
+          npm version "$VERSION" --prefix "$PKG_DIR" --no-git-tag-version --allow-same-version
 
           # Update optionalDependencies versions to match release version
           node -e "
@@ -157,8 +160,28 @@ jobs:
             require('fs').writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
           "
 
-          # Publish root package
-          npm publish "$PKG_DIR" --access public
+          # Publish root package with provenance
+          npm publish "$PKG_DIR" --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
+
+      - name: Prepare Zipped Binaries for GitHub Release
+        run: |
+          TAG="${{ steps.get_version.outputs.TAG }}"
+          mkdir -p release-assets
+
+          tar -czvf "release-assets/sqltype-${TAG}-x86_64-unknown-linux-gnu.tar.gz" -C artifacts/binary-linux-x64 sqltype
+          tar -czvf "release-assets/sqltype-${TAG}-aarch64-unknown-linux-gnu.tar.gz" -C artifacts/binary-linux-arm64 sqltype
+          tar -czvf "release-assets/sqltype-${TAG}-x86_64-apple-darwin.tar.gz" -C artifacts/binary-darwin-x64 sqltype
+          tar -czvf "release-assets/sqltype-${TAG}-aarch64-apple-darwin.tar.gz" -C artifacts/binary-darwin-arm64 sqltype
+          zip -j "release-assets/sqltype-${TAG}-x86_64-pc-windows-msvc.zip" artifacts/binary-win32-x64/sqltype.exe
+        shell: bash
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

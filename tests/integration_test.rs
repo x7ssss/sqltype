@@ -1,7 +1,7 @@
 use lsp_types::{HoverContents, Position};
 use sqltype::analyzer::analyze_query;
 use sqltype::catalog::{Catalog, DriverTarget};
-use sqltype::codegen::{generate_file_ts, generate_file_ts_with_options, CodegenOptions};
+use sqltype::codegen::{CodegenOptions, generate_file_ts, generate_file_ts_with_options};
 use sqltype::lsp::{resolve_hover, validate_sql};
 use std::fs;
 
@@ -86,13 +86,19 @@ SELECT
 FROM posts p
 WHERE p.published = $1;
     "#;
-    fs::write(queries_dir.join("find_posts_by_status.sql"), query_posts_by_status).unwrap();
+    fs::write(
+        queries_dir.join("find_posts_by_status.sql"),
+        query_posts_by_status,
+    )
+    .unwrap();
 
     // 3. Build in-memory schema catalog
     let catalog = Catalog::load_from_dir(&migrations_dir).expect("Failed to load catalog");
 
     // Verify catalog state
-    let users_table = catalog.get_table("users").expect("users table should exist");
+    let users_table = catalog
+        .get_table("users")
+        .expect("users table should exist");
     assert_eq!(users_table.columns.len(), 5);
     assert!(!users_table.get_column("id").unwrap().is_nullable);
     assert!(!users_table.get_column("email").unwrap().is_nullable);
@@ -100,7 +106,8 @@ WHERE p.published = $1;
     assert!(users_table.get_column("age").unwrap().is_nullable);
 
     // 4. Analyze queries
-    let analyzed_user = analyze_query(query_get_user, &catalog, Some("get_user_with_posts.sql")).unwrap();
+    let analyzed_user =
+        analyze_query(query_get_user, &catalog, Some("get_user_with_posts.sql")).unwrap();
     assert_eq!(analyzed_user.name, "GetUserWithPosts");
     assert_eq!(analyzed_user.params.len(), 1);
     assert_eq!(analyzed_user.params[0].name, "id");
@@ -116,7 +123,12 @@ WHERE p.published = $1;
     assert_eq!(analyzed_user.fields[3].name, "comment_count");
     assert_eq!(analyzed_user.fields[3].ts_type, "number");
 
-    let analyzed_posts = analyze_query(query_posts_by_status, &catalog, Some("find_posts_by_status.sql")).unwrap();
+    let analyzed_posts = analyze_query(
+        query_posts_by_status,
+        &catalog,
+        Some("find_posts_by_status.sql"),
+    )
+    .unwrap();
     assert_eq!(analyzed_posts.name, "FindPostsByStatus");
     assert_eq!(analyzed_posts.params.len(), 1);
     assert_eq!(analyzed_posts.params[0].name, "published");
@@ -138,7 +150,9 @@ WHERE p.published = $1;
     assert!(ts_user.contains("export const getUserWithPostsSql = `"));
     assert!(ts_user.contains("export type GetUserWithPostsQuery = {\n  sql: string;\n  params: GetUserWithPostsParams;\n  row: GetUserWithPostsRow;\n};"));
 
-    assert!(ts_posts.contains("export interface FindPostsByStatusParams {\n  published: boolean;\n}"));
+    assert!(
+        ts_posts.contains("export interface FindPostsByStatusParams {\n  published: boolean;\n}")
+    );
     assert!(ts_posts.contains("export interface FindPostsByStatusRow {\n  id: string;\n  title: string;\n  views: number;\n  published: boolean;\n}"));
     assert!(ts_posts.contains("export const findPostsByStatusSql = `"));
     assert!(ts_posts.contains("export type FindPostsByStatusQuery = {\n  sql: string;\n  params: FindPostsByStatusParams;\n  row: FindPostsByStatusRow;\n};"));
@@ -184,7 +198,8 @@ fn test_cte_and_expressions_integration() {
             title VARCHAR(255) NOT NULL
         );
         "#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let query_cte = r#"
 -- name: GetActiveUsersWithPosts
@@ -290,8 +305,14 @@ DELETE FROM users WHERE id = $1;
     assert_eq!(analyzed_insert.fields[1].ts_type, "Date");
 
     let ts_insert = generate_file_ts(&[analyzed_insert]);
-    assert!(ts_insert.contains("export interface CreateUserParams {\n  name: string;\n  email: string;\n}"));
-    assert!(ts_insert.contains("export interface CreateUserRow {\n  id: string;\n  created_at: Date;\n}"));
+    assert!(
+        ts_insert
+            .contains("export interface CreateUserParams {\n  name: string;\n  email: string;\n}")
+    );
+    assert!(
+        ts_insert
+            .contains("export interface CreateUserRow {\n  id: string;\n  created_at: Date;\n}")
+    );
     assert!(ts_insert.contains("export type CreateUserQuery = {\n  sql: string;\n  params: CreateUserParams;\n  row: CreateUserRow;\n};"));
 
     // 2. Analyze & verify UpdateUser
@@ -309,8 +330,13 @@ DELETE FROM users WHERE id = $1;
     assert_eq!(analyzed_update.fields[1].ts_type, "string");
 
     let ts_update = generate_file_ts(&[analyzed_update]);
-    assert!(ts_update.contains("export interface UpdateUserParams {\n  name: string;\n  id: string;\n}"));
-    assert!(ts_update.contains("export interface UpdateUserRow {\n  id: string;\n  name: string;\n}"));
+    assert!(
+        ts_update
+            .contains("export interface UpdateUserParams {\n  name: string;\n  id: string;\n}")
+    );
+    assert!(
+        ts_update.contains("export interface UpdateUserRow {\n  id: string;\n  name: string;\n}")
+    );
     assert!(ts_update.contains("export type UpdateUserQuery = {\n  sql: string;\n  params: UpdateUserParams;\n  row: UpdateUserRow;\n};"));
 
     // 3. Analyze & verify DeleteUser
@@ -325,7 +351,9 @@ DELETE FROM users WHERE id = $1;
     assert!(ts_delete.contains("export interface DeleteUserParams {\n  id: string;\n}"));
     assert!(!ts_delete.contains("DeleteUserRow"));
     assert!(!ts_delete.contains("row:"));
-    assert!(ts_delete.contains("export type DeleteUserQuery = {\n  sql: string;\n  params: DeleteUserParams;\n};"));
+    assert!(ts_delete.contains(
+        "export type DeleteUserQuery = {\n  sql: string;\n  params: DeleteUserParams;\n};"
+    ));
 
     let _ = fs::remove_dir_all(base_dir);
 }
@@ -366,9 +394,11 @@ fn test_lsp_integration_pipeline() {
     let invalid_table_sql = "SELECT id FROM orders WHERE id = $1;";
     let diags_table = validate_sql(invalid_table_sql, &catalog);
     assert_eq!(diags_table.len(), 1);
-    assert!(diags_table[0]
-        .message
-        .contains("Table \"orders\" does not exist in schema catalog"));
+    assert!(
+        diags_table[0]
+            .message
+            .contains("Table \"orders\" does not exist in schema catalog")
+    );
 
     // 3. Query with syntax error produces diagnostic with cursorpos
     let syntax_err_sql = "SELECT * FROM;";
@@ -442,24 +472,28 @@ DELETE FROM accounts WHERE id = $1;
 
     // 1. Postgres driver wrappers
     let pg_options = CodegenOptions::new(DriverTarget::Postgres, true);
-    let pg_ts_insert = generate_file_ts_with_options(std::slice::from_ref(&analyzed_insert), &pg_options);
+    let pg_ts_insert =
+        generate_file_ts_with_options(std::slice::from_ref(&analyzed_insert), &pg_options);
     assert!(pg_ts_insert.contains("export async function createAccount(sql: postgres.Sql, params: CreateAccountParams): Promise<CreateAccountRow[]> {"));
     assert!(pg_ts_insert.contains("return await sql<CreateAccountRow[]>`${sql.unsafe(createAccountSql, [params.username, params.balance ?? null])}`;"));
 
-    let pg_ts_delete = generate_file_ts_with_options(std::slice::from_ref(&analyzed_delete), &pg_options);
+    let pg_ts_delete =
+        generate_file_ts_with_options(std::slice::from_ref(&analyzed_delete), &pg_options);
     assert!(pg_ts_delete.contains("export async function deleteAccount(sql: postgres.Sql, params: DeleteAccountParams): Promise<void> {"));
     assert!(pg_ts_delete.contains("await sql.unsafe(deleteAccountSql, [params.id]);"));
 
     // 2. Node-postgres driver wrappers
     let node_pg_options = CodegenOptions::new(DriverTarget::Pg, true);
-    let node_pg_ts_insert = generate_file_ts_with_options(std::slice::from_ref(&analyzed_insert), &node_pg_options);
+    let node_pg_ts_insert =
+        generate_file_ts_with_options(std::slice::from_ref(&analyzed_insert), &node_pg_options);
     assert!(node_pg_ts_insert.contains("export async function createAccount(client: pg.ClientBase | pg.Pool, params: CreateAccountParams): Promise<CreateAccountRow[]> {"));
     assert!(node_pg_ts_insert.contains("const res = await client.query<CreateAccountRow>(createAccountSql, [params.username, params.balance ?? null]);"));
     assert!(node_pg_ts_insert.contains("return res.rows;"));
 
     // 3. Bun driver wrappers
     let bun_options = CodegenOptions::new(DriverTarget::Bun, true);
-    let bun_ts_insert = generate_file_ts_with_options(std::slice::from_ref(&analyzed_insert), &bun_options);
+    let bun_ts_insert =
+        generate_file_ts_with_options(std::slice::from_ref(&analyzed_insert), &bun_options);
     assert!(bun_ts_insert.contains("export async function createAccount(sql: import(\"bun\").SQL, params: CreateAccountParams): Promise<CreateAccountRow[]> {"));
     assert!(bun_ts_insert.contains("return await sql<CreateAccountRow[]>`${sql.raw(createAccountSql, [params.username, params.balance ?? null])}`;"));
 }

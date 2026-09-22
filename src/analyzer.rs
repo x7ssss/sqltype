@@ -1,6 +1,8 @@
-use crate::catalog::{extract_type_name, normalize_pg_type_to_ts, Catalog, ColumnMetadata, TableMetadata};
-use pg_query::protobuf::{AExprKind, BoolExprType, JoinType, NullTestType};
+use crate::catalog::{
+    Catalog, ColumnMetadata, TableMetadata, extract_type_name, normalize_pg_type_to_ts,
+};
 use pg_query::NodeEnum;
+use pg_query::protobuf::{AExprKind, BoolExprType, JoinType, NullTestType};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,7 +116,11 @@ fn extract_func_name(funcnames: &[pg_query::protobuf::Node]) -> String {
             names.push(s);
         }
     }
-    names.last().cloned().unwrap_or_default().to_ascii_lowercase()
+    names
+        .last()
+        .cloned()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
 }
 
 /// Analyzes an application SQL query file against the catalog.
@@ -134,14 +140,15 @@ pub fn analyze_query(
                 &node.node,
                 Some(
                     NodeEnum::SelectStmt(_)
-                    | NodeEnum::InsertStmt(_)
-                    | NodeEnum::UpdateStmt(_)
-                    | NodeEnum::DeleteStmt(_)
+                        | NodeEnum::InsertStmt(_)
+                        | NodeEnum::UpdateStmt(_)
+                        | NodeEnum::DeleteStmt(_)
                 )
-            ) {
-                root_stmt = Some(node);
-                break;
-            }
+            )
+        {
+            root_stmt = Some(node);
+            break;
+        }
     }
 
     let root = root_stmt.ok_or_else(|| {
@@ -183,7 +190,10 @@ pub fn analyze_query(
         params.push(QueryParam {
             index: idx as usize,
             name: final_name,
-            ts_type: info.inferred_type.clone().unwrap_or_else(|| "unknown".to_string()),
+            ts_type: info
+                .inferred_type
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
             is_optional: info.is_optional,
         });
     }
@@ -205,36 +215,37 @@ fn register_ctes(
         if let Some(NodeEnum::CommonTableExpr(cte)) = &cte_node.node {
             let cte_name = cte.ctename.to_ascii_lowercase();
             if let Some(query_node) = &cte.ctequery
-                && let Some(NodeEnum::SelectStmt(cte_select)) = &query_node.node {
-                    let cte_fields = analyze_select_stmt(cte_select, scoped_catalog, param_map)?;
-                    let mut cte_columns = Vec::new();
+                && let Some(NodeEnum::SelectStmt(cte_select)) = &query_node.node
+            {
+                let cte_fields = analyze_select_stmt(cte_select, scoped_catalog, param_map)?;
+                let mut cte_columns = Vec::new();
 
-                    for (i, field) in cte_fields.iter().enumerate() {
-                        let col_name = if let Some(alias_node) = cte.aliascolnames.get(i) {
-                            extract_string(alias_node).unwrap_or_else(|| field.name.clone())
-                        } else {
-                            field.name.clone()
-                        };
-
-                        let is_nullable = field.ts_type.contains("| null");
-                        let base_ts_type = field.ts_type.replace(" | null", "").trim().to_string();
-
-                        cte_columns.push(ColumnMetadata {
-                            name: col_name,
-                            pg_type: "unknown".to_string(),
-                            ts_type: base_ts_type,
-                            is_nullable,
-                            has_default: false,
-                        });
-                    }
-
-                    let cte_table = TableMetadata {
-                        name: cte_name.clone(),
-                        schema: None,
-                        columns: cte_columns,
+                for (i, field) in cte_fields.iter().enumerate() {
+                    let col_name = if let Some(alias_node) = cte.aliascolnames.get(i) {
+                        extract_string(alias_node).unwrap_or_else(|| field.name.clone())
+                    } else {
+                        field.name.clone()
                     };
-                    scoped_catalog.tables.insert(cte_name, cte_table);
+
+                    let is_nullable = field.ts_type.contains("| null");
+                    let base_ts_type = field.ts_type.replace(" | null", "").trim().to_string();
+
+                    cte_columns.push(ColumnMetadata {
+                        name: col_name,
+                        pg_type: "unknown".to_string(),
+                        ts_type: base_ts_type,
+                        is_nullable,
+                        has_default: false,
+                    });
                 }
+
+                let cte_table = TableMetadata {
+                    name: cte_name.clone(),
+                    schema: None,
+                    columns: cte_columns,
+                };
+                scoped_catalog.tables.insert(cte_name, cte_table);
+            }
         }
     }
     Ok(())
@@ -247,9 +258,10 @@ fn analyze_select_stmt(
 ) -> Result<Vec<QueryField>, String> {
     // Check if this SelectStmt is a setop (like UNION) where projections are in larg
     if select.target_list.is_empty()
-        && let Some(l_sel) = &select.larg {
-            return analyze_select_stmt(l_sel, catalog, param_map);
-        }
+        && let Some(l_sel) = &select.larg
+    {
+        return analyze_select_stmt(l_sel, catalog, param_map);
+    }
 
     // 0. Register CTEs from with_clause into a query-scoped catalog overlay
     let mut scoped_catalog = catalog.clone();
@@ -277,26 +289,28 @@ fn analyze_select_stmt(
     }
 
     if let Some(limit_node) = &select.limit_count
-        && let Some(NodeEnum::ParamRef(p)) = &limit_node.node {
-            let entry = param_map.entry(p.number).or_default();
-            if entry.suggested_name.is_none() {
-                entry.suggested_name = Some("limit".to_string());
-            }
-            if entry.inferred_type.is_none() {
-                entry.inferred_type = Some("number".to_string());
-            }
+        && let Some(NodeEnum::ParamRef(p)) = &limit_node.node
+    {
+        let entry = param_map.entry(p.number).or_default();
+        if entry.suggested_name.is_none() {
+            entry.suggested_name = Some("limit".to_string());
         }
+        if entry.inferred_type.is_none() {
+            entry.inferred_type = Some("number".to_string());
+        }
+    }
 
     if let Some(offset_node) = &select.limit_offset
-        && let Some(NodeEnum::ParamRef(p)) = &offset_node.node {
-            let entry = param_map.entry(p.number).or_default();
-            if entry.suggested_name.is_none() {
-                entry.suggested_name = Some("offset".to_string());
-            }
-            if entry.inferred_type.is_none() {
-                entry.inferred_type = Some("number".to_string());
-            }
+        && let Some(NodeEnum::ParamRef(p)) = &offset_node.node
+    {
+        let entry = param_map.entry(p.number).or_default();
+        if entry.suggested_name.is_none() {
+            entry.suggested_name = Some("offset".to_string());
         }
+        if entry.inferred_type.is_none() {
+            entry.inferred_type = Some("number".to_string());
+        }
+    }
 
     Ok(fields)
 }
@@ -354,44 +368,45 @@ fn analyze_insert_stmt(
 
     // Process values / parameters from select_stmt
     if let Some(select_node) = &insert.select_stmt
-        && let Some(NodeEnum::SelectStmt(select)) = &select_node.node {
-            if !select.values_lists.is_empty() {
-                for row_node in &select.values_lists {
-                    if let Some(NodeEnum::List(row_list)) = &row_node.node {
-                        for (i, val_node) in row_list.items.iter().enumerate() {
-                            if let Some(col_name) = target_col_names.get(i) {
-                                let col_meta = table_meta.get_column(col_name);
-                                let is_optional = col_meta
-                                    .map(|c| c.is_nullable || c.has_default)
-                                    .unwrap_or(false);
+        && let Some(NodeEnum::SelectStmt(select)) = &select_node.node
+    {
+        if !select.values_lists.is_empty() {
+            for row_node in &select.values_lists {
+                if let Some(NodeEnum::List(row_list)) = &row_node.node {
+                    for (i, val_node) in row_list.items.iter().enumerate() {
+                        if let Some(col_name) = target_col_names.get(i) {
+                            let col_meta = table_meta.get_column(col_name);
+                            let is_optional = col_meta
+                                .map(|c| c.is_nullable || c.has_default)
+                                .unwrap_or(false);
 
-                                if let Some((param_num, cast_opt)) = extract_param_info(val_node) {
-                                    record_param(
-                                        param_num,
-                                        cast_opt,
-                                        None,
-                                        col_name,
-                                        &scoped_catalog,
-                                        &tables_in_scope,
-                                        param_map,
-                                        is_optional,
-                                    )?;
-                                } else {
-                                    resolve_params_in_expr(
-                                        val_node,
-                                        &scoped_catalog,
-                                        &tables_in_scope,
-                                        param_map,
-                                    )?;
-                                }
+                            if let Some((param_num, cast_opt)) = extract_param_info(val_node) {
+                                record_param(
+                                    param_num,
+                                    cast_opt,
+                                    None,
+                                    col_name,
+                                    &scoped_catalog,
+                                    &tables_in_scope,
+                                    param_map,
+                                    is_optional,
+                                )?;
+                            } else {
+                                resolve_params_in_expr(
+                                    val_node,
+                                    &scoped_catalog,
+                                    &tables_in_scope,
+                                    param_map,
+                                )?;
                             }
                         }
                     }
                 }
-            } else {
-                analyze_select_stmt(select, &scoped_catalog, param_map)?;
             }
+        } else {
+            analyze_select_stmt(select, &scoped_catalog, param_map)?;
         }
+    }
 
     // Process on_conflict_clause if present
     if let Some(occ) = &insert.on_conflict_clause {
@@ -502,12 +517,7 @@ fn analyze_update_stmt(
                         is_optional,
                     )?;
                 } else {
-                    resolve_params_in_expr(
-                        val_node,
-                        &scoped_catalog,
-                        &tables_in_scope,
-                        param_map,
-                    )?;
+                    resolve_params_in_expr(val_node, &scoped_catalog, &tables_in_scope, param_map)?;
                 }
             }
         }
@@ -594,7 +604,10 @@ fn collect_from_node(
             let table_name = rv.relname.to_ascii_lowercase();
             // Validate table exists in catalog
             if catalog.get_table(&table_name).is_none() {
-                return Err(format!("Table \"{}\" does not exist in schema catalog", rv.relname));
+                return Err(format!(
+                    "Table \"{}\" does not exist in schema catalog",
+                    rv.relname
+                ));
             }
 
             let alias = if let Some(a) = &rv.alias {
@@ -651,52 +664,54 @@ fn resolve_target(
         Some(NodeEnum::ColumnRef(cr)) => {
             // Check for wildcard '*'
             if let Some(first) = cr.fields.first()
-                && let Some(NodeEnum::AStar(_)) = &first.node {
-                    // SELECT * FROM ...
-                    for table in tables {
-                        if let Some(table_meta) = catalog.get_table(&table.table_name) {
-                            for col in &table_meta.columns {
-                                let is_null = col.is_nullable || table.is_nullable;
-                                let ts_type = if is_null {
-                                    format_nullable(&col.ts_type)
-                                } else {
-                                    col.ts_type.clone()
-                                };
-                                fields.push(QueryField {
-                                    name: col.name.clone(),
-                                    ts_type,
-                                });
-                            }
+                && let Some(NodeEnum::AStar(_)) = &first.node
+            {
+                // SELECT * FROM ...
+                for table in tables {
+                    if let Some(table_meta) = catalog.get_table(&table.table_name) {
+                        for col in &table_meta.columns {
+                            let is_null = col.is_nullable || table.is_nullable;
+                            let ts_type = if is_null {
+                                format_nullable(&col.ts_type)
+                            } else {
+                                col.ts_type.clone()
+                            };
+                            fields.push(QueryField {
+                                name: col.name.clone(),
+                                ts_type,
+                            });
                         }
                     }
-                    return Ok(());
                 }
+                return Ok(());
+            }
 
             // Check for 'alias.*'
             if cr.fields.len() == 2
                 && let (Some(first), Some(second)) = (cr.fields.first(), cr.fields.get(1))
-                    && let Some(NodeEnum::AStar(_)) = &second.node
-                        && let Some(alias) = extract_string(first) {
-                            let table = tables
-                                .iter()
-                                .find(|t| t.alias.eq_ignore_ascii_case(&alias))
-                                .ok_or_else(|| format!("Unknown table alias \"{}\"", alias))?;
-                            if let Some(table_meta) = catalog.get_table(&table.table_name) {
-                                for col in &table_meta.columns {
-                                    let is_null = col.is_nullable || table.is_nullable;
-                                    let ts_type = if is_null {
-                                        format_nullable(&col.ts_type)
-                                    } else {
-                                        col.ts_type.clone()
-                                    };
-                                    fields.push(QueryField {
-                                        name: col.name.clone(),
-                                        ts_type,
-                                    });
-                                }
-                            }
-                            return Ok(());
-                        }
+                && let Some(NodeEnum::AStar(_)) = &second.node
+                && let Some(alias) = extract_string(first)
+            {
+                let table = tables
+                    .iter()
+                    .find(|t| t.alias.eq_ignore_ascii_case(&alias))
+                    .ok_or_else(|| format!("Unknown table alias \"{}\"", alias))?;
+                if let Some(table_meta) = catalog.get_table(&table.table_name) {
+                    for col in &table_meta.columns {
+                        let is_null = col.is_nullable || table.is_nullable;
+                        let ts_type = if is_null {
+                            format_nullable(&col.ts_type)
+                        } else {
+                            col.ts_type.clone()
+                        };
+                        fields.push(QueryField {
+                            name: col.name.clone(),
+                            ts_type,
+                        });
+                    }
+                }
+                return Ok(());
+            }
 
             // Qualified or unqualified column ref
             if cr.fields.len() == 2 {
@@ -708,15 +723,20 @@ fn resolve_target(
                 let table = tables
                     .iter()
                     .find(|t| t.alias.eq_ignore_ascii_case(&alias_str))
-                    .ok_or_else(|| format!("Unknown table alias \"{}\" in column reference", alias_str))?;
+                    .ok_or_else(|| {
+                        format!("Unknown table alias \"{}\" in column reference", alias_str)
+                    })?;
 
-                let table_meta = catalog
-                    .get_table(&table.table_name)
-                    .ok_or_else(|| format!("Table \"{}\" not found in catalog", table.table_name))?;
+                let table_meta = catalog.get_table(&table.table_name).ok_or_else(|| {
+                    format!("Table \"{}\" not found in catalog", table.table_name)
+                })?;
 
-                let col = table_meta
-                    .get_column(&col_str)
-                    .ok_or_else(|| format!("Column \"{}\" not found on table \"{}\"", col_str, table.table_name))?;
+                let col = table_meta.get_column(&col_str).ok_or_else(|| {
+                    format!(
+                        "Column \"{}\" not found on table \"{}\"",
+                        col_str, table.table_name
+                    )
+                })?;
 
                 let is_null = col.is_nullable || table.is_nullable;
                 let ts_type = if is_null {
@@ -736,16 +756,23 @@ fn resolve_target(
                 let mut matched: Vec<(&TableInScope, &crate::catalog::ColumnMetadata)> = Vec::new();
                 for table in tables {
                     if let Some(table_meta) = catalog.get_table(&table.table_name)
-                        && let Some(col) = table_meta.get_column(&col_str) {
-                            matched.push((table, col));
-                        }
+                        && let Some(col) = table_meta.get_column(&col_str)
+                    {
+                        matched.push((table, col));
+                    }
                 }
 
                 if matched.is_empty() {
-                    return Err(format!("Column \"{}\" not found in any table in scope", col_str));
+                    return Err(format!(
+                        "Column \"{}\" not found in any table in scope",
+                        col_str
+                    ));
                 }
                 if matched.len() > 1 {
-                    return Err(format!("Column \"{}\" is ambiguous across multiple tables in scope", col_str));
+                    return Err(format!(
+                        "Column \"{}\" is ambiguous across multiple tables in scope",
+                        col_str
+                    ));
                 }
 
                 let (table, col) = matched[0];
@@ -784,9 +811,10 @@ fn resolve_target(
                             location: 0,
                         };
                         if resolve_target(&dummy_rt, catalog, tables, &mut sub_fields).is_ok()
-                            && let Some(first_field) = sub_fields.first() {
-                                inner_type = first_field.ts_type.clone();
-                            }
+                            && let Some(first_field) = sub_fields.first()
+                        {
+                            inner_type = first_field.ts_type.clone();
+                        }
                     }
                     format_nullable(&inner_type)
                 }
@@ -803,17 +831,18 @@ fn resolve_target(
                             location: 0,
                         };
                         if resolve_target(&dummy_rt, catalog, tables, &mut sub_fields).is_ok()
-                            && let Some(f) = sub_fields.first() {
-                                let arg_is_nullable = f.ts_type.contains("| null");
-                                let base = f.ts_type.replace(" | null", "").trim().to_string();
-                                if base != "unknown" {
-                                    resolved_type = base;
-                                }
-                                if !arg_is_nullable {
-                                    is_nullable = false;
-                                    break;
-                                }
+                            && let Some(f) = sub_fields.first()
+                        {
+                            let arg_is_nullable = f.ts_type.contains("| null");
+                            let base = f.ts_type.replace(" | null", "").trim().to_string();
+                            if base != "unknown" {
+                                resolved_type = base;
                             }
+                            if !arg_is_nullable {
+                                is_nullable = false;
+                                break;
+                            }
+                        }
                     }
                     if is_nullable {
                         format_nullable(&resolved_type)
@@ -841,17 +870,18 @@ fn resolve_target(
                     location: 0,
                 };
                 if resolve_target(&dummy_rt, catalog, tables, &mut sub_fields).is_ok()
-                    && let Some(f) = sub_fields.first() {
-                        let arg_is_nullable = f.ts_type.contains("| null");
-                        let base = f.ts_type.replace(" | null", "").trim().to_string();
-                        if base != "unknown" {
-                            resolved_type = base;
-                        }
-                        if !arg_is_nullable {
-                            is_nullable = false;
-                            break;
-                        }
+                    && let Some(f) = sub_fields.first()
+                {
+                    let arg_is_nullable = f.ts_type.contains("| null");
+                    let base = f.ts_type.replace(" | null", "").trim().to_string();
+                    if base != "unknown" {
+                        resolved_type = base;
                     }
+                    if !arg_is_nullable {
+                        is_nullable = false;
+                        break;
+                    }
+                }
             }
 
             let ts_type = if is_nullable {
@@ -896,24 +926,26 @@ fn resolve_target(
             let name = explicit_alias.unwrap_or_else(|| "expr".to_string());
             let op = ae.name.first().and_then(extract_string).unwrap_or_default();
 
-            let resolve_operand = |operand_node: &Option<Box<pg_query::protobuf::Node>>| -> (String, bool) {
-                if let Some(op_node) = operand_node {
-                    let mut sub_fields = Vec::new();
-                    let dummy_rt = pg_query::protobuf::ResTarget {
-                        name: String::new(),
-                        indirection: Vec::new(),
-                        val: Some(op_node.clone()),
-                        location: 0,
-                    };
-                    if resolve_target(&dummy_rt, catalog, tables, &mut sub_fields).is_ok()
-                        && let Some(f) = sub_fields.first() {
+            let resolve_operand =
+                |operand_node: &Option<Box<pg_query::protobuf::Node>>| -> (String, bool) {
+                    if let Some(op_node) = operand_node {
+                        let mut sub_fields = Vec::new();
+                        let dummy_rt = pg_query::protobuf::ResTarget {
+                            name: String::new(),
+                            indirection: Vec::new(),
+                            val: Some(op_node.clone()),
+                            location: 0,
+                        };
+                        if resolve_target(&dummy_rt, catalog, tables, &mut sub_fields).is_ok()
+                            && let Some(f) = sub_fields.first()
+                        {
                             let is_null = f.ts_type.contains("| null");
                             let base = f.ts_type.replace(" | null", "").trim().to_string();
                             return (base, is_null);
                         }
-                }
-                ("unknown".to_string(), true)
-            };
+                    }
+                    ("unknown".to_string(), true)
+                };
 
             let (_l_type, l_null) = resolve_operand(&ae.lexpr);
             let (_r_type, r_null) = resolve_operand(&ae.rexpr);
@@ -958,9 +990,10 @@ fn resolve_target(
                     location: 0,
                 };
                 if resolve_target(&dummy_rt, catalog, tables, &mut sub_fields).is_ok()
-                    && let Some(f) = sub_fields.first() {
-                        elem_type = f.ts_type.replace(" | null", "").trim().to_string();
-                    }
+                    && let Some(f) = sub_fields.first()
+                {
+                    elem_type = f.ts_type.replace(" | null", "").trim().to_string();
+                }
             }
             fields.push(QueryField {
                 name,
@@ -985,19 +1018,18 @@ fn extract_param_info(node: &pg_query::protobuf::Node) -> Option<(i32, Option<St
         Some(NodeEnum::ParamRef(p)) => Some((p.number, None)),
         Some(NodeEnum::TypeCast(tc)) => {
             if let Some(arg) = &tc.arg
-                && let Some(NodeEnum::ParamRef(p)) = &arg.node {
-                    let cast_type = tc.type_name.as_ref().map(extract_type_name);
-                    return Some((p.number, cast_type));
-                }
+                && let Some(NodeEnum::ParamRef(p)) = &arg.node
+            {
+                let cast_type = tc.type_name.as_ref().map(extract_type_name);
+                return Some((p.number, cast_type));
+            }
             None
         }
         _ => None,
     }
 }
 
-fn extract_column_info(
-    node: &pg_query::protobuf::Node,
-) -> Option<(Option<String>, String)> {
+fn extract_column_info(node: &pg_query::protobuf::Node) -> Option<(Option<String>, String)> {
     match &node.node {
         Some(NodeEnum::ColumnRef(cr)) => {
             if cr.fields.len() == 2 {
@@ -1007,9 +1039,10 @@ fn extract_column_info(
                     return Some((alias, c));
                 }
             } else if cr.fields.len() == 1
-                && let Some(c) = extract_string(&cr.fields[0]) {
-                    return Some((None, c));
-                }
+                && let Some(c) = extract_string(&cr.fields[0])
+            {
+                return Some((None, c));
+            }
             None
         }
         Some(NodeEnum::TypeCast(tc)) => {
@@ -1053,8 +1086,7 @@ fn match_equality_col_param(
         let param_opt_r = ae.rexpr.as_ref().and_then(|n| extract_param_info(n));
         let col_opt_r = ae.rexpr.as_ref().and_then(|n| extract_column_info(n));
 
-        if let (Some((param_num, cast_opt)), Some((alias_opt, col_name))) =
-            (param_opt_r, col_opt_l)
+        if let (Some((param_num, cast_opt)), Some((alias_opt, col_name))) = (param_opt_r, col_opt_l)
         {
             return Some((param_num, cast_opt, alias_opt, col_name));
         } else if let (Some((param_num, cast_opt)), Some((alias_opt, col_name))) =
@@ -1143,26 +1175,14 @@ fn resolve_params_in_expr(
                     (param_opt_r, col_opt_l)
                 {
                     record_param(
-                        param_num,
-                        cast_opt,
-                        alias_opt,
-                        &col_name,
-                        catalog,
-                        tables,
-                        param_map,
+                        param_num, cast_opt, alias_opt, &col_name, catalog, tables, param_map,
                         false,
                     )?;
                 } else if let (Some((param_num, cast_opt)), Some((alias_opt, col_name))) =
                     (param_opt_l, col_opt_r)
                 {
                     record_param(
-                        param_num,
-                        cast_opt,
-                        alias_opt,
-                        &col_name,
-                        catalog,
-                        tables,
-                        param_map,
+                        param_num, cast_opt, alias_opt, &col_name, catalog, tables, param_map,
                         false,
                     )?;
                 } else {
@@ -1185,7 +1205,9 @@ fn resolve_params_in_expr(
                         .map(extract_type_name)
                         .map(|t| normalize_pg_type_to_ts(&t, catalog.driver));
                     let entry = param_map.entry(p.number).or_default();
-                    if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
+                    if entry.inferred_type.is_none()
+                        || entry.inferred_type.as_deref() == Some("unknown")
+                    {
                         entry.inferred_type = ts_type;
                     }
                 } else {
@@ -1217,7 +1239,8 @@ fn record_param(
     param_map: &mut HashMap<i32, ParamInfo>,
     is_optional: bool,
 ) -> Result<(), String> {
-    let mut resolved_type: Option<String> = cast_opt.map(|c| normalize_pg_type_to_ts(&c, catalog.driver));
+    let mut resolved_type: Option<String> =
+        cast_opt.map(|c| normalize_pg_type_to_ts(&c, catalog.driver));
 
     // Lookup column to verify and get type if not explicitly cast
     let col_meta = if let Some(alias) = alias_opt {
@@ -1233,18 +1256,20 @@ fn record_param(
         let mut found = None;
         for t in tables {
             if let Some(t_meta) = catalog.get_table(&t.table_name)
-                && let Some(c) = t_meta.get_column(col_name) {
-                    found = Some(c);
-                    break;
-                }
+                && let Some(c) = t_meta.get_column(col_name)
+            {
+                found = Some(c);
+                break;
+            }
         }
         found
     };
 
     if let Some(col) = col_meta
-        && resolved_type.is_none() {
-            resolved_type = Some(col.ts_type.clone());
-        }
+        && resolved_type.is_none()
+    {
+        resolved_type = Some(col.ts_type.clone());
+    }
 
     let entry = param_map.entry(param_num).or_default();
     if is_optional {
@@ -1404,7 +1429,8 @@ RIGHT JOIN posts p ON p.user_id = u.id;
         assert_eq!(analyzed_star.fields[1].ts_type, "string");
 
         let alias_star_sql = "SELECT u.* FROM users u LEFT JOIN posts p ON p.user_id = u.id;";
-        let analyzed_alias_star = analyze_query(alias_star_sql, &catalog, Some("users_alias.sql")).unwrap();
+        let analyzed_alias_star =
+            analyze_query(alias_star_sql, &catalog, Some("users_alias.sql")).unwrap();
         assert_eq!(analyzed_alias_star.fields.len(), 2);
         assert_eq!(analyzed_alias_star.fields[0].name, "id");
         assert_eq!(analyzed_alias_star.fields[0].ts_type, "string");
@@ -1426,7 +1452,9 @@ RIGHT JOIN posts p ON p.user_id = u.id;
     #[test]
     fn test_cte_selection() {
         let mut catalog = Catalog::default();
-        catalog.apply_sql("
+        catalog
+            .apply_sql(
+                "
             CREATE TABLE users (
                 id UUID PRIMARY KEY,
                 email TEXT NOT NULL,
@@ -1437,7 +1465,9 @@ RIGHT JOIN posts p ON p.user_id = u.id;
                 user_id UUID NOT NULL,
                 title VARCHAR(255) NOT NULL
             );
-        ").unwrap();
+        ",
+            )
+            .unwrap();
 
         let query_sql = "
             WITH active_users AS (
@@ -1458,13 +1488,17 @@ RIGHT JOIN posts p ON p.user_id = u.id;
     #[test]
     fn test_arithmetic_and_coalesce() {
         let mut catalog = Catalog::default();
-        catalog.apply_sql("
+        catalog
+            .apply_sql(
+                "
             CREATE TABLE users (
                 id UUID PRIMARY KEY,
                 age INT NOT NULL,
                 nickname TEXT
             );
-        ").unwrap();
+        ",
+            )
+            .unwrap();
 
         let query_sql = "
             SELECT (u.age + 1) AS next_age, COALESCE(u.nickname, 'anon') AS display_name FROM users u;
@@ -1480,14 +1514,18 @@ RIGHT JOIN posts p ON p.user_id = u.id;
     #[test]
     fn test_array_type_mappings() {
         let mut catalog = Catalog::default();
-        catalog.apply_sql("
+        catalog
+            .apply_sql(
+                "
             CREATE TABLE articles (
                 id UUID PRIMARY KEY,
                 tags TEXT[] NOT NULL,
                 scores INT4[] NOT NULL,
                 optional_tags TEXT[]
             );
-        ").unwrap();
+        ",
+            )
+            .unwrap();
 
         let query_sql = "
             SELECT a.tags, a.scores, a.optional_tags, ARRAY['rust', 'typescript'] AS defaults
@@ -1509,12 +1547,14 @@ RIGHT JOIN posts p ON p.user_id = u.id;
     fn test_optional_dynamic_filter() {
         let mut catalog = Catalog::default();
         catalog
-            .apply_sql("
+            .apply_sql(
+                "
                 CREATE TABLE users (
                     id UUID PRIMARY KEY,
                     name TEXT NOT NULL
                 );
-            ")
+            ",
+            )
             .unwrap();
 
         let query_sql = "
@@ -1540,14 +1580,16 @@ RIGHT JOIN posts p ON p.user_id = u.id;
     fn test_insert_with_returning() {
         let mut catalog = Catalog::default();
         catalog
-            .apply_sql("
+            .apply_sql(
+                "
                 CREATE TABLE users (
                     id UUID PRIMARY KEY,
                     name TEXT NOT NULL,
                     email VARCHAR(255) NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL
                 );
-            ")
+            ",
+            )
             .unwrap();
 
         let query_sql = "
@@ -1580,12 +1622,14 @@ RIGHT JOIN posts p ON p.user_id = u.id;
     fn test_update_with_returning() {
         let mut catalog = Catalog::default();
         catalog
-            .apply_sql("
+            .apply_sql(
+                "
                 CREATE TABLE users (
                     id UUID PRIMARY KEY,
                     name TEXT NOT NULL
                 );
-            ")
+            ",
+            )
             .unwrap();
 
         let query_sql = "
@@ -1618,11 +1662,13 @@ RIGHT JOIN posts p ON p.user_id = u.id;
     fn test_delete_without_returning() {
         let mut catalog = Catalog::default();
         catalog
-            .apply_sql("
+            .apply_sql(
+                "
                 CREATE TABLE users (
                     id UUID PRIMARY KEY
                 );
-            ")
+            ",
+            )
             .unwrap();
 
         let query_sql = "

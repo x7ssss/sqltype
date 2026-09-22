@@ -1,1 +1,7 @@
 /target
+node_modules
+npm/platforms/*/bin/sqltype*
+!npm/platforms/*/bin/.gitkeep
+dist/
+artifacts/
+release-assets/

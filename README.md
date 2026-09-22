@@ -3,9 +3,9 @@
 > **Ultra-fast, local-first SQL-to-TypeScript compiler CLI and Language Server in Rust.**  
 > Write raw PostgreSQL queries with compile-time type safety. **Zero** Docker containers. **Zero** WASM overhead. **Sub-10ms** codegen & LSP.
 
-[![Release](https://img.shields.io/badge/npm-v0.1.0-blue.svg)](https://www.npmjs.com/package/sqltype)
+[![Release](https://img.shields.io/badge/npm-%40x7ssss%2Fsqltype-blue.svg)](https://www.npmjs.com/package/@x7ssss/sqltype)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-33%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-39%20passed-brightgreen.svg)]()
 
 ---
 
@@ -117,10 +117,10 @@ Install globally or as a project devDependency via npm:
 
 ```bash
 # Using npm
-npm install -D sqltype
+npm install -D @x7ssss/sqltype
 
 # Using pnpm
-pnpm add -D sqltype
+pnpm add -D @x7ssss/sqltype
 
 # Using cargo
 cargo install --path .

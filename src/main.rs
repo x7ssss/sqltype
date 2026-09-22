@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use sqltype::analyzer::analyze_query;
 use sqltype::catalog::{Catalog, DriverTarget};
-use sqltype::codegen::{generate_file_ts_with_options, CodegenOptions};
+use sqltype::codegen::{CodegenOptions, generate_file_ts_with_options};
 use std::path::{Path, PathBuf};
 use std::process;
 use walkdir::WalkDir;
@@ -83,9 +83,10 @@ fn discover_sql_files<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, String> {
         let path = entry.path();
         if path.is_file()
             && let Some(ext) = path.extension()
-                && ext.eq_ignore_ascii_case("sql") {
-                    files.push(path.to_path_buf());
-                }
+            && ext.eq_ignore_ascii_case("sql")
+        {
+            files.push(path.to_path_buf());
+        }
     }
 
     // Sort deterministically
@@ -125,7 +126,11 @@ fn run_check(
         let content = match std::fs::read_to_string(file) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[Error] Failed to read query file {}: {}", file.display(), e);
+                eprintln!(
+                    "[Error] Failed to read query file {}: {}",
+                    file.display(),
+                    e
+                );
                 has_errors = true;
                 continue;
             }
@@ -140,7 +145,8 @@ fn run_check(
             Ok(analyzed) => {
                 if wrappers {
                     let options = CodegenOptions::new(driver, true);
-                    let _ = generate_file_ts_with_options(std::slice::from_ref(&analyzed), &options);
+                    let _ =
+                        generate_file_ts_with_options(std::slice::from_ref(&analyzed), &options);
                 }
                 println!(
                     "  ✓ [{}] {} ({} params, {} fields{})",
@@ -205,7 +211,11 @@ fn run_generate(
         let content = match std::fs::read_to_string(file) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[Error] Failed to read query file {}: {}", file.display(), e);
+                eprintln!(
+                    "[Error] Failed to read query file {}: {}",
+                    file.display(),
+                    e
+                );
                 has_errors = true;
                 continue;
             }
@@ -240,14 +250,15 @@ fn run_generate(
         let out_file_path = out_dir.join(rel_path).with_extension("ts");
 
         if let Some(parent) = out_file_path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!(
-                    "[Error] Failed to create output directory {}: {}",
-                    parent.display(),
-                    e
-                );
-                return Err(());
-            }
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "[Error] Failed to create output directory {}: {}",
+                parent.display(),
+                e
+            );
+            return Err(());
+        }
 
         let ts_code = generate_file_ts_with_options(std::slice::from_ref(analyzed), &options);
         if let Err(e) = std::fs::write(&out_file_path, ts_code) {
@@ -289,7 +300,9 @@ fn main() {
         } => {
             let res = run_generate(&migrations, &queries, &out, driver, wrappers);
             if res.is_ok() && watch {
-                if let Err(e) = sqltype::watcher::run_watch(&migrations, &queries, &out, driver, wrappers) {
+                if let Err(e) =
+                    sqltype::watcher::run_watch(&migrations, &queries, &out, driver, wrappers)
+                {
                     eprintln!("[Watch Error] {}", e);
                     Err(())
                 } else {

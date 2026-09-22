@@ -10,7 +10,7 @@ use lsp_types::{
 use notify::{RecursiveMode, Watcher};
 use pg_query::{NodeEnum, NodeRef};
 use std::collections::{HashMap, HashSet};
-use std::ffi::{c_char, c_int, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_int};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -247,7 +247,8 @@ pub fn resolve_hover(text: &str, pos: Position, catalog: &Catalog) -> Option<Hov
                 let end = byte_offset_to_position(text, loc + param_str.len());
 
                 let md = if let Some(ref query) = analyzed {
-                    if let Some(param) = query.params.iter().find(|p| p.index == pr.number as usize) {
+                    if let Some(param) = query.params.iter().find(|p| p.index == pr.number as usize)
+                    {
                         format!(
                             "### Parameter `${}`\n- **Field**: `{}`\n- **TypeScript Type**: `{}`\n- **Optional**: `{}`",
                             pr.number, param.name, param.ts_type, param.is_optional
@@ -285,12 +286,26 @@ pub fn resolve_hover(text: &str, pos: Position, catalog: &Catalog) -> Option<Hov
                 let md = if let Some(table) = catalog.get_table(&rv.relname) {
                     let mut cols = Vec::new();
                     for col in &table.columns {
-                        let null_str = if col.is_nullable { "nullable" } else { "non-null" };
-                        cols.push(format!("- `{}`: `{}` ({})", col.name, col.pg_type, null_str));
+                        let null_str = if col.is_nullable {
+                            "nullable"
+                        } else {
+                            "non-null"
+                        };
+                        cols.push(format!(
+                            "- `{}`: `{}` ({})",
+                            col.name, col.pg_type, null_str
+                        ));
                     }
-                    format!("### Table `{}`\n**Columns**:\n{}", table.name, cols.join("\n"))
+                    format!(
+                        "### Table `{}`\n**Columns**:\n{}",
+                        table.name,
+                        cols.join("\n")
+                    )
                 } else {
-                    format!("### Table `{}`\n*(Not found in schema catalog)*", rv.relname)
+                    format!(
+                        "### Table `{}`\n*(Not found in schema catalog)*",
+                        rv.relname
+                    )
                 };
 
                 return Some(Hover {
@@ -483,9 +498,7 @@ pub fn run_lsp_server<P: AsRef<Path>>(migrations_dir: P) -> Result<(), Box<dyn s
                             .unwrap_or(false)
                     });
 
-                    if has_sql
-                        && let Ok(new_cat) = Catalog::load_from_dir(&migrations_path_clone)
-                    {
+                    if has_sql && let Ok(new_cat) = Catalog::load_from_dir(&migrations_path_clone) {
                         catalog.store(Arc::new(new_cat));
 
                         // Re-trigger analysis on all active open buffers
@@ -519,9 +532,13 @@ pub fn run_lsp_server<P: AsRef<Path>>(migrations_dir: P) -> Result<(), Box<dyn s
                 if req.method == "textDocument/hover" {
                     let (id, params) = cast_req::<HoverParams>(req)?;
                     let vfs_guard = vfs.read().unwrap();
-                    let hover_res = if let Some((_, text)) =
-                        vfs_guard.get(params.text_document_position_params.text_document.uri.as_str())
-                    {
+                    let hover_res = if let Some((_, text)) = vfs_guard.get(
+                        params
+                            .text_document_position_params
+                            .text_document
+                            .uri
+                            .as_str(),
+                    ) {
                         let cat_snapshot = catalog.load();
                         resolve_hover(
                             text,
@@ -540,16 +557,37 @@ pub fn run_lsp_server<P: AsRef<Path>>(migrations_dir: P) -> Result<(), Box<dyn s
                     connection.sender.send(Message::Response(resp))?;
                 }
             }
-            Message::Notification(notif) => {
-                match notif.method.as_str() {
-                    "textDocument/didOpen" => {
-                        if let Ok(params) = cast_notif::<DidOpenTextDocumentParams>(notif) {
-                            let uri = params.text_document.uri;
-                            let uri_str = uri.to_string();
-                            let version = params.text_document.version;
-                            let text = params.text_document.text;
+            Message::Notification(notif) => match notif.method.as_str() {
+                "textDocument/didOpen" => {
+                    if let Ok(params) = cast_notif::<DidOpenTextDocumentParams>(notif) {
+                        let uri = params.text_document.uri;
+                        let uri_str = uri.to_string();
+                        let version = params.text_document.version;
+                        let text = params.text_document.text;
 
-                            vfs.write().unwrap().insert(uri_str.clone(), (version, text.clone()));
+                        vfs.write()
+                            .unwrap()
+                            .insert(uri_str.clone(), (version, text.clone()));
+                        let job_id = latest_job_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                        uri_latest_jobs.lock().unwrap().insert(uri_str, job_id);
+                        let _ = job_sender.send(AnalysisJob {
+                            uri,
+                            version,
+                            text,
+                            job_id,
+                        });
+                    }
+                }
+                "textDocument/didChange" => {
+                    if let Ok(params) = cast_notif::<DidChangeTextDocumentParams>(notif) {
+                        let uri = params.text_document.uri;
+                        let uri_str = uri.to_string();
+                        let version = params.text_document.version;
+                        if let Some(change) = params.content_changes.into_iter().last() {
+                            let text = change.text;
+                            vfs.write()
+                                .unwrap()
+                                .insert(uri_str.clone(), (version, text.clone()));
                             let job_id = latest_job_counter.fetch_add(1, Ordering::SeqCst) + 1;
                             uri_latest_jobs.lock().unwrap().insert(uri_str, job_id);
                             let _ = job_sender.send(AnalysisJob {
@@ -560,35 +598,16 @@ pub fn run_lsp_server<P: AsRef<Path>>(migrations_dir: P) -> Result<(), Box<dyn s
                             });
                         }
                     }
-                    "textDocument/didChange" => {
-                        if let Ok(params) = cast_notif::<DidChangeTextDocumentParams>(notif) {
-                            let uri = params.text_document.uri;
-                            let uri_str = uri.to_string();
-                            let version = params.text_document.version;
-                            if let Some(change) = params.content_changes.into_iter().last() {
-                                let text = change.text;
-                                vfs.write().unwrap().insert(uri_str.clone(), (version, text.clone()));
-                                let job_id = latest_job_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                                uri_latest_jobs.lock().unwrap().insert(uri_str, job_id);
-                                let _ = job_sender.send(AnalysisJob {
-                                    uri,
-                                    version,
-                                    text,
-                                    job_id,
-                                });
-                            }
-                        }
-                    }
-                    "textDocument/didClose" => {
-                        if let Ok(params) = cast_notif::<DidCloseTextDocumentParams>(notif) {
-                            let uri_str = params.text_document.uri.to_string();
-                            vfs.write().unwrap().remove(&uri_str);
-                            uri_latest_jobs.lock().unwrap().remove(&uri_str);
-                        }
-                    }
-                    _ => {}
                 }
-            }
+                "textDocument/didClose" => {
+                    if let Ok(params) = cast_notif::<DidCloseTextDocumentParams>(notif) {
+                        let uri_str = params.text_document.uri.to_string();
+                        vfs.write().unwrap().remove(&uri_str);
+                        uri_latest_jobs.lock().unwrap().remove(&uri_str);
+                    }
+                }
+                _ => {}
+            },
             Message::Response(_) => {}
         }
     }
@@ -654,9 +673,11 @@ mod tests {
         let sql = "SELECT id FROM nonexistent_table WHERE 1=1;";
         let diags = validate_sql(sql, &catalog);
         assert_eq!(diags.len(), 1);
-        assert!(diags[0]
-            .message
-            .contains("Table \"nonexistent_table\" does not exist in schema catalog"));
+        assert!(
+            diags[0]
+                .message
+                .contains("Table \"nonexistent_table\" does not exist in schema catalog")
+        );
         assert_eq!(diags[0].range.start.character, 15);
         assert_eq!(diags[0].range.end.character, 32);
     }
