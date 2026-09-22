@@ -126,20 +126,36 @@ pub fn analyze_query(
     let query_name = extract_query_name(sql, fallback_filename);
     let parsed = pg_query::parse(sql).map_err(|e| format!("Query parse error: {}", e))?;
 
-    // Find the SelectStmt
-    let mut select_stmt: Option<&pg_query::protobuf::SelectStmt> = None;
+    // Find the query statement
+    let mut root_stmt: Option<&pg_query::protobuf::Node> = None;
     for stmt in &parsed.protobuf.stmts {
         if let Some(node) = &stmt.stmt
-            && let Some(NodeEnum::SelectStmt(sel)) = &node.node {
-                select_stmt = Some(sel);
+            && matches!(
+                &node.node,
+                Some(
+                    NodeEnum::SelectStmt(_)
+                    | NodeEnum::InsertStmt(_)
+                    | NodeEnum::UpdateStmt(_)
+                    | NodeEnum::DeleteStmt(_)
+                )
+            ) {
+                root_stmt = Some(node);
                 break;
             }
     }
 
-    let select = select_stmt.ok_or_else(|| "No SELECT statement found in query".to_string())?;
+    let root = root_stmt.ok_or_else(|| {
+        "No supported statement (SELECT, INSERT, UPDATE, DELETE) found in query".to_string()
+    })?;
     let mut param_map: HashMap<i32, ParamInfo> = HashMap::new();
 
-    let fields = analyze_select_stmt(select, catalog, &mut param_map)?;
+    let fields = match &root.node {
+        Some(NodeEnum::SelectStmt(select)) => analyze_select_stmt(select, catalog, &mut param_map)?,
+        Some(NodeEnum::InsertStmt(insert)) => analyze_insert_stmt(insert, catalog, &mut param_map)?,
+        Some(NodeEnum::UpdateStmt(update)) => analyze_update_stmt(update, catalog, &mut param_map)?,
+        Some(NodeEnum::DeleteStmt(delete)) => analyze_delete_stmt(delete, catalog, &mut param_map)?,
+        _ => unreachable!(),
+    };
 
     // Sort parameters deterministically by index (1..=N)
     let mut param_indices: Vec<i32> = param_map.keys().copied().collect();
@@ -180,6 +196,50 @@ pub fn analyze_query(
     })
 }
 
+fn register_ctes(
+    wc: &pg_query::protobuf::WithClause,
+    scoped_catalog: &mut Catalog,
+    param_map: &mut HashMap<i32, ParamInfo>,
+) -> Result<(), String> {
+    for cte_node in &wc.ctes {
+        if let Some(NodeEnum::CommonTableExpr(cte)) = &cte_node.node {
+            let cte_name = cte.ctename.to_ascii_lowercase();
+            if let Some(query_node) = &cte.ctequery
+                && let Some(NodeEnum::SelectStmt(cte_select)) = &query_node.node {
+                    let cte_fields = analyze_select_stmt(cte_select, scoped_catalog, param_map)?;
+                    let mut cte_columns = Vec::new();
+
+                    for (i, field) in cte_fields.iter().enumerate() {
+                        let col_name = if let Some(alias_node) = cte.aliascolnames.get(i) {
+                            extract_string(alias_node).unwrap_or_else(|| field.name.clone())
+                        } else {
+                            field.name.clone()
+                        };
+
+                        let is_nullable = field.ts_type.contains("| null");
+                        let base_ts_type = field.ts_type.replace(" | null", "").trim().to_string();
+
+                        cte_columns.push(ColumnMetadata {
+                            name: col_name,
+                            pg_type: "unknown".to_string(),
+                            ts_type: base_ts_type,
+                            is_nullable,
+                            has_default: false,
+                        });
+                    }
+
+                    let cte_table = TableMetadata {
+                        name: cte_name.clone(),
+                        schema: None,
+                        columns: cte_columns,
+                    };
+                    scoped_catalog.tables.insert(cte_name, cte_table);
+                }
+        }
+    }
+    Ok(())
+}
+
 fn analyze_select_stmt(
     select: &pg_query::protobuf::SelectStmt,
     catalog: &Catalog,
@@ -194,41 +254,7 @@ fn analyze_select_stmt(
     // 0. Register CTEs from with_clause into a query-scoped catalog overlay
     let mut scoped_catalog = catalog.clone();
     if let Some(wc) = &select.with_clause {
-        for cte_node in &wc.ctes {
-            if let Some(NodeEnum::CommonTableExpr(cte)) = &cte_node.node {
-                let cte_name = cte.ctename.to_ascii_lowercase();
-                if let Some(query_node) = &cte.ctequery
-                    && let Some(NodeEnum::SelectStmt(cte_select)) = &query_node.node {
-                        let cte_fields = analyze_select_stmt(cte_select, &scoped_catalog, param_map)?;
-                        let mut cte_columns = Vec::new();
-
-                        for (i, field) in cte_fields.iter().enumerate() {
-                            let col_name = if let Some(alias_node) = cte.aliascolnames.get(i) {
-                                extract_string(alias_node).unwrap_or_else(|| field.name.clone())
-                            } else {
-                                field.name.clone()
-                            };
-
-                            let is_nullable = field.ts_type.contains("| null");
-                            let base_ts_type = field.ts_type.replace(" | null", "").trim().to_string();
-
-                            cte_columns.push(ColumnMetadata {
-                                name: col_name,
-                                pg_type: "unknown".to_string(),
-                                ts_type: base_ts_type,
-                                is_nullable,
-                            });
-                        }
-
-                        let cte_table = TableMetadata {
-                            name: cte_name.clone(),
-                            schema: None,
-                            columns: cte_columns,
-                        };
-                        scoped_catalog.tables.insert(cte_name, cte_table);
-                    }
-            }
-        }
+        register_ctes(wc, &mut scoped_catalog, param_map)?;
     }
 
     // 1. Build table-to-nullability context map from from_clause
@@ -271,6 +297,288 @@ fn analyze_select_stmt(
                 entry.inferred_type = Some("number".to_string());
             }
         }
+
+    Ok(fields)
+}
+
+fn analyze_insert_stmt(
+    insert: &pg_query::protobuf::InsertStmt,
+    catalog: &Catalog,
+    param_map: &mut HashMap<i32, ParamInfo>,
+) -> Result<Vec<QueryField>, String> {
+    let mut scoped_catalog = catalog.clone();
+    if let Some(wc) = &insert.with_clause {
+        register_ctes(wc, &mut scoped_catalog, param_map)?;
+    }
+
+    let rel = insert
+        .relation
+        .as_ref()
+        .ok_or_else(|| "INSERT statement missing target relation".to_string())?;
+    let table_name = rel.relname.to_ascii_lowercase();
+    let table_meta = scoped_catalog
+        .get_table(&table_name)
+        .ok_or_else(|| format!("Table \"{}\" does not exist in schema catalog", rel.relname))?
+        .clone();
+
+    let alias = rel
+        .alias
+        .as_ref()
+        .map(|a| a.aliasname.clone())
+        .unwrap_or_else(|| table_name.clone());
+
+    let tables_in_scope = vec![TableInScope {
+        table_name: table_name.clone(),
+        alias,
+        is_nullable: false,
+    }];
+
+    // Determine target column names
+    let target_col_names: Vec<String> = if !insert.cols.is_empty() {
+        let mut cols = Vec::new();
+        for col_node in &insert.cols {
+            if let Some(NodeEnum::ResTarget(rt)) = &col_node.node {
+                if table_meta.get_column(&rt.name).is_none() {
+                    return Err(format!(
+                        "Column \"{}\" does not exist on table \"{}\"",
+                        rt.name, table_name
+                    ));
+                }
+                cols.push(rt.name.clone());
+            }
+        }
+        cols
+    } else {
+        table_meta.columns.iter().map(|c| c.name.clone()).collect()
+    };
+
+    // Process values / parameters from select_stmt
+    if let Some(select_node) = &insert.select_stmt
+        && let Some(NodeEnum::SelectStmt(select)) = &select_node.node {
+            if !select.values_lists.is_empty() {
+                for row_node in &select.values_lists {
+                    if let Some(NodeEnum::List(row_list)) = &row_node.node {
+                        for (i, val_node) in row_list.items.iter().enumerate() {
+                            if let Some(col_name) = target_col_names.get(i) {
+                                let col_meta = table_meta.get_column(col_name);
+                                let is_optional = col_meta
+                                    .map(|c| c.is_nullable || c.has_default)
+                                    .unwrap_or(false);
+
+                                if let Some((param_num, cast_opt)) = extract_param_info(val_node) {
+                                    record_param(
+                                        param_num,
+                                        cast_opt,
+                                        None,
+                                        col_name,
+                                        &scoped_catalog,
+                                        &tables_in_scope,
+                                        param_map,
+                                        is_optional,
+                                    )?;
+                                } else {
+                                    resolve_params_in_expr(
+                                        val_node,
+                                        &scoped_catalog,
+                                        &tables_in_scope,
+                                        param_map,
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                analyze_select_stmt(select, &scoped_catalog, param_map)?;
+            }
+        }
+
+    // Process on_conflict_clause if present
+    if let Some(occ) = &insert.on_conflict_clause {
+        for target in &occ.target_list {
+            if let Some(NodeEnum::ResTarget(rt)) = &target.node {
+                let col_name = &rt.name;
+                let is_optional = table_meta
+                    .get_column(col_name)
+                    .map(|c| c.is_nullable)
+                    .unwrap_or(false);
+                if let Some(val_node) = &rt.val {
+                    if let Some((param_num, cast_opt)) = extract_param_info(val_node) {
+                        record_param(
+                            param_num,
+                            cast_opt,
+                            None,
+                            col_name,
+                            &scoped_catalog,
+                            &tables_in_scope,
+                            param_map,
+                            is_optional,
+                        )?;
+                    } else {
+                        resolve_params_in_expr(
+                            val_node,
+                            &scoped_catalog,
+                            &tables_in_scope,
+                            param_map,
+                        )?;
+                    }
+                }
+            }
+        }
+        if let Some(where_node) = &occ.where_clause {
+            resolve_params_in_expr(where_node, &scoped_catalog, &tables_in_scope, param_map)?;
+        }
+    }
+
+    // Resolve RETURNING list if present
+    let mut fields = Vec::new();
+    for rt_node in &insert.returning_list {
+        if let Some(NodeEnum::ResTarget(rt)) = &rt_node.node {
+            resolve_target(rt, &scoped_catalog, &tables_in_scope, &mut fields)?;
+        }
+    }
+
+    Ok(fields)
+}
+
+fn analyze_update_stmt(
+    update: &pg_query::protobuf::UpdateStmt,
+    catalog: &Catalog,
+    param_map: &mut HashMap<i32, ParamInfo>,
+) -> Result<Vec<QueryField>, String> {
+    let mut scoped_catalog = catalog.clone();
+    if let Some(wc) = &update.with_clause {
+        register_ctes(wc, &mut scoped_catalog, param_map)?;
+    }
+
+    let rel = update
+        .relation
+        .as_ref()
+        .ok_or_else(|| "UPDATE statement missing target relation".to_string())?;
+    let table_name = rel.relname.to_ascii_lowercase();
+    let table_meta = scoped_catalog
+        .get_table(&table_name)
+        .ok_or_else(|| format!("Table \"{}\" does not exist in schema catalog", rel.relname))?
+        .clone();
+
+    let alias = rel
+        .alias
+        .as_ref()
+        .map(|a| a.aliasname.clone())
+        .unwrap_or_else(|| table_name.clone());
+
+    let mut tables_in_scope = vec![TableInScope {
+        table_name: table_name.clone(),
+        alias,
+        is_nullable: false,
+    }];
+
+    for from_item in &update.from_clause {
+        collect_from_node(from_item, false, &scoped_catalog, &mut tables_in_scope)?;
+    }
+
+    // 1. Column updates in target_list
+    for target in &update.target_list {
+        if let Some(NodeEnum::ResTarget(rt)) = &target.node {
+            let col_name = &rt.name;
+            if table_meta.get_column(col_name).is_none() {
+                return Err(format!(
+                    "Column \"{}\" does not exist on table \"{}\"",
+                    col_name, table_name
+                ));
+            }
+            if let Some(val_node) = &rt.val {
+                if let Some((param_num, cast_opt)) = extract_param_info(val_node) {
+                    let col = table_meta.get_column(col_name);
+                    let is_optional = col.map(|c| c.is_nullable).unwrap_or(false);
+                    record_param(
+                        param_num,
+                        cast_opt,
+                        None,
+                        col_name,
+                        &scoped_catalog,
+                        &tables_in_scope,
+                        param_map,
+                        is_optional,
+                    )?;
+                } else {
+                    resolve_params_in_expr(
+                        val_node,
+                        &scoped_catalog,
+                        &tables_in_scope,
+                        param_map,
+                    )?;
+                }
+            }
+        }
+    }
+
+    // 2. WHERE clause
+    if let Some(where_node) = &update.where_clause {
+        resolve_params_in_expr(where_node, &scoped_catalog, &tables_in_scope, param_map)?;
+    }
+
+    // 3. RETURNING list
+    let mut fields = Vec::new();
+    for rt_node in &update.returning_list {
+        if let Some(NodeEnum::ResTarget(rt)) = &rt_node.node {
+            resolve_target(rt, &scoped_catalog, &tables_in_scope, &mut fields)?;
+        }
+    }
+
+    Ok(fields)
+}
+
+fn analyze_delete_stmt(
+    delete: &pg_query::protobuf::DeleteStmt,
+    catalog: &Catalog,
+    param_map: &mut HashMap<i32, ParamInfo>,
+) -> Result<Vec<QueryField>, String> {
+    let mut scoped_catalog = catalog.clone();
+    if let Some(wc) = &delete.with_clause {
+        register_ctes(wc, &mut scoped_catalog, param_map)?;
+    }
+
+    let rel = delete
+        .relation
+        .as_ref()
+        .ok_or_else(|| "DELETE statement missing target relation".to_string())?;
+    let table_name = rel.relname.to_ascii_lowercase();
+    if scoped_catalog.get_table(&table_name).is_none() {
+        return Err(format!(
+            "Table \"{}\" does not exist in schema catalog",
+            rel.relname
+        ));
+    }
+
+    let alias = rel
+        .alias
+        .as_ref()
+        .map(|a| a.aliasname.clone())
+        .unwrap_or_else(|| table_name.clone());
+
+    let mut tables_in_scope = vec![TableInScope {
+        table_name,
+        alias,
+        is_nullable: false,
+    }];
+
+    for using_item in &delete.using_clause {
+        collect_from_node(using_item, false, &scoped_catalog, &mut tables_in_scope)?;
+    }
+
+    // 1. WHERE clause
+    if let Some(where_node) = &delete.where_clause {
+        resolve_params_in_expr(where_node, &scoped_catalog, &tables_in_scope, param_map)?;
+    }
+
+    // 2. RETURNING list
+    let mut fields = Vec::new();
+    for rt_node in &delete.returning_list {
+        if let Some(NodeEnum::ResTarget(rt)) = &rt_node.node {
+            resolve_target(rt, &scoped_catalog, &tables_in_scope, &mut fields)?;
+        }
+    }
 
     Ok(fields)
 }
@@ -1226,5 +1534,111 @@ RIGHT JOIN posts p ON p.user_id = u.id;
         assert_eq!(p2.name, "id");
         assert_eq!(p2.ts_type, "string");
         assert!(!p2.is_optional);
+    }
+
+    #[test]
+    fn test_insert_with_returning() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql("
+                CREATE TABLE users (
+                    id UUID PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    email VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL
+                );
+            ")
+            .unwrap();
+
+        let query_sql = "
+            -- name: CreateUser
+            INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id, created_at;
+        ";
+        let analyzed = analyze_query(query_sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.name, "CreateUser");
+        assert_eq!(analyzed.params.len(), 2);
+
+        // $1 -> users.name
+        assert_eq!(analyzed.params[0].index, 1);
+        assert_eq!(analyzed.params[0].name, "name");
+        assert_eq!(analyzed.params[0].ts_type, "string");
+
+        // $2 -> users.email
+        assert_eq!(analyzed.params[1].index, 2);
+        assert_eq!(analyzed.params[1].name, "email");
+        assert_eq!(analyzed.params[1].ts_type, "string");
+
+        // RETURNING id, created_at
+        assert_eq!(analyzed.fields.len(), 2);
+        assert_eq!(analyzed.fields[0].name, "id");
+        assert_eq!(analyzed.fields[0].ts_type, "string");
+        assert_eq!(analyzed.fields[1].name, "created_at");
+        assert_eq!(analyzed.fields[1].ts_type, "Date");
+    }
+
+    #[test]
+    fn test_update_with_returning() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql("
+                CREATE TABLE users (
+                    id UUID PRIMARY KEY,
+                    name TEXT NOT NULL
+                );
+            ")
+            .unwrap();
+
+        let query_sql = "
+            -- name: UpdateUser
+            UPDATE users SET name = $1 WHERE id = $2 RETURNING id, name;
+        ";
+        let analyzed = analyze_query(query_sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.name, "UpdateUser");
+        assert_eq!(analyzed.params.len(), 2);
+
+        // $1 -> users.name
+        assert_eq!(analyzed.params[0].index, 1);
+        assert_eq!(analyzed.params[0].name, "name");
+        assert_eq!(analyzed.params[0].ts_type, "string");
+
+        // $2 -> users.id
+        assert_eq!(analyzed.params[1].index, 2);
+        assert_eq!(analyzed.params[1].name, "id");
+        assert_eq!(analyzed.params[1].ts_type, "string");
+
+        // RETURNING id, name
+        assert_eq!(analyzed.fields.len(), 2);
+        assert_eq!(analyzed.fields[0].name, "id");
+        assert_eq!(analyzed.fields[0].ts_type, "string");
+        assert_eq!(analyzed.fields[1].name, "name");
+        assert_eq!(analyzed.fields[1].ts_type, "string");
+    }
+
+    #[test]
+    fn test_delete_without_returning() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql("
+                CREATE TABLE users (
+                    id UUID PRIMARY KEY
+                );
+            ")
+            .unwrap();
+
+        let query_sql = "
+            -- name: DeleteUser
+            DELETE FROM users WHERE id = $1;
+        ";
+        let analyzed = analyze_query(query_sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.name, "DeleteUser");
+        assert_eq!(analyzed.params.len(), 1);
+
+        // $1 -> users.id
+        assert_eq!(analyzed.params[0].index, 1);
+        assert_eq!(analyzed.params[0].name, "id");
+        assert_eq!(analyzed.params[0].ts_type, "string");
+
+        // No row return projection
+        assert!(analyzed.fields.is_empty());
     }
 }

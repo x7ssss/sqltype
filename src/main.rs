@@ -55,6 +55,12 @@ enum Commands {
         #[arg(long, short = 'd', value_enum, default_value_t = DriverTarget::Postgres)]
         driver: DriverTarget,
     },
+    /// Starts the Language Server Protocol (LSP) server for real-time diagnostics and hover inspection
+    Lsp {
+        /// Directory containing PostgreSQL migration SQL files
+        #[arg(long, short = 'm', default_value = "./migrations")]
+        migrations: PathBuf,
+    },
 }
 
 fn discover_sql_files<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, String> {
@@ -268,6 +274,14 @@ fn main() {
                 }
             } else {
                 res
+            }
+        }
+        Commands::Lsp { migrations } => {
+            if let Err(e) = sqltype::lsp::run_lsp_server(migrations) {
+                eprintln!("[LSP Error] {}", e);
+                Err(())
+            } else {
+                Ok(())
             }
         }
     };

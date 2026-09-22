@@ -9,6 +9,7 @@ pub struct ColumnMetadata {
     pub pg_type: String,
     pub ts_type: String,
     pub is_nullable: bool,
+    pub has_default: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +22,10 @@ pub struct TableMetadata {
 impl TableMetadata {
     pub fn get_column(&self, name: &str) -> Option<&ColumnMetadata> {
         self.columns.iter().find(|c| c.name.eq_ignore_ascii_case(name))
+    }
+
+    pub fn get_column_mut(&mut self, name: &str) -> Option<&mut ColumnMetadata> {
+        self.columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(name))
     }
 }
 
@@ -234,13 +239,20 @@ impl Catalog {
                     let ts_type = normalize_pg_type_to_ts(&pg_type, self.driver);
 
                     let mut is_not_null = col.is_not_null;
+                    let mut has_default = matches!(
+                        pg_type.to_ascii_lowercase().as_str(),
+                        "serial" | "bigserial" | "smallserial" | "serial8" | "serial4" | "serial2"
+                    );
                     for c in &col.constraints {
-                        if let Some(NodeEnum::Constraint(constr)) = &c.node
-                            && (constr.contype == ConstrType::ConstrPrimary as i32
-                                || constr.contype == ConstrType::ConstrNotnull as i32)
+                        if let Some(NodeEnum::Constraint(constr)) = &c.node {
+                            if constr.contype == ConstrType::ConstrPrimary as i32
+                                || constr.contype == ConstrType::ConstrNotnull as i32
                             {
                                 is_not_null = true;
+                            } else if constr.contype == ConstrType::ConstrDefault as i32 {
+                                has_default = true;
                             }
+                        }
                     }
 
                     columns.push(ColumnMetadata {
@@ -248,6 +260,7 @@ impl Catalog {
                         pg_type,
                         ts_type,
                         is_nullable: !is_not_null,
+                        has_default,
                     });
                 }
                 Some(NodeEnum::Constraint(constr))
@@ -304,13 +317,20 @@ impl Catalog {
                                 .unwrap_or_else(|| "text".to_string());
                             let ts_type = normalize_pg_type_to_ts(&pg_type, self.driver);
                             let mut is_not_null = col.is_not_null;
+                            let mut has_default = matches!(
+                                pg_type.to_ascii_lowercase().as_str(),
+                                "serial" | "bigserial" | "smallserial" | "serial8" | "serial4" | "serial2"
+                            );
                             for c in &col.constraints {
-                                if let Some(NodeEnum::Constraint(constr)) = &c.node
-                                    && (constr.contype == ConstrType::ConstrPrimary as i32
-                                        || constr.contype == ConstrType::ConstrNotnull as i32)
+                                if let Some(NodeEnum::Constraint(constr)) = &c.node {
+                                    if constr.contype == ConstrType::ConstrPrimary as i32
+                                        || constr.contype == ConstrType::ConstrNotnull as i32
                                     {
                                         is_not_null = true;
+                                    } else if constr.contype == ConstrType::ConstrDefault as i32 {
+                                        has_default = true;
                                     }
+                                }
                             }
 
                             // If column existed previously, replace it; otherwise append
@@ -320,6 +340,7 @@ impl Catalog {
                                 pg_type,
                                 ts_type,
                                 is_nullable: !is_not_null,
+                                has_default,
                             });
                         }
                 } else if cmd.subtype == AlterTableType::AtDropColumn as i32 {
@@ -355,6 +376,13 @@ impl Catalog {
                         table.columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(col_name))
                     {
                         existing_col.is_nullable = true;
+                    }
+                } else if cmd.subtype == AlterTableType::AtColumnDefault as i32 {
+                    let col_name = &cmd.name;
+                    if let Some(existing_col) =
+                        table.columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(col_name))
+                    {
+                        existing_col.has_default = cmd.def.is_some();
                     }
                 }
             }

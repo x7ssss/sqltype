@@ -83,12 +83,15 @@ pub fn generate_query_ts(query: &AnalyzedQuery) -> String {
     out.push_str("}\n\n");
 
     // 2. Row Interface
-    out.push_str(&format!("export interface {}Row {{\n", name));
-    for field in &query.fields {
-        let key = format_property_key(&field.name);
-        out.push_str(&format!("  {}: {};\n", key, field.ts_type));
+    let has_row = !query.fields.is_empty();
+    if has_row {
+        out.push_str(&format!("export interface {}Row {{\n", name));
+        for field in &query.fields {
+            let key = format_property_key(&field.name);
+            out.push_str(&format!("  {}: {};\n", key, field.ts_type));
+        }
+        out.push_str("}\n\n");
     }
-    out.push_str("}\n\n");
 
     // 3. SQL string constant
     let clean_sql = sanitize_sql_template(&query.raw_sql);
@@ -103,7 +106,9 @@ pub fn generate_query_ts(query: &AnalyzedQuery) -> String {
     out.push_str(&format!("export type {}Query = {{\n", name));
     out.push_str("  sql: string;\n");
     out.push_str(&format!("  params: {}Params;\n", name));
-    out.push_str(&format!("  row: {}Row;\n", name));
+    if has_row {
+        out.push_str(&format!("  row: {}Row;\n", name));
+    }
     out.push_str("};\n");
 
     out
@@ -265,5 +270,90 @@ GROUP BY u.id, u.email, p.title;
         assert!(pg_ts.contains("payload: Buffer;"));
         assert!(pg_ts.contains("active_date: string;"));
         assert!(pg_ts.contains("created_at: Date;"));
+    }
+
+    #[test]
+    fn test_dml_codegen_insert_returning() {
+        use crate::catalog::{Catalog, DriverTarget};
+
+        let ddl = "
+            CREATE TABLE users (
+                id BIGINT PRIMARY KEY,
+                name TEXT NOT NULL,
+                email VARCHAR(255) NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL
+            );
+        ";
+
+        // Postgres driver
+        let mut pg_catalog = Catalog::new(DriverTarget::Postgres);
+        pg_catalog.apply_sql(ddl).unwrap();
+        let query_sql = "
+            -- name: CreateUser
+            INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id, created_at;
+        ";
+        let pg_analyzed = crate::analyzer::analyze_query(query_sql, &pg_catalog, None).unwrap();
+        let pg_ts = generate_file_ts(&[pg_analyzed]);
+
+        assert!(pg_ts.contains("export interface CreateUserParams {\n  name: string;\n  email: string;\n}"));
+        assert!(pg_ts.contains("export interface CreateUserRow {\n  id: string;\n  created_at: Date;\n}"));
+        assert!(pg_ts.contains("export const createUserSql = `"));
+        assert!(pg_ts.contains("export type CreateUserQuery = {\n  sql: string;\n  params: CreateUserParams;\n  row: CreateUserRow;\n};"));
+
+        // Bun driver: id should be bigint
+        let mut bun_catalog = Catalog::new(DriverTarget::Bun);
+        bun_catalog.apply_sql(ddl).unwrap();
+        let bun_analyzed = crate::analyzer::analyze_query(query_sql, &bun_catalog, None).unwrap();
+        let bun_ts = generate_file_ts(&[bun_analyzed]);
+        assert!(bun_ts.contains("export interface CreateUserRow {\n  id: bigint;\n  created_at: Date;\n}"));
+    }
+
+    #[test]
+    fn test_dml_codegen_update_returning() {
+        let mut catalog = crate::catalog::Catalog::default();
+        catalog
+            .apply_sql("
+                CREATE TABLE users (
+                    id UUID PRIMARY KEY,
+                    name TEXT NOT NULL
+                );
+            ")
+            .unwrap();
+
+        let query_sql = "
+            -- name: UpdateUser
+            UPDATE users SET name = $1 WHERE id = $2 RETURNING id, name;
+        ";
+        let analyzed = crate::analyzer::analyze_query(query_sql, &catalog, None).unwrap();
+        let ts = generate_file_ts(&[analyzed]);
+
+        assert!(ts.contains("export interface UpdateUserParams {\n  name: string;\n  id: string;\n}"));
+        assert!(ts.contains("export interface UpdateUserRow {\n  id: string;\n  name: string;\n}"));
+        assert!(ts.contains("export type UpdateUserQuery = {\n  sql: string;\n  params: UpdateUserParams;\n  row: UpdateUserRow;\n};"));
+    }
+
+    #[test]
+    fn test_dml_codegen_delete_without_returning() {
+        let mut catalog = crate::catalog::Catalog::default();
+        catalog
+            .apply_sql("
+                CREATE TABLE users (
+                    id UUID PRIMARY KEY
+                );
+            ")
+            .unwrap();
+
+        let query_sql = "
+            -- name: DeleteUser
+            DELETE FROM users WHERE id = $1;
+        ";
+        let analyzed = crate::analyzer::analyze_query(query_sql, &catalog, None).unwrap();
+        let ts = generate_file_ts(&[analyzed]);
+
+        assert!(ts.contains("export interface DeleteUserParams {\n  id: string;\n}"));
+        // No row return type or interface required
+        assert!(!ts.contains("DeleteUserRow"));
+        assert!(!ts.contains("row:"));
+        assert!(ts.contains("export type DeleteUserQuery = {\n  sql: string;\n  params: DeleteUserParams;\n};"));
     }
 }

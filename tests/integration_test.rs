@@ -1,6 +1,8 @@
+use lsp_types::{HoverContents, Position};
 use sqltype::analyzer::analyze_query;
 use sqltype::catalog::Catalog;
 use sqltype::codegen::generate_file_ts;
+use sqltype::lsp::{resolve_hover, validate_sql};
 use std::fs;
 
 #[test]
@@ -217,6 +219,196 @@ JOIN posts p ON p.user_id = au.id;
     assert!(ts.contains("next_age: number;"));
     assert!(ts.contains("display_name: string;"));
     assert!(ts.contains("title: string;"));
+
+    let _ = fs::remove_dir_all(base_dir);
+}
+
+#[test]
+fn test_dml_compiler_pipeline() {
+    let base_dir = std::env::temp_dir().join(format!(
+        "sqltype_dml_e2e_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let migrations_dir = base_dir.join("migrations");
+    let queries_dir = base_dir.join("queries");
+    let out_dir = base_dir.join("out");
+
+    fs::create_dir_all(&migrations_dir).unwrap();
+    fs::create_dir_all(&queries_dir).unwrap();
+    fs::create_dir_all(&out_dir).unwrap();
+
+    fs::write(
+        migrations_dir.join("001_init.sql"),
+        r#"
+        CREATE TABLE users (
+            id UUID PRIMARY KEY,
+            name VARCHAR(100) NOT NULL,
+            email TEXT NOT NULL,
+            age INT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        "#,
+    )
+    .unwrap();
+
+    let query_insert = r#"
+-- name: CreateUser
+INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id, created_at;
+    "#;
+    fs::write(queries_dir.join("create_user.sql"), query_insert).unwrap();
+
+    let query_update = r#"
+-- name: UpdateUser
+UPDATE users SET name = $1 WHERE id = $2 RETURNING id, name;
+    "#;
+    fs::write(queries_dir.join("update_user.sql"), query_update).unwrap();
+
+    let query_delete = r#"
+-- name: DeleteUser
+DELETE FROM users WHERE id = $1;
+    "#;
+    fs::write(queries_dir.join("delete_user.sql"), query_delete).unwrap();
+
+    let catalog = Catalog::load_from_dir(&migrations_dir).unwrap();
+
+    // 1. Analyze & verify CreateUser
+    let analyzed_insert = analyze_query(query_insert, &catalog, Some("create_user.sql")).unwrap();
+    assert_eq!(analyzed_insert.name, "CreateUser");
+    assert_eq!(analyzed_insert.params.len(), 2);
+    assert_eq!(analyzed_insert.params[0].name, "name");
+    assert_eq!(analyzed_insert.params[0].ts_type, "string");
+    assert_eq!(analyzed_insert.params[1].name, "email");
+    assert_eq!(analyzed_insert.params[1].ts_type, "string");
+    assert_eq!(analyzed_insert.fields.len(), 2);
+    assert_eq!(analyzed_insert.fields[0].name, "id");
+    assert_eq!(analyzed_insert.fields[0].ts_type, "string");
+    assert_eq!(analyzed_insert.fields[1].name, "created_at");
+    assert_eq!(analyzed_insert.fields[1].ts_type, "Date");
+
+    let ts_insert = generate_file_ts(&[analyzed_insert]);
+    assert!(ts_insert.contains("export interface CreateUserParams {\n  name: string;\n  email: string;\n}"));
+    assert!(ts_insert.contains("export interface CreateUserRow {\n  id: string;\n  created_at: Date;\n}"));
+    assert!(ts_insert.contains("export type CreateUserQuery = {\n  sql: string;\n  params: CreateUserParams;\n  row: CreateUserRow;\n};"));
+
+    // 2. Analyze & verify UpdateUser
+    let analyzed_update = analyze_query(query_update, &catalog, Some("update_user.sql")).unwrap();
+    assert_eq!(analyzed_update.name, "UpdateUser");
+    assert_eq!(analyzed_update.params.len(), 2);
+    assert_eq!(analyzed_update.params[0].name, "name");
+    assert_eq!(analyzed_update.params[0].ts_type, "string");
+    assert_eq!(analyzed_update.params[1].name, "id");
+    assert_eq!(analyzed_update.params[1].ts_type, "string");
+    assert_eq!(analyzed_update.fields.len(), 2);
+    assert_eq!(analyzed_update.fields[0].name, "id");
+    assert_eq!(analyzed_update.fields[0].ts_type, "string");
+    assert_eq!(analyzed_update.fields[1].name, "name");
+    assert_eq!(analyzed_update.fields[1].ts_type, "string");
+
+    let ts_update = generate_file_ts(&[analyzed_update]);
+    assert!(ts_update.contains("export interface UpdateUserParams {\n  name: string;\n  id: string;\n}"));
+    assert!(ts_update.contains("export interface UpdateUserRow {\n  id: string;\n  name: string;\n}"));
+    assert!(ts_update.contains("export type UpdateUserQuery = {\n  sql: string;\n  params: UpdateUserParams;\n  row: UpdateUserRow;\n};"));
+
+    // 3. Analyze & verify DeleteUser
+    let analyzed_delete = analyze_query(query_delete, &catalog, Some("delete_user.sql")).unwrap();
+    assert_eq!(analyzed_delete.name, "DeleteUser");
+    assert_eq!(analyzed_delete.params.len(), 1);
+    assert_eq!(analyzed_delete.params[0].name, "id");
+    assert_eq!(analyzed_delete.params[0].ts_type, "string");
+    assert!(analyzed_delete.fields.is_empty());
+
+    let ts_delete = generate_file_ts(&[analyzed_delete]);
+    assert!(ts_delete.contains("export interface DeleteUserParams {\n  id: string;\n}"));
+    assert!(!ts_delete.contains("DeleteUserRow"));
+    assert!(!ts_delete.contains("row:"));
+    assert!(ts_delete.contains("export type DeleteUserQuery = {\n  sql: string;\n  params: DeleteUserParams;\n};"));
+
+    let _ = fs::remove_dir_all(base_dir);
+}
+
+#[test]
+fn test_lsp_integration_pipeline() {
+    let base_dir = std::env::temp_dir().join(format!(
+        "sqltype_lsp_e2e_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let migrations_dir = base_dir.join("migrations");
+    fs::create_dir_all(&migrations_dir).unwrap();
+
+    fs::write(
+        migrations_dir.join("001_create_accounts.sql"),
+        r#"
+        CREATE TABLE accounts (
+            id UUID PRIMARY KEY,
+            username VARCHAR(50) NOT NULL,
+            balance INT NOT NULL DEFAULT 0
+        );
+        "#,
+    )
+    .unwrap();
+
+    let catalog = Catalog::load_from_dir(&migrations_dir).unwrap();
+
+    // 1. Valid query produces zero diagnostics
+    let valid_sql = "SELECT id, username, balance FROM accounts WHERE id = $1;";
+    let diags_valid = validate_sql(valid_sql, &catalog);
+    assert!(diags_valid.is_empty());
+
+    // 2. Query with non-existent table produces diagnostic
+    let invalid_table_sql = "SELECT id FROM orders WHERE id = $1;";
+    let diags_table = validate_sql(invalid_table_sql, &catalog);
+    assert_eq!(diags_table.len(), 1);
+    assert!(diags_table[0]
+        .message
+        .contains("Table \"orders\" does not exist in schema catalog"));
+
+    // 3. Query with syntax error produces diagnostic with cursorpos
+    let syntax_err_sql = "SELECT * FROM;";
+    let diags_syntax = validate_sql(syntax_err_sql, &catalog);
+    assert_eq!(diags_syntax.len(), 1);
+    assert!(diags_syntax[0].message.contains("syntax error"));
+
+    // 4. Hover inspection on parameter
+    let hover_param = resolve_hover(
+        valid_sql,
+        Position {
+            line: 0,
+            character: 54, // on $1
+        },
+        &catalog,
+    );
+    assert!(hover_param.is_some());
+    if let Some(h) = hover_param
+        && let HoverContents::Markup(m) = h.contents
+    {
+        assert!(m.value.contains("Parameter `$1`"));
+        assert!(m.value.contains("TypeScript Type"));
+    }
+
+    // 5. Hover inspection on table
+    let hover_table = resolve_hover(
+        valid_sql,
+        Position {
+            line: 0,
+            character: 36, // on accounts
+        },
+        &catalog,
+    );
+    assert!(hover_table.is_some());
+    if let Some(h) = hover_table
+        && let HoverContents::Markup(m) = h.contents
+    {
+        assert!(m.value.contains("### Table `accounts`"));
+        assert!(m.value.contains("- `username`: `varchar`"));
+    }
 
     let _ = fs::remove_dir_all(base_dir);
 }
