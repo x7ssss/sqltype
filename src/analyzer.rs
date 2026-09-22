@@ -1,6 +1,4 @@
-use crate::catalog::{
-    Catalog, ColumnMetadata, TableMetadata, extract_type_name, normalize_pg_type_to_ts,
-};
+use crate::catalog::{Catalog, ColumnMetadata, TableMetadata, extract_type_name};
 use pg_query::NodeEnum;
 use pg_query::protobuf::{AExprKind, BoolExprType, JoinType, NullTestType};
 use std::collections::HashMap;
@@ -918,7 +916,7 @@ fn resolve_target(
                 .as_ref()
                 .map(extract_type_name)
                 .unwrap_or_else(|| "unknown".to_string());
-            let ts_type = normalize_pg_type_to_ts(&pg_type, catalog.driver);
+            let ts_type = catalog.resolve_type(&pg_type);
             fields.push(QueryField { name, ts_type });
             Ok(())
         }
@@ -1203,7 +1201,7 @@ fn resolve_params_in_expr(
                         .type_name
                         .as_ref()
                         .map(extract_type_name)
-                        .map(|t| normalize_pg_type_to_ts(&t, catalog.driver));
+                        .map(|t| catalog.resolve_type(&t));
                     let entry = param_map.entry(p.number).or_default();
                     if entry.inferred_type.is_none()
                         || entry.inferred_type.as_deref() == Some("unknown")
@@ -1239,8 +1237,7 @@ fn record_param(
     param_map: &mut HashMap<i32, ParamInfo>,
     is_optional: bool,
 ) -> Result<(), String> {
-    let mut resolved_type: Option<String> =
-        cast_opt.map(|c| normalize_pg_type_to_ts(&c, catalog.driver));
+    let mut resolved_type: Option<String> = cast_opt.map(|c| catalog.resolve_type(&c));
 
     // Lookup column to verify and get type if not explicitly cast
     let col_meta = if let Some(alias) = alias_opt {

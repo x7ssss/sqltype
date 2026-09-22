@@ -65,6 +65,7 @@ impl std::fmt::Display for DriverTarget {
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     pub tables: HashMap<String, TableMetadata>,
+    pub enums: HashMap<String, Vec<String>>,
     pub driver: DriverTarget,
 }
 
@@ -153,8 +154,38 @@ impl Catalog {
     pub fn new(driver: DriverTarget) -> Self {
         Self {
             tables: HashMap::new(),
+            enums: HashMap::new(),
             driver,
         }
+    }
+
+    /// Resolves a PostgreSQL type name to its TypeScript type representation,
+    /// checking for registered custom ENUM types before falling back to default primitives.
+    pub fn resolve_type(&self, pg_type: &str) -> String {
+        let lower = pg_type.to_ascii_lowercase();
+        let lower = lower.trim();
+
+        if let Some(inner) = lower.strip_suffix("[]") {
+            let inner_ts = self.resolve_type(inner);
+            if inner_ts.contains('|') {
+                return format!("({})[]", inner_ts);
+            } else {
+                return format!("{}[]", inner_ts);
+            }
+        }
+
+        if let Some(vals) = self.enums.get(lower) {
+            if vals.is_empty() {
+                return "string".to_string();
+            }
+            return vals
+                .iter()
+                .map(|v| format!("\"{}\"", v))
+                .collect::<Vec<_>>()
+                .join(" | ");
+        }
+
+        normalize_pg_type_to_ts(pg_type, self.driver)
     }
 
     pub fn with_driver(mut self, driver: DriverTarget) -> Self {
@@ -226,10 +257,39 @@ impl Catalog {
                     Some(NodeEnum::AlterTableStmt(alter_stmt)) => {
                         self.handle_alter_table_stmt(alter_stmt)?;
                     }
+                    Some(NodeEnum::CreateEnumStmt(create_enum)) => {
+                        self.handle_create_enum_stmt(create_enum)?;
+                    }
                     _ => {}
                 }
             }
         }
+        Ok(())
+    }
+
+    fn handle_create_enum_stmt(
+        &mut self,
+        stmt: &pg_query::protobuf::CreateEnumStmt,
+    ) -> Result<(), String> {
+        let mut name_parts = Vec::new();
+        for node in &stmt.type_name {
+            if let Some(NodeEnum::String(s)) = &node.node {
+                name_parts.push(s.sval.as_str());
+            }
+        }
+        let enum_name = match name_parts.last() {
+            Some(&name) => name.to_ascii_lowercase(),
+            None => return Ok(()),
+        };
+
+        let mut values = Vec::new();
+        for node in &stmt.vals {
+            if let Some(NodeEnum::String(s)) = &node.node {
+                values.push(s.sval.clone());
+            }
+        }
+
+        self.enums.insert(enum_name, values);
         Ok(())
     }
 
@@ -258,7 +318,7 @@ impl Catalog {
                         .as_ref()
                         .map(extract_type_name)
                         .unwrap_or_else(|| "text".to_string());
-                    let ts_type = normalize_pg_type_to_ts(&pg_type, self.driver);
+                    let ts_type = self.resolve_type(&pg_type);
 
                     let mut is_not_null = col.is_not_null;
                     let mut has_default = matches!(
@@ -328,10 +388,9 @@ impl Catalog {
         };
 
         let table_name = rel.relname.to_ascii_lowercase();
-        let table = match self.tables.get_mut(&table_name) {
-            Some(t) => t,
-            None => return Ok(()),
-        };
+        if !self.tables.contains_key(&table_name) {
+            return Ok(());
+        }
 
         for cmd_node in &stmt.cmds {
             if let Some(NodeEnum::AlterTableCmd(cmd)) = &cmd_node.node {
@@ -345,7 +404,7 @@ impl Catalog {
                             .as_ref()
                             .map(extract_type_name)
                             .unwrap_or_else(|| "text".to_string());
-                        let ts_type = normalize_pg_type_to_ts(&pg_type, self.driver);
+                        let ts_type = self.resolve_type(&pg_type);
                         let mut is_not_null = col.is_not_null;
                         let mut has_default = matches!(
                             pg_type.to_ascii_lowercase().as_str(),
@@ -368,23 +427,26 @@ impl Catalog {
                             }
                         }
 
-                        // If column existed previously, replace it; otherwise append
-                        table
-                            .columns
-                            .retain(|c| !c.name.eq_ignore_ascii_case(&col_name));
-                        table.columns.push(ColumnMetadata {
-                            name: col_name,
-                            pg_type,
-                            ts_type,
-                            is_nullable: !is_not_null,
-                            has_default,
-                        });
+                        if let Some(table) = self.tables.get_mut(&table_name) {
+                            table
+                                .columns
+                                .retain(|c| !c.name.eq_ignore_ascii_case(&col_name));
+                            table.columns.push(ColumnMetadata {
+                                name: col_name,
+                                pg_type,
+                                ts_type,
+                                is_nullable: !is_not_null,
+                                has_default,
+                            });
+                        }
                     }
                 } else if cmd.subtype == AlterTableType::AtDropColumn as i32 {
                     let col_name = &cmd.name;
-                    table
-                        .columns
-                        .retain(|c| !c.name.eq_ignore_ascii_case(col_name));
+                    if let Some(table) = self.tables.get_mut(&table_name) {
+                        table
+                            .columns
+                            .retain(|c| !c.name.eq_ignore_ascii_case(col_name));
+                    }
                 } else if cmd.subtype == AlterTableType::AtAlterColumnType as i32 {
                     let col_name = &cmd.name;
                     if let Some(def_node) = &cmd.def
@@ -395,11 +457,12 @@ impl Catalog {
                             .as_ref()
                             .map(extract_type_name)
                             .unwrap_or_else(|| "text".to_string());
-                        let ts_type = normalize_pg_type_to_ts(&pg_type, self.driver);
-                        if let Some(existing_col) = table
-                            .columns
-                            .iter_mut()
-                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                        let ts_type = self.resolve_type(&pg_type);
+                        if let Some(table) = self.tables.get_mut(&table_name)
+                            && let Some(existing_col) = table
+                                .columns
+                                .iter_mut()
+                                .find(|c| c.name.eq_ignore_ascii_case(col_name))
                         {
                             existing_col.pg_type = pg_type;
                             existing_col.ts_type = ts_type;
@@ -407,28 +470,31 @@ impl Catalog {
                     }
                 } else if cmd.subtype == AlterTableType::AtSetNotNull as i32 {
                     let col_name = &cmd.name;
-                    if let Some(existing_col) = table
-                        .columns
-                        .iter_mut()
-                        .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                    if let Some(table) = self.tables.get_mut(&table_name)
+                        && let Some(existing_col) = table
+                            .columns
+                            .iter_mut()
+                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
                     {
                         existing_col.is_nullable = false;
                     }
                 } else if cmd.subtype == AlterTableType::AtDropNotNull as i32 {
                     let col_name = &cmd.name;
-                    if let Some(existing_col) = table
-                        .columns
-                        .iter_mut()
-                        .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                    if let Some(table) = self.tables.get_mut(&table_name)
+                        && let Some(existing_col) = table
+                            .columns
+                            .iter_mut()
+                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
                     {
                         existing_col.is_nullable = true;
                     }
                 } else if cmd.subtype == AlterTableType::AtColumnDefault as i32 {
                     let col_name = &cmd.name;
-                    if let Some(existing_col) = table
-                        .columns
-                        .iter_mut()
-                        .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                    if let Some(table) = self.tables.get_mut(&table_name)
+                        && let Some(existing_col) = table
+                            .columns
+                            .iter_mut()
+                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
                     {
                         existing_col.has_default = cmd.def.is_some();
                     }
@@ -631,5 +697,40 @@ mod tests {
         assert!(!table.get_column("price").unwrap().is_nullable);
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_create_enum_type() {
+        let sql = "
+            CREATE TYPE user_role AS ENUM ('admin', 'editor', 'viewer');
+            CREATE TABLE team_members (
+                id UUID PRIMARY KEY,
+                role user_role NOT NULL,
+                backup_roles user_role[]
+            );
+        ";
+        let mut catalog = Catalog::default();
+        catalog.apply_sql(sql).unwrap();
+
+        assert_eq!(
+            catalog.resolve_type("user_role"),
+            "\"admin\" | \"editor\" | \"viewer\""
+        );
+        assert_eq!(
+            catalog.resolve_type("user_role[]"),
+            "(\"admin\" | \"editor\" | \"viewer\")[]"
+        );
+
+        let table = catalog.get_table("team_members").unwrap();
+        let role_col = table.get_column("role").unwrap();
+        assert_eq!(role_col.ts_type, "\"admin\" | \"editor\" | \"viewer\"");
+        assert!(!role_col.is_nullable);
+
+        let backup_col = table.get_column("backup_roles").unwrap();
+        assert_eq!(
+            backup_col.ts_type,
+            "(\"admin\" | \"editor\" | \"viewer\")[]"
+        );
+        assert!(backup_col.is_nullable);
     }
 }
