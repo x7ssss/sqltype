@@ -1,6 +1,6 @@
 [package]
 name = "sqltype"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["x7ssss <babadookmariqn@gmail.com>"]
 repository = "https://github.com/x7ssss/sqltype"
