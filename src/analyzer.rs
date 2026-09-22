@@ -1,6 +1,8 @@
 use crate::catalog::{Catalog, ColumnMetadata, DriverTarget, TableMetadata, extract_type_name};
 use pg_query::NodeEnum;
-use pg_query::protobuf::{AExprKind, BoolExprType, JoinType, NullTestType, SubLinkType};
+use pg_query::protobuf::{
+    AExprKind, BoolExprType, JoinType, NullTestType, SetOperation, SubLinkType,
+};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -88,6 +90,32 @@ impl PgType {
                     format!("{}[]", inner_ts)
                 }
             }
+        }
+    }
+
+    pub fn to_pg_str(&self) -> String {
+        match self {
+            PgType::Unknown => "unknown".to_string(),
+            PgType::Bool => "bool".to_string(),
+            PgType::Int2 => "int2".to_string(),
+            PgType::Int4 => "int4".to_string(),
+            PgType::Int8 => "int8".to_string(),
+            PgType::Float4 => "float4".to_string(),
+            PgType::Float8 => "float8".to_string(),
+            PgType::Numeric => "numeric".to_string(),
+            PgType::Text => "text".to_string(),
+            PgType::Varchar => "varchar".to_string(),
+            PgType::Uuid => "uuid".to_string(),
+            PgType::Date => "date".to_string(),
+            PgType::Timestamp => "timestamp".to_string(),
+            PgType::Timestamptz => "timestamptz".to_string(),
+            PgType::Time => "time".to_string(),
+            PgType::Timetz => "timetz".to_string(),
+            PgType::Bytea => "bytea".to_string(),
+            PgType::Json => "json".to_string(),
+            PgType::Jsonb => "jsonb".to_string(),
+            PgType::Custom(name) => name.clone(),
+            PgType::Array(inner) => format!("{}[]", inner.to_pg_str()),
         }
     }
 }
@@ -193,6 +221,10 @@ pub fn unify_types(a: &PgType, b: &PgType) -> Result<PgType, String> {
     ))
 }
 
+pub fn unify_cte_types(anchor: &PgType, rec: &PgType) -> Result<PgType, String> {
+    unify_types(anchor, rec)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferredExpr {
     pub pg_type: PgType,
@@ -282,15 +314,34 @@ impl TableBinding {
     }
 }
 
+pub type ScopeContext = QueryScope;
+
 #[derive(Default, Debug, Clone)]
 pub struct QueryScope {
     pub bindings: HashMap<String, TableBinding>,
     pub binding_order: Vec<String>,
+    pub ctes: HashMap<String, TableBinding>,
+    pub tables: HashMap<String, TableBinding>,
+    pub cte_column_orders: HashMap<String, Vec<String>>,
 }
 
 impl QueryScope {
+    pub fn with_ctes_from(active: &QueryScope) -> Self {
+        Self {
+            ctes: active.ctes.clone(),
+            cte_column_orders: active.cte_column_orders.clone(),
+            ..Default::default()
+        }
+    }
+
     pub fn force_all_nullable(&mut self) {
         for binding in self.bindings.values_mut() {
+            binding.is_null_padded = true;
+            for col in binding.columns.values_mut() {
+                col.is_nullable = true;
+            }
+        }
+        for binding in self.tables.values_mut() {
             binding.is_null_padded = true;
             for col in binding.columns.values_mut() {
                 col.is_nullable = true;
@@ -307,7 +358,20 @@ impl QueryScope {
             ));
         }
         self.binding_order.push(binding.exposed_name.clone());
-        self.bindings.insert(key, binding);
+        self.bindings.insert(key.clone(), binding.clone());
+        self.tables.insert(key, binding);
+        Ok(())
+    }
+
+    pub fn register_cte(&mut self, binding: TableBinding) -> Result<(), String> {
+        let key = binding.exposed_name.to_ascii_lowercase();
+        if self.ctes.contains_key(&key) {
+            return Err(format!(
+                "WITH query name \"{}\" specified more than once",
+                binding.exposed_name
+            ));
+        }
+        self.ctes.insert(key, binding);
         Ok(())
     }
 
@@ -316,6 +380,12 @@ impl QueryScope {
             if let Some(binding) = other.bindings.get(&name.to_ascii_lowercase()) {
                 self.add_binding(binding.clone())?;
             }
+        }
+        for (k, v) in other.ctes {
+            self.ctes.entry(k).or_insert(v);
+        }
+        for (k, v) in other.cte_column_orders {
+            self.cte_column_orders.entry(k).or_insert(v);
         }
         Ok(())
     }
@@ -623,90 +693,253 @@ pub fn analyze_query(
     })
 }
 
-fn register_ctes(
-    wc: &pg_query::protobuf::WithClause,
-    scoped_catalog: &mut Catalog,
+pub fn process_with_clause(
+    with_clause: &pg_query::protobuf::WithClause,
+    scope: &mut ScopeContext,
+    catalog: &Catalog,
+) -> Result<(), String> {
+    let mut param_map = HashMap::new();
+    process_with_clause_with_params(with_clause, scope, catalog, &mut param_map)
+}
+
+fn process_with_clause_with_params(
+    with_clause: &pg_query::protobuf::WithClause,
+    scope: &mut ScopeContext,
+    catalog: &Catalog,
     param_map: &mut HashMap<i32, ParamInfo>,
 ) -> Result<(), String> {
-    for cte_node in &wc.ctes {
+    let mut seen_in_this_with = std::collections::HashSet::new();
+
+    for cte_node in &with_clause.ctes {
         if let Some(NodeEnum::CommonTableExpr(cte)) = &cte_node.node {
             let cte_name = cte.ctename.to_ascii_lowercase();
-            if let Some(query_node) = &cte.ctequery
-                && let Some(NodeEnum::SelectStmt(cte_select)) = &query_node.node
-            {
-                let cte_fields = analyze_select_stmt(cte_select, scoped_catalog, param_map)?;
-                let mut cte_columns = Vec::new();
+            if !seen_in_this_with.insert(cte_name.clone()) {
+                return Err(format!(
+                    "WITH query name \"{}\" specified more than once",
+                    cte.ctename
+                ));
+            }
 
-                for (i, field) in cte_fields.iter().enumerate() {
-                    let col_name = if let Some(alias_node) = cte.aliascolnames.get(i) {
-                        extract_string(alias_node).unwrap_or_else(|| field.name.clone())
-                    } else {
-                        field.name.clone()
-                    };
+            let query_node = cte
+                .ctequery
+                .as_ref()
+                .ok_or_else(|| format!("WITH query \"{}\" missing query body", cte.ctename))?;
+            let cte_select = match &query_node.node {
+                Some(NodeEnum::SelectStmt(s)) => s,
+                _ => {
+                    return Err(format!(
+                        "WITH query \"{}\" body is not a SelectStmt",
+                        cte.ctename
+                    ));
+                }
+            };
 
-                    let is_nullable = field.ts_type.contains("| null");
-                    let base_ts_type = field.ts_type.replace(" | null", "").trim().to_string();
+            // Check if recursive CTE: with_clause.recursive is true and query is a SetopUnion with larg & rarg
+            let is_recursive_cte = with_clause.recursive
+                && cte_select.op == SetOperation::SetopUnion as i32
+                && cte_select.larg.is_some()
+                && cte_select.rarg.is_some();
 
-                    cte_columns.push(ColumnMetadata {
-                        name: col_name,
-                        pg_type: "unknown".to_string(),
-                        ts_type: base_ts_type,
-                        is_nullable,
-                        has_default: false,
-                    });
+            if is_recursive_cte {
+                let anchor_stmt = cte_select.larg.as_ref().unwrap();
+                let rec_stmt = cte_select.rarg.as_ref().unwrap();
+
+                // 1. Evaluate anchor term
+                let mut anchor_cols =
+                    infer_select_projected_columns(anchor_stmt, catalog, scope, param_map)?;
+
+                // 2. Handle positional aliasing on anchor columns if aliascolnames provided
+                if !cte.aliascolnames.is_empty() {
+                    if cte.aliascolnames.len() != anchor_cols.len() {
+                        return Err(format!(
+                            "table \"{}\" has {} columns available but {} columns specified",
+                            cte.ctename,
+                            anchor_cols.len(),
+                            cte.aliascolnames.len()
+                        ));
+                    }
+                    for (i, alias_node) in cte.aliascolnames.iter().enumerate() {
+                        if let Some(alias_name) = extract_string(alias_node) {
+                            anchor_cols[i].name = alias_name;
+                        }
+                    }
                 }
 
-                let cte_table = TableMetadata {
-                    name: cte_name.clone(),
-                    schema: None,
-                    columns: cte_columns,
+                // 3. Synthesize stub TableBinding for recursive term
+                let mut stub_cols = HashMap::new();
+                let mut stub_order = Vec::new();
+                for col in &anchor_cols {
+                    stub_cols.insert(col.name.to_ascii_lowercase(), col.clone());
+                    stub_order.push(col.name.clone());
+                }
+                let stub_binding = TableBinding {
+                    base_table: cte_name.clone(),
+                    exposed_name: cte.ctename.clone(),
+                    has_explicit_alias: false,
+                    is_null_padded: false,
+                    columns: stub_cols,
                 };
-                scoped_catalog.tables.insert(cte_name, cte_table);
+
+                let mut rec_scope = scope.clone();
+                rec_scope.register_cte(stub_binding)?;
+                rec_scope
+                    .cte_column_orders
+                    .insert(cte_name.clone(), stub_order.clone());
+
+                // 4. Evaluate recursive term against stubbed scope
+                let rec_cols =
+                    infer_select_projected_columns(rec_stmt, catalog, &rec_scope, param_map)?;
+
+                // 5. Validate column counts match
+                if anchor_cols.len() != rec_cols.len() {
+                    return Err(format!(
+                        "Recursive query \"{}\" column count mismatch: anchor term has {}, recursive term has {}",
+                        cte.ctename,
+                        anchor_cols.len(),
+                        rec_cols.len()
+                    ));
+                }
+
+                // 6. Unify types and combine nullability
+                let mut final_columns = HashMap::new();
+                let mut final_order = Vec::new();
+
+                for (i, anchor_col) in anchor_cols.iter().enumerate() {
+                    let rec_col = &rec_cols[i];
+                    let anchor_pg = PgType::from_pg_str(&anchor_col.pg_type);
+                    let rec_pg = PgType::from_pg_str(&rec_col.pg_type);
+                    let unified_pg = unify_cte_types(&anchor_pg, &rec_pg)?;
+                    let is_nullable = anchor_col.is_nullable || rec_col.is_nullable;
+                    let ts_type = unified_pg.to_ts(catalog);
+                    let col_meta = ColumnMetadata {
+                        name: anchor_col.name.clone(),
+                        pg_type: unified_pg.to_pg_str(),
+                        ts_type,
+                        is_nullable,
+                        has_default: false,
+                    };
+                    final_columns.insert(anchor_col.name.to_ascii_lowercase(), col_meta);
+                    final_order.push(anchor_col.name.clone());
+                }
+
+                let resolved_binding = TableBinding {
+                    base_table: cte_name.clone(),
+                    exposed_name: cte.ctename.clone(),
+                    has_explicit_alias: false,
+                    is_null_padded: false,
+                    columns: final_columns,
+                };
+                scope.register_cte(resolved_binding)?;
+                scope.cte_column_orders.insert(cte_name, final_order);
+            } else {
+                // Standard CTE
+                let mut proj_cols =
+                    infer_select_projected_columns(cte_select, catalog, scope, param_map)?;
+
+                if !cte.aliascolnames.is_empty() {
+                    if cte.aliascolnames.len() != proj_cols.len() {
+                        return Err(format!(
+                            "table \"{}\" has {} columns available but {} columns specified",
+                            cte.ctename,
+                            proj_cols.len(),
+                            cte.aliascolnames.len()
+                        ));
+                    }
+                    for (i, alias_node) in cte.aliascolnames.iter().enumerate() {
+                        if let Some(alias_name) = extract_string(alias_node) {
+                            proj_cols[i].name = alias_name;
+                        }
+                    }
+                }
+
+                let mut final_columns = HashMap::new();
+                let mut final_order = Vec::new();
+                for col in proj_cols {
+                    final_columns.insert(col.name.to_ascii_lowercase(), col.clone());
+                    final_order.push(col.name);
+                }
+
+                let resolved_binding = TableBinding {
+                    base_table: cte_name.clone(),
+                    exposed_name: cte.ctename.clone(),
+                    has_explicit_alias: false,
+                    is_null_padded: false,
+                    columns: final_columns,
+                };
+                scope.register_cte(resolved_binding)?;
+                scope.cte_column_orders.insert(cte_name, final_order);
             }
         }
     }
+
     Ok(())
 }
 
-fn analyze_select_stmt(
+fn infer_select_projected_columns(
     select: &pg_query::protobuf::SelectStmt,
     catalog: &Catalog,
+    parent_scope: &QueryScope,
     param_map: &mut HashMap<i32, ParamInfo>,
-) -> Result<Vec<QueryField>, String> {
+) -> Result<Vec<ColumnMetadata>, String> {
     // Check if this SelectStmt is a setop (like UNION) where projections are in larg
     if select.target_list.is_empty()
         && let Some(l_sel) = &select.larg
     {
-        return analyze_select_stmt(l_sel, catalog, param_map);
+        let l_cols = infer_select_projected_columns(l_sel, catalog, parent_scope, param_map)?;
+        if let Some(r_sel) = &select.rarg {
+            let r_cols = infer_select_projected_columns(r_sel, catalog, parent_scope, param_map)?;
+            if l_cols.len() == r_cols.len() {
+                let mut unified_cols = Vec::new();
+                for (i, l_col) in l_cols.iter().enumerate() {
+                    let r_col = &r_cols[i];
+                    let l_pg = PgType::from_pg_str(&l_col.pg_type);
+                    let r_pg = PgType::from_pg_str(&r_col.pg_type);
+                    let unified_pg = unify_cte_types(&l_pg, &r_pg).unwrap_or(l_pg);
+                    let is_nullable = l_col.is_nullable || r_col.is_nullable;
+                    let ts_type = unified_pg.to_ts(catalog);
+                    unified_cols.push(ColumnMetadata {
+                        name: l_col.name.clone(),
+                        pg_type: unified_pg.to_pg_str(),
+                        ts_type,
+                        is_nullable,
+                        has_default: false,
+                    });
+                }
+                return Ok(unified_cols);
+            }
+        }
+        return Ok(l_cols);
     }
 
-    // 0. Register CTEs from with_clause into a query-scoped catalog overlay
-    let mut scoped_catalog = catalog.clone();
+    // 0. Register CTEs from with_clause
+    let mut query_scope = QueryScope::with_ctes_from(parent_scope);
+
     if let Some(wc) = &select.with_clause {
-        register_ctes(wc, &mut scoped_catalog, param_map)?;
+        process_with_clause_with_params(wc, &mut query_scope, catalog, param_map)?;
     }
 
     // 1. Build QueryScope from from_clause
-    let mut scope = QueryScope::default();
+    let mut catalog_mut = catalog.clone();
     for from_item in &select.from_clause {
-        let item_scope = resolve_from_clause_node(from_item, &mut scoped_catalog, param_map)?;
-        scope.merge(item_scope)?;
+        let item_scope =
+            resolve_from_clause_node(from_item, &mut catalog_mut, &query_scope, param_map)?;
+        query_scope.merge(item_scope)?;
     }
 
     // 2. Resolve projections (target_list)
-    let mut fields: Vec<QueryField> = Vec::new();
+    let mut columns: Vec<ColumnMetadata> = Vec::new();
     for target in &select.target_list {
         if let Some(NodeEnum::ResTarget(rt)) = &target.node {
-            resolve_target(rt, &scoped_catalog, &scope, &mut fields)?;
+            resolve_target_columns(rt, catalog, &query_scope, &mut columns)?;
             if let Some(val) = &rt.val {
-                resolve_params_in_expr(val, &scoped_catalog, &scope, param_map)?;
+                resolve_params_in_expr(val, catalog, &query_scope, param_map)?;
             }
         }
     }
 
     // 3. Resolve parameters from WHERE clause (and limit / offset if present)
     if let Some(where_node) = &select.where_clause {
-        resolve_params_in_expr(where_node, &scoped_catalog, &scope, param_map)?;
+        resolve_params_in_expr(where_node, catalog, &query_scope, param_map)?;
     }
 
     if let Some(limit_node) = &select.limit_count
@@ -733,6 +966,30 @@ fn analyze_select_stmt(
         }
     }
 
+    Ok(columns)
+}
+
+fn analyze_select_stmt(
+    select: &pg_query::protobuf::SelectStmt,
+    catalog: &Catalog,
+    param_map: &mut HashMap<i32, ParamInfo>,
+) -> Result<Vec<QueryField>, String> {
+    let empty_scope = QueryScope::default();
+    let cols = infer_select_projected_columns(select, catalog, &empty_scope, param_map)?;
+    let fields = cols
+        .into_iter()
+        .map(|col| {
+            let ts_type = if col.is_nullable {
+                format_nullable(&col.ts_type)
+            } else {
+                col.ts_type
+            };
+            QueryField {
+                name: col.name,
+                ts_type,
+            }
+        })
+        .collect();
     Ok(fields)
 }
 
@@ -741,9 +998,9 @@ fn analyze_insert_stmt(
     catalog: &Catalog,
     param_map: &mut HashMap<i32, ParamInfo>,
 ) -> Result<Vec<QueryField>, String> {
-    let mut scoped_catalog = catalog.clone();
+    let mut scope = QueryScope::default();
     if let Some(wc) = &insert.with_clause {
-        register_ctes(wc, &mut scoped_catalog, param_map)?;
+        process_with_clause_with_params(wc, &mut scope, catalog, param_map)?;
     }
 
     let rel = insert
@@ -751,7 +1008,7 @@ fn analyze_insert_stmt(
         .as_ref()
         .ok_or_else(|| "INSERT statement missing target relation".to_string())?;
     let table_name = rel.relname.to_ascii_lowercase();
-    let table_meta = scoped_catalog
+    let table_meta = catalog
         .get_table(&table_name)
         .ok_or_else(|| format!("Table \"{}\" does not exist in schema catalog", rel.relname))?
         .clone();
@@ -775,7 +1032,6 @@ fn analyze_insert_stmt(
         columns,
     };
 
-    let mut scope = QueryScope::default();
     scope.add_binding(binding)?;
 
     // Determine target column names
@@ -817,25 +1073,20 @@ fn analyze_insert_stmt(
                                     cast_opt,
                                     None,
                                     col_name,
-                                    &scoped_catalog,
+                                    catalog,
                                     &scope,
                                     param_map,
                                     is_optional,
                                 )?;
                             } else {
-                                resolve_params_in_expr(
-                                    val_node,
-                                    &scoped_catalog,
-                                    &scope,
-                                    param_map,
-                                )?;
+                                resolve_params_in_expr(val_node, catalog, &scope, param_map)?;
                             }
                         }
                     }
                 }
             }
         } else {
-            analyze_select_stmt(select, &scoped_catalog, param_map)?;
+            infer_select_projected_columns(select, catalog, &scope, param_map)?;
         }
     }
 
@@ -855,19 +1106,19 @@ fn analyze_insert_stmt(
                             cast_opt,
                             None,
                             col_name,
-                            &scoped_catalog,
+                            catalog,
                             &scope,
                             param_map,
                             is_optional,
                         )?;
                     } else {
-                        resolve_params_in_expr(val_node, &scoped_catalog, &scope, param_map)?;
+                        resolve_params_in_expr(val_node, catalog, &scope, param_map)?;
                     }
                 }
             }
         }
         if let Some(where_node) = &occ.where_clause {
-            resolve_params_in_expr(where_node, &scoped_catalog, &scope, param_map)?;
+            resolve_params_in_expr(where_node, catalog, &scope, param_map)?;
         }
     }
 
@@ -875,9 +1126,9 @@ fn analyze_insert_stmt(
     let mut fields = Vec::new();
     for rt_node in &insert.returning_list {
         if let Some(NodeEnum::ResTarget(rt)) = &rt_node.node {
-            resolve_target(rt, &scoped_catalog, &scope, &mut fields)?;
+            resolve_target(rt, catalog, &scope, &mut fields)?;
             if let Some(val) = &rt.val {
-                resolve_params_in_expr(val, &scoped_catalog, &scope, param_map)?;
+                resolve_params_in_expr(val, catalog, &scope, param_map)?;
             }
         }
     }
@@ -890,9 +1141,9 @@ fn analyze_update_stmt(
     catalog: &Catalog,
     param_map: &mut HashMap<i32, ParamInfo>,
 ) -> Result<Vec<QueryField>, String> {
-    let mut scoped_catalog = catalog.clone();
+    let mut scope = QueryScope::default();
     if let Some(wc) = &update.with_clause {
-        register_ctes(wc, &mut scoped_catalog, param_map)?;
+        process_with_clause_with_params(wc, &mut scope, catalog, param_map)?;
     }
 
     let rel = update
@@ -900,7 +1151,7 @@ fn analyze_update_stmt(
         .as_ref()
         .ok_or_else(|| "UPDATE statement missing target relation".to_string())?;
     let table_name = rel.relname.to_ascii_lowercase();
-    let table_meta = scoped_catalog
+    let table_meta = catalog
         .get_table(&table_name)
         .ok_or_else(|| format!("Table \"{}\" does not exist in schema catalog", rel.relname))?
         .clone();
@@ -924,11 +1175,11 @@ fn analyze_update_stmt(
         columns,
     };
 
-    let mut scope = QueryScope::default();
     scope.add_binding(binding)?;
 
+    let mut catalog_mut = catalog.clone();
     for from_item in &update.from_clause {
-        let item_scope = resolve_from_clause_node(from_item, &mut scoped_catalog, param_map)?;
+        let item_scope = resolve_from_clause_node(from_item, &mut catalog_mut, &scope, param_map)?;
         scope.merge(item_scope)?;
     }
 
@@ -951,13 +1202,13 @@ fn analyze_update_stmt(
                         cast_opt,
                         None,
                         col_name,
-                        &scoped_catalog,
+                        catalog,
                         &scope,
                         param_map,
                         is_optional,
                     )?;
                 } else {
-                    resolve_params_in_expr(val_node, &scoped_catalog, &scope, param_map)?;
+                    resolve_params_in_expr(val_node, catalog, &scope, param_map)?;
                 }
             }
         }
@@ -965,16 +1216,16 @@ fn analyze_update_stmt(
 
     // 2. WHERE clause
     if let Some(where_node) = &update.where_clause {
-        resolve_params_in_expr(where_node, &scoped_catalog, &scope, param_map)?;
+        resolve_params_in_expr(where_node, catalog, &scope, param_map)?;
     }
 
     // 3. RETURNING list
     let mut fields = Vec::new();
     for rt_node in &update.returning_list {
         if let Some(NodeEnum::ResTarget(rt)) = &rt_node.node {
-            resolve_target(rt, &scoped_catalog, &scope, &mut fields)?;
+            resolve_target(rt, catalog, &scope, &mut fields)?;
             if let Some(val) = &rt.val {
-                resolve_params_in_expr(val, &scoped_catalog, &scope, param_map)?;
+                resolve_params_in_expr(val, catalog, &scope, param_map)?;
             }
         }
     }
@@ -987,9 +1238,9 @@ fn analyze_delete_stmt(
     catalog: &Catalog,
     param_map: &mut HashMap<i32, ParamInfo>,
 ) -> Result<Vec<QueryField>, String> {
-    let mut scoped_catalog = catalog.clone();
+    let mut scope = QueryScope::default();
     if let Some(wc) = &delete.with_clause {
-        register_ctes(wc, &mut scoped_catalog, param_map)?;
+        process_with_clause_with_params(wc, &mut scope, catalog, param_map)?;
     }
 
     let rel = delete
@@ -997,7 +1248,7 @@ fn analyze_delete_stmt(
         .as_ref()
         .ok_or_else(|| "DELETE statement missing target relation".to_string())?;
     let table_name = rel.relname.to_ascii_lowercase();
-    let table_meta = scoped_catalog
+    let table_meta = catalog
         .get_table(&table_name)
         .ok_or_else(|| format!("Table \"{}\" does not exist in schema catalog", rel.relname))?
         .clone();
@@ -1021,26 +1272,26 @@ fn analyze_delete_stmt(
         columns,
     };
 
-    let mut scope = QueryScope::default();
     scope.add_binding(binding)?;
 
+    let mut catalog_mut = catalog.clone();
     for using_item in &delete.using_clause {
-        let item_scope = resolve_from_clause_node(using_item, &mut scoped_catalog, param_map)?;
+        let item_scope = resolve_from_clause_node(using_item, &mut catalog_mut, &scope, param_map)?;
         scope.merge(item_scope)?;
     }
 
     // 1. WHERE clause
     if let Some(where_node) = &delete.where_clause {
-        resolve_params_in_expr(where_node, &scoped_catalog, &scope, param_map)?;
+        resolve_params_in_expr(where_node, catalog, &scope, param_map)?;
     }
 
     // 2. RETURNING list
     let mut fields = Vec::new();
     for rt_node in &delete.returning_list {
         if let Some(NodeEnum::ResTarget(rt)) = &rt_node.node {
-            resolve_target(rt, &scoped_catalog, &scope, &mut fields)?;
+            resolve_target(rt, catalog, &scope, &mut fields)?;
             if let Some(val) = &rt.val {
-                resolve_params_in_expr(val, &scoped_catalog, &scope, param_map)?;
+                resolve_params_in_expr(val, catalog, &scope, param_map)?;
             }
         }
     }
@@ -1048,7 +1299,31 @@ fn analyze_delete_stmt(
     Ok(fields)
 }
 
-fn get_ordered_columns<'a>(binding: &'a TableBinding, catalog: &'a Catalog) -> Vec<&'a ColumnMeta> {
+fn get_ordered_columns<'a>(
+    binding: &'a TableBinding,
+    catalog: &'a Catalog,
+    scope: Option<&'a QueryScope>,
+) -> Vec<&'a ColumnMeta> {
+    if let Some(scope) = scope
+        && let Some(order) = scope
+            .cte_column_orders
+            .get(&binding.base_table.to_ascii_lowercase())
+            .or_else(|| {
+                scope
+                    .cte_column_orders
+                    .get(&binding.exposed_name.to_ascii_lowercase())
+            })
+    {
+        let mut cols = Vec::new();
+        for col_name in order {
+            if let Some(col) = binding.get_column(col_name) {
+                cols.push(col);
+            }
+        }
+        if !cols.is_empty() {
+            return cols;
+        }
+    }
     if let Some(table_meta) = catalog.get_table(&binding.exposed_name) {
         let mut cols = Vec::new();
         for c in &table_meta.columns {
@@ -1079,12 +1354,15 @@ fn get_ordered_columns<'a>(binding: &'a TableBinding, catalog: &'a Catalog) -> V
 fn resolve_from_clause_node(
     node: &pg_query::protobuf::Node,
     catalog: &mut Catalog,
+    active_scope: &QueryScope,
     param_map: &mut HashMap<i32, ParamInfo>,
 ) -> Result<QueryScope, String> {
     match &node.node {
-        Some(NodeEnum::RangeVar(rv)) => resolve_range_var(rv, catalog),
-        Some(NodeEnum::JoinExpr(je)) => resolve_join_expr(je, catalog, param_map),
-        Some(NodeEnum::RangeSubselect(rss)) => resolve_range_subselect(rss, catalog, param_map),
+        Some(NodeEnum::RangeVar(rv)) => resolve_range_var(rv, catalog, active_scope),
+        Some(NodeEnum::JoinExpr(je)) => resolve_join_expr(je, catalog, active_scope, param_map),
+        Some(NodeEnum::RangeSubselect(rss)) => {
+            resolve_range_subselect(rss, catalog, active_scope, param_map)
+        }
         _ => Ok(QueryScope::default()),
     }
 }
@@ -1092,12 +1370,91 @@ fn resolve_from_clause_node(
 fn resolve_range_var(
     rv: &pg_query::protobuf::RangeVar,
     catalog: &mut Catalog,
+    active_scope: &QueryScope,
 ) -> Result<QueryScope, String> {
+    let is_unqualified = rv.schemaname.is_empty();
     let table_name = rv.relname.to_ascii_lowercase();
+
+    // 1. Catalog Shadowing: If unqualified, check active_scope.ctes first
+    if is_unqualified && let Some(cte_binding) = active_scope.ctes.get(&table_name) {
+        let (has_explicit_alias, exposed_name, colnames) = if let Some(a) = &rv.alias {
+            (true, a.aliasname.clone(), &a.colnames)
+        } else {
+            (false, table_name.clone(), &Vec::new())
+        };
+
+        let orig_order: Vec<String> =
+            if let Some(order) = active_scope.cte_column_orders.get(&table_name) {
+                order.clone()
+            } else {
+                let mut cols: Vec<String> = cte_binding.columns.keys().cloned().collect();
+                cols.sort();
+                cols
+            };
+
+        let mut columns = HashMap::new();
+        let mut final_order = Vec::new();
+
+        if !colnames.is_empty() {
+            for (i, orig_col_name) in orig_order.iter().enumerate() {
+                let col_name = if let Some(alias_node) = colnames.get(i) {
+                    extract_string(alias_node).unwrap_or_else(|| orig_col_name.clone())
+                } else {
+                    orig_col_name.clone()
+                };
+                if let Some(col) = cte_binding.get_column(orig_col_name) {
+                    let mut aliased_col = col.clone();
+                    aliased_col.name = col_name.clone();
+                    columns.insert(col_name.to_ascii_lowercase(), aliased_col);
+                    final_order.push(col_name);
+                }
+            }
+        } else {
+            for orig_col_name in &orig_order {
+                if let Some(col) = cte_binding.get_column(orig_col_name) {
+                    columns.insert(col.name.to_ascii_lowercase(), col.clone());
+                    final_order.push(col.name.clone());
+                }
+            }
+        }
+
+        let binding = TableBinding {
+            base_table: table_name.clone(),
+            exposed_name: exposed_name.clone(),
+            has_explicit_alias,
+            is_null_padded: false,
+            columns,
+        };
+
+        let mut scope = QueryScope::with_ctes_from(active_scope);
+        scope
+            .cte_column_orders
+            .insert(exposed_name.to_ascii_lowercase(), final_order);
+        scope.add_binding(binding)?;
+        return Ok(scope);
+    }
+
+    // 2. Database Catalog Resolution
     let table_meta = catalog
         .get_table(&table_name)
         .ok_or_else(|| format!("Table \"{}\" does not exist in schema catalog", rv.relname))?
         .clone();
+
+    if !rv.schemaname.is_empty() {
+        if let Some(tbl_schema) = &table_meta.schema {
+            if !tbl_schema.eq_ignore_ascii_case(&rv.schemaname) {
+                return Err(format!(
+                    "Schema mismatch for table \"{}\": expected \"{}\", got \"{}\"",
+                    table_name, tbl_schema, rv.schemaname
+                ));
+            }
+        } else if !rv.schemaname.eq_ignore_ascii_case("public") {
+            return Err(format!(
+                "Schema mismatch for table \"{}\": expected public, got \"{}\"",
+                table_name, rv.schemaname
+            ));
+        }
+    }
 
     let (has_explicit_alias, exposed_name, colnames) = if let Some(a) = &rv.alias {
         (true, a.aliasname.clone(), &a.colnames)
@@ -1142,7 +1499,7 @@ fn resolve_range_var(
         columns,
     };
 
-    let mut scope = QueryScope::default();
+    let mut scope = QueryScope::with_ctes_from(active_scope);
     scope.add_binding(binding)?;
     Ok(scope)
 }
@@ -1150,6 +1507,7 @@ fn resolve_range_var(
 fn resolve_join_expr(
     je: &pg_query::protobuf::JoinExpr,
     catalog: &mut Catalog,
+    active_scope: &QueryScope,
     param_map: &mut HashMap<i32, ParamInfo>,
 ) -> Result<QueryScope, String> {
     let larg = je
@@ -1161,8 +1519,8 @@ fn resolve_join_expr(
         .as_ref()
         .ok_or_else(|| "JoinExpr missing right argument".to_string())?;
 
-    let mut left_scope = resolve_from_clause_node(larg, catalog, param_map)?;
-    let mut right_scope = resolve_from_clause_node(rarg, catalog, param_map)?;
+    let mut left_scope = resolve_from_clause_node(larg, catalog, active_scope, param_map)?;
+    let mut right_scope = resolve_from_clause_node(rarg, catalog, active_scope, param_map)?;
 
     let join_kind = JoinKind::from_i32(je.jointype);
 
@@ -1213,7 +1571,7 @@ fn resolve_join_expr(
 
         for name in &result_scope.binding_order {
             if let Some(b) = result_scope.bindings.get(&name.to_ascii_lowercase()) {
-                let ordered = get_ordered_columns(b, catalog);
+                let ordered = get_ordered_columns(b, catalog, Some(&result_scope));
                 for col in ordered {
                     unified_columns.insert(col.name.to_ascii_lowercase(), col.clone());
                     ordered_columns.push(col.clone());
@@ -1238,7 +1596,7 @@ fn resolve_join_expr(
             columns: unified_columns,
         };
 
-        let mut unified_scope = QueryScope::default();
+        let mut unified_scope = QueryScope::with_ctes_from(active_scope);
         unified_scope.add_binding(unified_binding)?;
         return Ok(unified_scope);
     }
@@ -1249,6 +1607,7 @@ fn resolve_join_expr(
 fn resolve_range_subselect(
     rss: &pg_query::protobuf::RangeSubselect,
     catalog: &mut Catalog,
+    active_scope: &QueryScope,
     param_map: &mut HashMap<i32, ParamInfo>,
 ) -> Result<QueryScope, String> {
     let subquery_node = rss
@@ -1260,7 +1619,7 @@ fn resolve_range_subselect(
         _ => return Err("RangeSubselect subquery is not a SelectStmt".to_string()),
     };
 
-    let fields = analyze_select_stmt(sub_select, catalog, param_map)?;
+    let cols = infer_select_projected_columns(sub_select, catalog, active_scope, param_map)?;
 
     let alias = rss
         .alias
@@ -1270,27 +1629,21 @@ fn resolve_range_subselect(
 
     let mut columns = HashMap::new();
     let mut ordered_columns = Vec::new();
+    let mut col_names = Vec::new();
 
-    for (i, field) in fields.iter().enumerate() {
+    for (i, col) in cols.iter().enumerate() {
         let col_name = if let Some(alias_node) = alias.colnames.get(i) {
-            extract_string(alias_node).unwrap_or_else(|| field.name.clone())
+            extract_string(alias_node).unwrap_or_else(|| col.name.clone())
         } else {
-            field.name.clone()
+            col.name.clone()
         };
 
-        let is_nullable = field.ts_type.contains("| null");
-        let base_ts_type = field.ts_type.replace(" | null", "").trim().to_string();
-
-        let col_meta = ColumnMetadata {
-            name: col_name.clone(),
-            pg_type: "unknown".to_string(),
-            ts_type: base_ts_type,
-            is_nullable,
-            has_default: false,
-        };
+        let mut col_meta = col.clone();
+        col_meta.name = col_name.clone();
 
         columns.insert(col_name.to_ascii_lowercase(), col_meta.clone());
         ordered_columns.push(col_meta);
+        col_names.push(col_name);
     }
 
     catalog.tables.insert(
@@ -1310,7 +1663,10 @@ fn resolve_range_subselect(
         columns,
     };
 
-    let mut scope = QueryScope::default();
+    let mut scope = QueryScope::with_ctes_from(active_scope);
+    scope
+        .cte_column_orders
+        .insert(alias_name.to_ascii_lowercase(), col_names);
     scope.add_binding(binding)?;
     Ok(scope)
 }
@@ -1585,16 +1941,25 @@ fn infer_expr(
                     return Err("Scalar subquery must have exactly one target column".to_string());
                 }
 
-                let mut sub_catalog = catalog.clone();
                 let mut dummy_params = HashMap::new();
+                let mut sub_scope = scope.clone();
                 if let Some(wc) = &sub_select.with_clause {
-                    register_ctes(wc, &mut sub_catalog, &mut dummy_params)?;
+                    process_with_clause_with_params(
+                        wc,
+                        &mut sub_scope,
+                        catalog,
+                        &mut dummy_params,
+                    )?;
                 }
 
-                let mut sub_scope = scope.clone();
+                let mut sub_catalog = catalog.clone();
                 for from_item in &sub_select.from_clause {
-                    let item_scope =
-                        resolve_from_clause_node(from_item, &mut sub_catalog, &mut dummy_params)?;
+                    let item_scope = resolve_from_clause_node(
+                        from_item,
+                        &mut sub_catalog,
+                        &sub_scope,
+                        &mut dummy_params,
+                    )?;
                     let _ = sub_scope.merge(item_scope);
                 }
 
@@ -1684,11 +2049,11 @@ fn infer_expr(
     }
 }
 
-fn resolve_target(
+fn resolve_target_columns(
     rt: &pg_query::protobuf::ResTarget,
     catalog: &Catalog,
     scope: &QueryScope,
-    fields: &mut Vec<QueryField>,
+    columns: &mut Vec<ColumnMetadata>,
 ) -> Result<(), String> {
     let explicit_alias = if !rt.name.is_empty() {
         Some(rt.name.clone())
@@ -1710,17 +2075,16 @@ fn resolve_target(
                 // SELECT * FROM ...
                 for name in &scope.binding_order {
                     if let Some(binding) = scope.bindings.get(&name.to_ascii_lowercase()) {
-                        let ordered_cols = get_ordered_columns(binding, catalog);
+                        let ordered_cols = get_ordered_columns(binding, catalog, Some(scope));
                         for col in ordered_cols {
                             let is_null = col.is_nullable || binding.is_null_padded;
-                            let ts_type = if is_null {
-                                format_nullable(&col.ts_type)
-                            } else {
-                                col.ts_type.clone()
-                            };
-                            fields.push(QueryField {
+                            let ts_type = col.ts_type.replace(" | null", "").trim().to_string();
+                            columns.push(ColumnMetadata {
                                 name: col.name.clone(),
+                                pg_type: col.pg_type.clone(),
                                 ts_type,
+                                is_nullable: is_null,
+                                has_default: col.has_default,
                             });
                         }
                     }
@@ -1752,17 +2116,16 @@ fn resolve_target(
                     .get(&target.to_ascii_lowercase())
                     .ok_or_else(|| format!("Unknown table alias \"{}\"", target))?;
 
-                let ordered_cols = get_ordered_columns(binding, catalog);
+                let ordered_cols = get_ordered_columns(binding, catalog, Some(scope));
                 for col in ordered_cols {
                     let is_null = col.is_nullable || binding.is_null_padded;
-                    let ts_type = if is_null {
-                        format_nullable(&col.ts_type)
-                    } else {
-                        col.ts_type.clone()
-                    };
-                    fields.push(QueryField {
+                    let ts_type = col.ts_type.replace(" | null", "").trim().to_string();
+                    columns.push(ColumnMetadata {
                         name: col.name.clone(),
+                        pg_type: col.pg_type.clone(),
                         ts_type,
+                        is_nullable: is_null,
+                        has_default: col.has_default,
                     });
                 }
                 return Ok(());
@@ -1776,21 +2139,19 @@ fn resolve_target(
                     .and_then(extract_string)
                     .unwrap_or_else(|| "column".to_string())
             });
-            let ts_type = if inferred.is_nullable {
-                format_nullable(&inferred.pg_type.to_ts(catalog))
-            } else {
-                inferred.pg_type.to_ts(catalog)
-            };
-            fields.push(QueryField { name, ts_type });
+            let ts_type = inferred.pg_type.to_ts(catalog);
+            columns.push(ColumnMetadata {
+                name,
+                pg_type: inferred.pg_type.to_pg_str(),
+                ts_type,
+                is_nullable: inferred.is_nullable,
+                has_default: false,
+            });
             Ok(())
         }
         _ => {
             let inferred = infer_expr(val_node, catalog, scope)?;
-            let ts_type = if inferred.is_nullable {
-                format_nullable(&inferred.pg_type.to_ts(catalog))
-            } else {
-                inferred.pg_type.to_ts(catalog)
-            };
+            let ts_type = inferred.pg_type.to_ts(catalog);
             let default_name = match &val_node.node {
                 Some(NodeEnum::FuncCall(fc)) => extract_func_name(&fc.funcname),
                 Some(NodeEnum::CaseExpr(_)) => "case".to_string(),
@@ -1804,13 +2165,38 @@ fn resolve_target(
                 Some(NodeEnum::AArrayExpr(_)) => "arr".to_string(),
                 _ => "column".to_string(),
             };
-            fields.push(QueryField {
+            columns.push(ColumnMetadata {
                 name: explicit_alias.unwrap_or(default_name),
+                pg_type: inferred.pg_type.to_pg_str(),
                 ts_type,
+                is_nullable: inferred.is_nullable,
+                has_default: false,
             });
             Ok(())
         }
     }
+}
+
+fn resolve_target(
+    rt: &pg_query::protobuf::ResTarget,
+    catalog: &Catalog,
+    scope: &QueryScope,
+    fields: &mut Vec<QueryField>,
+) -> Result<(), String> {
+    let mut cols = Vec::new();
+    resolve_target_columns(rt, catalog, scope, &mut cols)?;
+    for col in cols {
+        let ts_type = if col.is_nullable {
+            format_nullable(&col.ts_type)
+        } else {
+            col.ts_type
+        };
+        fields.push(QueryField {
+            name: col.name,
+            ts_type,
+        });
+    }
+    Ok(())
 }
 
 /// Helper to inspect an expression for ParamRef and ColumnRef combinations.
@@ -2060,14 +2446,14 @@ fn resolve_params_in_expr(
             if let Some(sub_node) = &sl.subselect
                 && let Some(NodeEnum::SelectStmt(sub_select)) = &sub_node.node
             {
-                let mut sub_catalog = catalog.clone();
-                if let Some(wc) = &sub_select.with_clause {
-                    let _ = register_ctes(wc, &mut sub_catalog, param_map);
-                }
                 let mut sub_scope = scope.clone();
+                if let Some(wc) = &sub_select.with_clause {
+                    let _ = process_with_clause_with_params(wc, &mut sub_scope, catalog, param_map);
+                }
+                let mut sub_catalog = catalog.clone();
                 for from_item in &sub_select.from_clause {
                     if let Ok(item_scope) =
-                        resolve_from_clause_node(from_item, &mut sub_catalog, param_map)
+                        resolve_from_clause_node(from_item, &mut sub_catalog, &sub_scope, param_map)
                     {
                         let _ = sub_scope.merge(item_scope);
                     }
@@ -2974,5 +3360,141 @@ RIGHT JOIN posts p ON p.user_id = u.id;
 
         assert!(scope.bindings["u"].is_null_padded);
         assert!(scope.bindings["u"].columns["id"].is_nullable);
+    }
+
+    #[test]
+    fn test_cte_standard_inference() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "
+            CREATE TABLE users (
+                id UUID PRIMARY KEY,
+                email TEXT NOT NULL,
+                age INT NOT NULL
+            );
+        ",
+            )
+            .unwrap();
+
+        let sql = "
+            WITH user_summary AS (
+                SELECT id, email, (age + 1) AS next_age FROM users
+            )
+            SELECT email, next_age FROM user_summary;
+        ";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.fields.len(), 2);
+        assert_eq!(analyzed.fields[0].name, "email");
+        assert_eq!(analyzed.fields[0].ts_type, "string");
+        assert_eq!(analyzed.fields[1].name, "next_age");
+        assert_eq!(analyzed.fields[1].ts_type, "number");
+    }
+
+    #[test]
+    fn test_cte_positional_aliasing() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "
+            CREATE TABLE users (
+                id UUID PRIMARY KEY,
+                email TEXT NOT NULL
+            );
+        ",
+            )
+            .unwrap();
+
+        let sql = "
+            WITH user_emails(uid, contact_email) AS (
+                SELECT id, email FROM users
+            )
+            SELECT ue.uid, ue.contact_email FROM user_emails ue;
+        ";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.fields.len(), 2);
+        assert_eq!(analyzed.fields[0].name, "uid");
+        assert_eq!(analyzed.fields[0].ts_type, "string");
+        assert_eq!(analyzed.fields[1].name, "contact_email");
+        assert_eq!(analyzed.fields[1].ts_type, "string");
+
+        // Length mismatch error
+        let bad_sql = "
+            WITH user_emails(uid) AS (
+                SELECT id, email FROM users
+            )
+            SELECT uid FROM user_emails;
+        ";
+        let err = analyze_query(bad_sql, &catalog, None).unwrap_err();
+        assert!(err.contains("columns available but"));
+    }
+
+    #[test]
+    fn test_cte_recursive_counter() {
+        let catalog = Catalog::default();
+        let sql = "
+            WITH RECURSIVE counter AS (
+                SELECT 1 AS n
+                UNION ALL
+                SELECT n + 1 FROM counter WHERE n < 10
+            )
+            SELECT n FROM counter;
+        ";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.fields.len(), 1);
+        assert_eq!(analyzed.fields[0].name, "n");
+        assert_eq!(analyzed.fields[0].ts_type, "number");
+    }
+
+    #[test]
+    fn test_cte_catalog_shadowing() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "
+            CREATE TABLE items (
+                id UUID PRIMARY KEY,
+                name TEXT NOT NULL
+            );
+        ",
+            )
+            .unwrap();
+
+        // Unqualified 'items' shadows physical table
+        let sql_shadow = "
+            WITH items AS (
+                SELECT 1 AS virtual_id
+            )
+            SELECT virtual_id FROM items;
+        ";
+        let analyzed_shadow = analyze_query(sql_shadow, &catalog, None).unwrap();
+        assert_eq!(analyzed_shadow.fields.len(), 1);
+        assert_eq!(analyzed_shadow.fields[0].name, "virtual_id");
+        assert_eq!(analyzed_shadow.fields[0].ts_type, "number");
+
+        // Schema-qualified 'public.items' accesses physical table
+        let sql_physical = "
+            WITH items AS (
+                SELECT 1 AS virtual_id
+            )
+            SELECT id, name FROM public.items;
+        ";
+        let analyzed_physical = analyze_query(sql_physical, &catalog, None).unwrap();
+        assert_eq!(analyzed_physical.fields.len(), 2);
+        assert_eq!(analyzed_physical.fields[0].name, "id");
+        assert_eq!(analyzed_physical.fields[0].ts_type, "string");
+        assert_eq!(analyzed_physical.fields[1].name, "name");
+        assert_eq!(analyzed_physical.fields[1].ts_type, "string");
+    }
+
+    #[test]
+    fn test_cte_duplicate_rejection() {
+        let catalog = Catalog::default();
+        let sql = "
+            WITH a AS (SELECT 1 AS x), a AS (SELECT 2 AS x)
+            SELECT x FROM a;
+        ";
+        let err = analyze_query(sql, &catalog, None).unwrap_err();
+        assert!(err.contains("WITH query name \"a\" specified more than once"));
     }
 }
