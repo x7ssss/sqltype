@@ -4,5 +4,10 @@
   "description": "Native sqltype binary for Windows x86_64",
   "os": ["win32"],
   "cpu": ["x64"],
-  "license": "MIT"
+  "author": "x7ssss",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/x7ssss/sqltype"
+  }
 }

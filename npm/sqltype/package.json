@@ -19,11 +19,15 @@
     "type-safe",
     "zero-runtime"
   ],
-  "author": "Antigravity Systems Team",
+  "author": "x7ssss",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/sqltype/sqltype"
+    "url": "https://github.com/x7ssss/sqltype"
+  },
+  "homepage": "https://github.com/x7ssss/sqltype#readme",
+  "bugs": {
+    "url": "https://github.com/x7ssss/sqltype/issues"
   },
   "optionalDependencies": {
     "@sqltype/linux-x64": "0.1.0",

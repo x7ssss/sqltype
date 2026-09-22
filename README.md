@@ -338,13 +338,14 @@ language-servers = ["sqltype"]
 
 ## About the Author
 
-**x7sss** is an independent systems and compiler developer specializing in high-performance developer tooling, type inference systems, and low-latency database engines in Rust.
+**x7ssss** is an independent systems and compiler developer specializing in high-performance developer tooling, type inference systems, and low-latency database engines in Rust.
 
-- **GitHub**: [@x7sss](https://github.com/x7sss)
+- **GitHub**: [@x7ssss](https://github.com/x7ssss)
+- **Repository**: [x7ssss/sqltype](https://github.com/x7ssss/sqltype)
 - **Email**: babadookmariqn@gmail.com
 
 ---
 
 ## License
 
-MIT © [x7sss](https://github.com/x7sss)
+MIT © [x7ssss](https://github.com/x7ssss)
