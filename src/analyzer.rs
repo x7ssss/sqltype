@@ -5,6 +5,40 @@ use pg_query::protobuf::{
 };
 use std::collections::HashMap;
 
+fn format_nullable(ts_type: &str) -> String {
+    if ts_type == "unknown" {
+        return "unknown".to_string();
+    }
+    if ts_type.contains("| null") {
+        ts_type.to_string()
+    } else {
+        format!("{} | null", ts_type)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InferredType {
+    pub pg_type: PgType,
+    pub is_nullable: bool,
+}
+
+pub type InferredExpr = InferredType;
+
+impl InferredType {
+    pub fn to_typescript(&self, catalog: &Catalog) -> String {
+        let base = self.pg_type.to_ts(catalog);
+        if self.is_nullable {
+            format_nullable(&base)
+        } else {
+            base
+        }
+    }
+
+    pub fn to_ts(&self, catalog: &Catalog) -> String {
+        self.to_typescript(catalog)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PgType {
     Unknown,
@@ -24,8 +58,11 @@ pub enum PgType {
     Time,
     Timetz,
     Bytea,
-    Json,
-    Jsonb,
+    JsonRaw,
+    JsonbRaw,
+    JsonObject(Vec<(String, InferredType)>),
+    JsonArray(Box<InferredType>),
+    JsonDynamicObject,
     Custom(String),
     Array(Box<PgType>),
 }
@@ -54,8 +91,8 @@ impl PgType {
             "time" | "time without time zone" => PgType::Time,
             "timetz" | "time with time zone" => PgType::Timetz,
             "bytea" => PgType::Bytea,
-            "json" => PgType::Json,
-            "jsonb" => PgType::Jsonb,
+            "json" => PgType::JsonRaw,
+            "jsonb" => PgType::JsonbRaw,
             "unknown" => PgType::Unknown,
             other => PgType::Custom(other.to_string()),
         }
@@ -80,7 +117,27 @@ impl PgType {
             PgType::Date => "string".to_string(),
             PgType::Timestamp | PgType::Timestamptz => "Date".to_string(),
             PgType::Time | PgType::Timetz => "string".to_string(),
-            PgType::Json | PgType::Jsonb => "unknown".to_string(),
+            PgType::JsonRaw | PgType::JsonbRaw => "unknown".to_string(),
+            PgType::JsonDynamicObject => "Record<string, unknown>".to_string(),
+            PgType::JsonArray(inner) => format!("Array<{}>", inner.to_typescript(catalog)),
+            PgType::JsonObject(fields) => {
+                if fields.is_empty() {
+                    "Record<string, never>".to_string()
+                } else {
+                    let inner = fields
+                        .iter()
+                        .map(|(k, v)| {
+                            format!(
+                                "{}: {}",
+                                crate::codegen::format_property_key(k),
+                                v.to_typescript(catalog)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    format!("{{ {} }}", inner)
+                }
+            }
             PgType::Custom(name) => catalog.resolve_type(name),
             PgType::Array(inner) => {
                 let inner_ts = inner.to_ts(catalog);
@@ -112,8 +169,11 @@ impl PgType {
             PgType::Time => "time".to_string(),
             PgType::Timetz => "timetz".to_string(),
             PgType::Bytea => "bytea".to_string(),
-            PgType::Json => "json".to_string(),
-            PgType::Jsonb => "jsonb".to_string(),
+            PgType::JsonRaw => "json".to_string(),
+            PgType::JsonbRaw
+            | PgType::JsonObject(_)
+            | PgType::JsonArray(_)
+            | PgType::JsonDynamicObject => "jsonb".to_string(),
             PgType::Custom(name) => name.clone(),
             PgType::Array(inner) => format!("{}[]", inner.to_pg_str()),
         }
@@ -215,20 +275,125 @@ pub fn unify_types(a: &PgType, b: &PgType) -> Result<PgType, String> {
         return Ok(PgType::Array(Box::new(inner)));
     }
 
+    // JSON types hierarchy & unification
+    if is_json_type(a) && is_json_type(b) {
+        return unify_json_types(a, b);
+    }
+
     Err(format!(
         "Cannot unify incompatible types: {:?} and {:?}",
         a, b
     ))
 }
 
-pub fn unify_cte_types(anchor: &PgType, rec: &PgType) -> Result<PgType, String> {
-    unify_types(anchor, rec)
+fn is_json_type(t: &PgType) -> bool {
+    matches!(
+        t,
+        PgType::JsonRaw
+            | PgType::JsonbRaw
+            | PgType::JsonObject(_)
+            | PgType::JsonArray(_)
+            | PgType::JsonDynamicObject
+    )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InferredExpr {
-    pub pg_type: PgType,
-    pub is_nullable: bool,
+fn unify_json_types(a: &PgType, b: &PgType) -> Result<PgType, String> {
+    if a == b {
+        return Ok(a.clone());
+    }
+
+    // JsonArray with JsonArray
+    if let (PgType::JsonArray(inner_a), PgType::JsonArray(inner_b)) = (a, b) {
+        let unified_inner_pg = unify_types(&inner_a.pg_type, &inner_b.pg_type)?;
+        let is_nullable = inner_a.is_nullable || inner_b.is_nullable;
+        return Ok(PgType::JsonArray(Box::new(InferredType {
+            pg_type: unified_inner_pg,
+            is_nullable,
+        })));
+    }
+
+    // JsonArray with raw json literal fallback (e.g. COALESCE(json_agg(...), '[]'::jsonb))
+    if matches!(a, PgType::JsonArray(_)) && matches!(b, PgType::JsonRaw | PgType::JsonbRaw) {
+        return Ok(a.clone());
+    }
+    if matches!(b, PgType::JsonArray(_)) && matches!(a, PgType::JsonRaw | PgType::JsonbRaw) {
+        return Ok(b.clone());
+    }
+
+    // JsonObject with JsonObject
+    if let (PgType::JsonObject(f_a), PgType::JsonObject(f_b)) = (a, b) {
+        // If keys and lengths match, unify fields
+        if f_a.len() == f_b.len() {
+            let mut unified_fields = Vec::with_capacity(f_a.len());
+            let mut all_matched = true;
+            for (k_a, val_a) in f_a {
+                if let Some((_, val_b)) = f_b.iter().find(|(k_b, _)| k_b == k_a) {
+                    if let Ok(unified_val_pg) = unify_types(&val_a.pg_type, &val_b.pg_type) {
+                        unified_fields.push((
+                            k_a.clone(),
+                            InferredType {
+                                pg_type: unified_val_pg,
+                                is_nullable: val_a.is_nullable || val_b.is_nullable,
+                            },
+                        ));
+                    } else {
+                        all_matched = false;
+                        break;
+                    }
+                } else {
+                    all_matched = false;
+                    break;
+                }
+            }
+            if all_matched {
+                return Ok(PgType::JsonObject(unified_fields));
+            }
+        }
+        return Ok(PgType::JsonDynamicObject);
+    }
+
+    // JsonObject with raw json fallback (e.g. COALESCE(obj, '{}'::jsonb))
+    if matches!(a, PgType::JsonObject(_)) && matches!(b, PgType::JsonRaw | PgType::JsonbRaw) {
+        return Ok(a.clone());
+    }
+    if matches!(b, PgType::JsonObject(_)) && matches!(a, PgType::JsonRaw | PgType::JsonbRaw) {
+        return Ok(b.clone());
+    }
+
+    // JsonDynamicObject with JsonObject or raw
+    if matches!(a, PgType::JsonDynamicObject)
+        && matches!(
+            b,
+            PgType::JsonObject(_) | PgType::JsonRaw | PgType::JsonbRaw
+        )
+    {
+        return Ok(PgType::JsonDynamicObject);
+    }
+    if matches!(b, PgType::JsonDynamicObject)
+        && matches!(
+            a,
+            PgType::JsonObject(_) | PgType::JsonRaw | PgType::JsonbRaw
+        )
+    {
+        return Ok(PgType::JsonDynamicObject);
+    }
+
+    // JsonRaw with JsonbRaw -> widen to JsonbRaw
+    if matches!(a, PgType::JsonRaw | PgType::JsonbRaw)
+        && matches!(b, PgType::JsonRaw | PgType::JsonbRaw)
+    {
+        if *a == PgType::JsonbRaw || *b == PgType::JsonbRaw {
+            return Ok(PgType::JsonbRaw);
+        }
+        return Ok(PgType::JsonRaw);
+    }
+
+    // Any other mixed JSON types fall back to JsonbRaw
+    Ok(PgType::JsonbRaw)
+}
+
+pub fn unify_cte_types(anchor: &PgType, rec: &PgType) -> Result<PgType, String> {
+    unify_types(anchor, rec)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -608,19 +773,71 @@ pub fn extract_query_name(sql: &str, fallback_filename: Option<&str>) -> String 
     }
 }
 
-fn format_nullable(ts_type: &str) -> String {
-    if ts_type.contains("| null") {
-        ts_type.to_string()
-    } else {
-        format!("{} | null", ts_type)
-    }
-}
-
 fn extract_string(node: &pg_query::protobuf::Node) -> Option<String> {
     if let Some(NodeEnum::String(s)) = &node.node {
         Some(s.sval.clone())
     } else {
         None
+    }
+}
+
+fn extract_const_string(node: &pg_query::protobuf::Node) -> Option<String> {
+    match &node.node {
+        Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+        Some(NodeEnum::AConst(ac)) => {
+            if let Some(pg_query::protobuf::a_const::Val::Sval(s)) = &ac.val {
+                Some(s.sval.clone())
+            } else {
+                None
+            }
+        }
+        Some(NodeEnum::TypeCast(tc)) => {
+            if let Some(arg) = &tc.arg {
+                extract_const_string(arg)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extract_static_string_array(node: &pg_query::protobuf::Node) -> Option<Vec<String>> {
+    match &node.node {
+        Some(NodeEnum::AArrayExpr(aae)) => {
+            let mut result = Vec::new();
+            for el in &aae.elements {
+                let s = extract_const_string(el)?;
+                result.push(s);
+            }
+            Some(result)
+        }
+        Some(NodeEnum::TypeCast(tc)) => {
+            if let Some(arg) = &tc.arg {
+                extract_static_string_array(arg)
+            } else {
+                None
+            }
+        }
+        Some(NodeEnum::AConst(ac)) => {
+            if let Some(pg_query::protobuf::a_const::Val::Sval(s)) = &ac.val {
+                let trimmed = s.sval.trim();
+                if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                    let inner = &trimmed[1..trimmed.len() - 1];
+                    let keys: Vec<String> = inner
+                        .split(',')
+                        .map(|k| k.trim().trim_matches('\"').trim_matches('\'').to_string())
+                        .filter(|k| !k.is_empty())
+                        .collect();
+                    Some(keys)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -2031,6 +2248,20 @@ fn infer_expr(
                             is_nullable: true,
                         })
                     }
+                    "json_agg" | "jsonb_agg" => {
+                        if fc.args.len() != 1 {
+                            return Err(format!(
+                                "Function {} requires 1 argument; found {}",
+                                func_name,
+                                fc.args.len()
+                            ));
+                        }
+                        let inner_type = infer_expr(&fc.args[0], catalog, scope)?;
+                        Ok(InferredType {
+                            pg_type: PgType::JsonArray(Box::new(inner_type)),
+                            is_nullable: true,
+                        })
+                    }
                     _ => {
                         let arg_type = if let Some(arg) = fc.args.first() {
                             infer_expr(arg, catalog, scope)?.pg_type
@@ -2046,6 +2277,101 @@ fn infer_expr(
             } else {
                 // Regular function call
                 match func_name.as_str() {
+                    "json_build_object" | "jsonb_build_object" => {
+                        if fc.args.len() % 2 != 0 {
+                            return Err(format!(
+                                "Argument list for {} must have an even number of elements; found {}",
+                                func_name,
+                                fc.args.len()
+                            ));
+                        }
+
+                        let mut fields: Vec<(String, InferredType)> = Vec::new();
+                        let mut is_dynamic = false;
+
+                        for chunk in fc.args.chunks(2) {
+                            let key_node = &chunk[0];
+                            let val_node = &chunk[1];
+
+                            let val_inferred = infer_expr(val_node, catalog, scope)?;
+
+                            if let Some(key_str) = extract_const_string(key_node) {
+                                if let Some(existing) =
+                                    fields.iter_mut().find(|(k, _)| k == &key_str)
+                                {
+                                    existing.1 = val_inferred;
+                                } else {
+                                    fields.push((key_str, val_inferred));
+                                }
+                            } else {
+                                is_dynamic = true;
+                            }
+                        }
+
+                        if is_dynamic {
+                            Ok(InferredType {
+                                pg_type: PgType::JsonDynamicObject,
+                                is_nullable: false,
+                            })
+                        } else {
+                            Ok(InferredType {
+                                pg_type: PgType::JsonObject(fields),
+                                is_nullable: false,
+                            })
+                        }
+                    }
+                    "json_agg" | "jsonb_agg" => {
+                        if fc.args.len() != 1 {
+                            return Err(format!(
+                                "Function {} requires 1 argument; found {}",
+                                func_name,
+                                fc.args.len()
+                            ));
+                        }
+                        let inner_type = infer_expr(&fc.args[0], catalog, scope)?;
+                        Ok(InferredType {
+                            pg_type: PgType::JsonArray(Box::new(inner_type)),
+                            is_nullable: true,
+                        })
+                    }
+                    "to_json" | "to_jsonb" => {
+                        if fc.args.len() != 1 {
+                            return Err(format!(
+                                "Function {} requires 1 argument; found {}",
+                                func_name,
+                                fc.args.len()
+                            ));
+                        }
+                        let inner = infer_expr(&fc.args[0], catalog, scope)?;
+                        match inner.pg_type {
+                            PgType::JsonObject(_)
+                            | PgType::JsonArray(_)
+                            | PgType::JsonDynamicObject => Ok(inner),
+                            _ => Ok(InferredType {
+                                pg_type: PgType::JsonbRaw,
+                                is_nullable: inner.is_nullable,
+                            }),
+                        }
+                    }
+                    "json_build_array" | "jsonb_build_array" => {
+                        let mut elem_type = PgType::Unknown;
+                        let mut is_elem_nullable = false;
+                        for arg in &fc.args {
+                            let inf = infer_expr(arg, catalog, scope)?;
+                            elem_type =
+                                unify_types(&elem_type, &inf.pg_type).unwrap_or(PgType::Unknown);
+                            if inf.is_nullable {
+                                is_elem_nullable = true;
+                            }
+                        }
+                        Ok(InferredType {
+                            pg_type: PgType::JsonArray(Box::new(InferredType {
+                                pg_type: elem_type,
+                                is_nullable: is_elem_nullable,
+                            })),
+                            is_nullable: false,
+                        })
+                    }
                     "count" => Ok(InferredExpr {
                         pg_type: PgType::Int4,
                         is_nullable: false,
@@ -2183,26 +2509,104 @@ fn infer_expr(
                     is_nullable: false,
                 }
             };
-            let is_nullable = l_inf.is_nullable || r_inf.is_nullable;
 
-            let pg_type = if matches!(op.as_str(), "+" | "-" | "*" | "/" | "%") {
-                if is_numeric_type(&l_inf.pg_type) && is_numeric_type(&r_inf.pg_type) {
-                    unify_types(&l_inf.pg_type, &r_inf.pg_type).unwrap_or(PgType::Numeric)
-                } else {
-                    PgType::Numeric
+            match op.as_str() {
+                "->>" | "#>>" => Ok(InferredType {
+                    pg_type: PgType::Text,
+                    is_nullable: true,
+                }),
+                "->" => {
+                    let right_key = ae.rexpr.as_ref().and_then(|r| extract_const_string(r));
+                    if let PgType::JsonObject(fields) = &l_inf.pg_type
+                        && let Some(key) = right_key
+                    {
+                        if let Some((_, field_inferred)) = fields.iter().find(|(k, _)| k == &key) {
+                            return Ok(InferredType {
+                                pg_type: field_inferred.pg_type.clone(),
+                                is_nullable: true,
+                            });
+                        }
+                    } else if let PgType::JsonArray(inner) = &l_inf.pg_type {
+                        return Ok(InferredType {
+                            pg_type: inner.pg_type.clone(),
+                            is_nullable: true,
+                        });
+                    }
+                    Ok(InferredType {
+                        pg_type: PgType::JsonbRaw,
+                        is_nullable: true,
+                    })
                 }
-            } else if op == "||" {
-                PgType::Text
-            } else if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
-                PgType::Bool
-            } else {
-                PgType::Unknown
-            };
-
-            Ok(InferredExpr {
-                pg_type,
-                is_nullable,
-            })
+                "#>" => {
+                    if let Some(path) = ae
+                        .rexpr
+                        .as_ref()
+                        .and_then(|r| extract_static_string_array(r))
+                    {
+                        let mut curr_type = &l_inf.pg_type;
+                        let mut matched = true;
+                        for key in &path {
+                            if let PgType::JsonObject(fields) = curr_type {
+                                if let Some((_, next_inferred)) =
+                                    fields.iter().find(|(k, _)| k == key)
+                                {
+                                    curr_type = &next_inferred.pg_type;
+                                } else {
+                                    matched = false;
+                                    break;
+                                }
+                            } else {
+                                matched = false;
+                                break;
+                            }
+                        }
+                        if matched && !path.is_empty() {
+                            return Ok(InferredType {
+                                pg_type: curr_type.clone(),
+                                is_nullable: true,
+                            });
+                        }
+                    }
+                    Ok(InferredType {
+                        pg_type: PgType::JsonbRaw,
+                        is_nullable: true,
+                    })
+                }
+                "+" | "-" | "*" | "/" | "%" => {
+                    let is_nullable = l_inf.is_nullable || r_inf.is_nullable;
+                    let pg_type =
+                        if is_numeric_type(&l_inf.pg_type) && is_numeric_type(&r_inf.pg_type) {
+                            unify_types(&l_inf.pg_type, &r_inf.pg_type).unwrap_or(PgType::Numeric)
+                        } else {
+                            PgType::Numeric
+                        };
+                    Ok(InferredType {
+                        pg_type,
+                        is_nullable,
+                    })
+                }
+                "||" => {
+                    let is_nullable = l_inf.is_nullable || r_inf.is_nullable;
+                    Ok(InferredType {
+                        pg_type: PgType::Text,
+                        is_nullable,
+                    })
+                }
+                "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" => {
+                    let is_nullable = l_inf.is_nullable || r_inf.is_nullable;
+                    Ok(InferredType {
+                        pg_type: PgType::Bool,
+                        is_nullable,
+                    })
+                }
+                _ => {
+                    let is_nullable = l_inf.is_nullable || r_inf.is_nullable;
+                    Ok(InferredType {
+                        pg_type: PgType::Unknown,
+                        is_nullable,
+                    })
+                }
+            }
         }
         Some(NodeEnum::AArrayExpr(aae)) => {
             let elem_type = if let Some(first) = aae.elements.first() {
@@ -3847,5 +4251,127 @@ LIMIT $1 OFFSET $2;
         )
         .unwrap_err();
         assert!(err_zero.contains("ORDER BY position 0 is out of range: must be between 1 and 1"));
+    }
+
+    fn setup_json_test_catalog() -> Catalog {
+        let sql = "
+            CREATE TABLE users (
+                id UUID PRIMARY KEY,
+                name TEXT NOT NULL,
+                metadata JSONB
+            );
+        ";
+        let mut catalog = Catalog::default();
+        catalog.apply_sql(sql).unwrap();
+        catalog
+    }
+
+    #[test]
+    fn test_jsonb_build_object_inference() {
+        let catalog = setup_json_test_catalog();
+        let query = "
+-- name: GetUserJson
+SELECT jsonb_build_object('id', u.id, 'name', u.name) AS user_obj
+FROM users u;
+        ";
+        let analyzed = analyze_query(query, &catalog, None).unwrap();
+        assert_eq!(analyzed.fields.len(), 1);
+        assert_eq!(analyzed.fields[0].name, "user_obj");
+        assert_eq!(analyzed.fields[0].ts_type, "{ id: string; name: string }");
+    }
+
+    #[test]
+    fn test_json_build_object_odd_args_error() {
+        let catalog = setup_json_test_catalog();
+        let query = "
+SELECT json_build_object('id') FROM users;
+        ";
+        let err = analyze_query(query, &catalog, None).unwrap_err();
+        assert!(err.contains(
+            "Argument list for json_build_object must have an even number of elements; found 1"
+        ));
+    }
+
+    #[test]
+    fn test_json_agg_inference() {
+        let catalog = setup_json_test_catalog();
+        let query = "
+-- name: GetUsersAgg
+SELECT json_agg(jsonb_build_object('id', u.id)) AS users_agg
+FROM users u;
+        ";
+        let analyzed = analyze_query(query, &catalog, None).unwrap();
+        assert_eq!(analyzed.fields.len(), 1);
+        assert_eq!(analyzed.fields[0].name, "users_agg");
+        assert_eq!(analyzed.fields[0].ts_type, "Array<{ id: string }> | null");
+    }
+
+    #[test]
+    fn test_coalesce_json_agg_shielding() {
+        let catalog = setup_json_test_catalog();
+        let query = "
+-- name: GetUsersAggCoalesced
+SELECT COALESCE(jsonb_agg(jsonb_build_object('id', u.id)), '[]'::jsonb) AS users_agg
+FROM users u;
+        ";
+        let analyzed = analyze_query(query, &catalog, None).unwrap();
+        assert_eq!(analyzed.fields.len(), 1);
+        assert_eq!(analyzed.fields[0].name, "users_agg");
+        assert_eq!(analyzed.fields[0].ts_type, "Array<{ id: string }>");
+    }
+
+    #[test]
+    fn test_json_operators_text_extraction() {
+        let catalog = setup_json_test_catalog();
+        let query = "
+-- name: GetUserRole
+SELECT u.metadata->>'role' AS role
+FROM users u;
+        ";
+        let analyzed = analyze_query(query, &catalog, None).unwrap();
+        assert_eq!(analyzed.fields.len(), 1);
+        assert_eq!(analyzed.fields[0].name, "role");
+        assert_eq!(analyzed.fields[0].ts_type, "string | null");
+    }
+
+    #[test]
+    fn test_json_operators_deep_and_nested() {
+        let catalog = setup_json_test_catalog();
+
+        // -> on JsonObject returns nested type (nullable = true)
+        let query_field = "
+-- name: GetNestedField
+SELECT jsonb_build_object('nested', jsonb_build_object('id', u.id))->'nested' AS nested_obj
+FROM users u;
+        ";
+        let analyzed_field = analyze_query(query_field, &catalog, None).unwrap();
+        assert_eq!(analyzed_field.fields[0].ts_type, "{ id: string } | null");
+
+        // #> with static array path matches nested JsonObject
+        let query_path = "
+-- name: GetNestedPath
+SELECT jsonb_build_object('a', jsonb_build_object('b', u.name)) #> '{a, b}' AS val
+FROM users u;
+        ";
+        let analyzed_path = analyze_query(query_path, &catalog, None).unwrap();
+        assert_eq!(analyzed_path.fields[0].ts_type, "string | null");
+
+        // Empty json_build_object -> Record<string, never>
+        let query_empty = "
+-- name: GetEmpty
+SELECT jsonb_build_object() AS empty_obj
+FROM users u;
+        ";
+        let analyzed_empty = analyze_query(query_empty, &catalog, None).unwrap();
+        assert_eq!(analyzed_empty.fields[0].ts_type, "Record<string, never>");
+
+        // Dynamic key json_build_object -> Record<string, unknown>
+        let query_dyn = "
+-- name: GetDynamic
+SELECT jsonb_build_object(u.name, u.id) AS dyn_obj
+FROM users u;
+        ";
+        let analyzed_dyn = analyze_query(query_dyn, &catalog, None).unwrap();
+        assert_eq!(analyzed_dyn.fields[0].ts_type, "Record<string, unknown>");
     }
 }

@@ -15,7 +15,7 @@ pub fn to_camel_case(s: &str) -> String {
 }
 
 /// Checks if a string is a valid JavaScript / TypeScript identifier.
-fn is_valid_js_identifier(name: &str) -> bool {
+pub fn is_valid_js_identifier(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
@@ -27,7 +27,7 @@ fn is_valid_js_identifier(name: &str) -> bool {
     chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
 }
 
-fn format_property_key(name: &str) -> String {
+pub fn format_property_key(name: &str) -> String {
     if is_valid_js_identifier(name) {
         name.to_string()
     } else {
@@ -761,5 +761,39 @@ GROUP BY u.id, u.email, p.title;
             expected_wrapper,
             ts
         );
+    }
+
+    #[test]
+    fn test_codegen_json_types() {
+        let query = AnalyzedQuery {
+            name: "GetUserPayload".to_string(),
+            raw_sql: "SELECT jsonb_build_object('id', id, 'meta', jsonb_build_object('active', true)) AS payload FROM users;".to_string(),
+            params: vec![],
+            fields: vec![
+                QueryField {
+                    name: "payload".to_string(),
+                    ts_type: "{ id: number; meta: { active: boolean } }".to_string(),
+                },
+                QueryField {
+                    name: "tags".to_string(),
+                    ts_type: "Array<string>".to_string(),
+                },
+                QueryField {
+                    name: "dynamic_data".to_string(),
+                    ts_type: "Record<string, unknown>".to_string(),
+                },
+                QueryField {
+                    name: "raw_json".to_string(),
+                    ts_type: "unknown".to_string(),
+                },
+            ],
+        };
+
+        let ts = generate_file_ts(&[query]);
+        assert!(ts.contains("export interface GetUserPayloadRow {"));
+        assert!(ts.contains("payload: { id: number; meta: { active: boolean } };"));
+        assert!(ts.contains("tags: Array<string>;"));
+        assert!(ts.contains("dynamic_data: Record<string, unknown>;"));
+        assert!(ts.contains("raw_json: unknown;"));
     }
 }
