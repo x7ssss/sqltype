@@ -69,7 +69,16 @@ pub fn generate_query_ts(query: &AnalyzedQuery) -> String {
     out.push_str(&format!("export interface {}Params {{\n", name));
     for param in &query.params {
         let key = format_property_key(&param.name);
-        out.push_str(&format!("  {}: {};\n", key, param.ts_type));
+        if param.is_optional {
+            let ts_type = if param.ts_type.contains("| null") {
+                param.ts_type.clone()
+            } else {
+                format!("{} | null", param.ts_type)
+            };
+            out.push_str(&format!("  {}?: {};\n", key, ts_type));
+        } else {
+            out.push_str(&format!("  {}: {};\n", key, param.ts_type));
+        }
     }
     out.push_str("}\n\n");
 
@@ -142,6 +151,7 @@ GROUP BY u.id, u.email, p.title;
                 index: 1,
                 name: "id".to_string(),
                 ts_type: "string".to_string(),
+                is_optional: false,
             }],
             fields: vec![
                 QueryField {
@@ -190,5 +200,70 @@ GROUP BY u.id, u.email, p.title;
         };
         let ts = generate_file_ts(&[query]);
         assert!(ts.contains("export interface GetAllUsersParams {\n}"));
+    }
+
+    #[test]
+    fn test_optional_param_codegen() {
+        let mut catalog = crate::catalog::Catalog::default();
+        catalog
+            .apply_sql("
+                CREATE TABLE users (
+                    id UUID PRIMARY KEY,
+                    name TEXT NOT NULL
+                );
+            ")
+            .unwrap();
+
+        let query_sql = "
+            SELECT id, name FROM users WHERE ($1::text IS NULL OR name = $1) AND id = $2;
+        ";
+        let analyzed = crate::analyzer::analyze_query(query_sql, &catalog, Some("get_users_by_filter.sql")).unwrap();
+        let ts = generate_file_ts(&[analyzed]);
+
+        assert!(ts.contains("export interface GetUsersByFilterParams {\n  name?: string | null;\n  id: string;\n}"));
+    }
+
+    #[test]
+    fn test_driver_profiles_codegen() {
+        use crate::catalog::{Catalog, DriverTarget};
+
+        let ddl = "
+            CREATE TABLE data_records (
+                id BIGINT PRIMARY KEY,
+                payload BYTEA NOT NULL,
+                active_date DATE NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL
+            );
+        ";
+
+        // Bun driver
+        let mut bun_catalog = Catalog::new(DriverTarget::Bun);
+        bun_catalog.apply_sql(ddl).unwrap();
+        let bun_query = crate::analyzer::analyze_query(
+            "SELECT id, payload, active_date, created_at FROM data_records;",
+            &bun_catalog,
+            Some("get_records.sql"),
+        )
+        .unwrap();
+        let bun_ts = generate_file_ts(&[bun_query]);
+        assert!(bun_ts.contains("id: bigint;"));
+        assert!(bun_ts.contains("payload: Uint8Array;"));
+        assert!(bun_ts.contains("active_date: string;"));
+        assert!(bun_ts.contains("created_at: Date;"));
+
+        // Postgres / pg driver
+        let mut pg_catalog = Catalog::new(DriverTarget::Postgres);
+        pg_catalog.apply_sql(ddl).unwrap();
+        let pg_query = crate::analyzer::analyze_query(
+            "SELECT id, payload, active_date, created_at FROM data_records;",
+            &pg_catalog,
+            Some("get_records.sql"),
+        )
+        .unwrap();
+        let pg_ts = generate_file_ts(&[pg_query]);
+        assert!(pg_ts.contains("id: string;"));
+        assert!(pg_ts.contains("payload: Buffer;"));
+        assert!(pg_ts.contains("active_date: string;"));
+        assert!(pg_ts.contains("created_at: Date;"));
     }
 }

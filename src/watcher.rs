@@ -1,5 +1,5 @@
 use crate::analyzer::analyze_query;
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, DriverTarget};
 use crate::codegen::generate_file_ts;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
@@ -30,7 +30,12 @@ fn discover_sql_files<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, String> {
 }
 
 /// Runs watch mode on migrations and queries directories with sub-5ms incremental re-generation.
-pub fn run_watch(migrations_dir: &Path, queries_dir: &Path, out_dir: &Path) -> Result<(), String> {
+pub fn run_watch(
+    migrations_dir: &Path,
+    queries_dir: &Path,
+    out_dir: &Path,
+    driver: DriverTarget,
+) -> Result<(), String> {
     // Canonicalize paths for robust comparison
     let abs_migrations = migrations_dir
         .canonicalize()
@@ -49,9 +54,10 @@ pub fn run_watch(migrations_dir: &Path, queries_dir: &Path, out_dir: &Path) -> R
     println!("   Migrations: {}", abs_migrations.display());
     println!("   Queries:    {}", abs_queries.display());
     println!("   Output:     {}", abs_out.display());
+    println!("   Driver:     {}", driver);
     println!("   (Press Ctrl+C to stop)\n");
 
-    let mut catalog = Catalog::load_from_dir(&abs_migrations)?;
+    let mut catalog = Catalog::load_from_dir_with_driver(&abs_migrations, driver)?;
 
     let (tx, rx) = channel();
     let mut watcher = RecommendedWatcher::new(tx, Config::default()).map_err(|e| e.to_string())?;
@@ -100,7 +106,7 @@ pub fn run_watch(migrations_dir: &Path, queries_dir: &Path, out_dir: &Path) -> R
         if changed_migrations {
             let start = Instant::now();
             println!("⚡ [Watch] Migration change detected. Rebuilding schema catalog...");
-            match Catalog::load_from_dir(&abs_migrations) {
+            match Catalog::load_from_dir_with_driver(&abs_migrations, driver) {
                 Ok(new_catalog) => {
                     catalog = new_catalog;
                     let query_files = discover_sql_files(&abs_queries).unwrap_or_default();

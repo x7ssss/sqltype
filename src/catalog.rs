@@ -24,19 +24,39 @@ impl TableMetadata {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DriverTarget {
+    #[default]
+    Postgres,
+    Pg,
+    Bun,
+}
+
+impl std::fmt::Display for DriverTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DriverTarget::Postgres => write!(f, "postgres"),
+            DriverTarget::Pg => write!(f, "pg"),
+            DriverTarget::Bun => write!(f, "bun"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     pub tables: HashMap<String, TableMetadata>,
+    pub driver: DriverTarget,
 }
 
-/// Normalizes PostgreSQL types to TypeScript primitives according to project specifications.
-pub fn normalize_pg_type_to_ts(pg_type: &str) -> String {
+/// Normalizes PostgreSQL types to TypeScript primitives according to driver target specifications.
+pub fn normalize_pg_type_to_ts(pg_type: &str, driver: DriverTarget) -> String {
     let lower = pg_type.to_ascii_lowercase();
     let lower = lower.trim();
 
     // Check array suffix e.g. text[] or int[]
     if let Some(inner) = lower.strip_suffix("[]") {
-        let inner_ts = normalize_pg_type_to_ts(inner);
+        let inner_ts = normalize_pg_type_to_ts(inner, driver);
         return format!("{}[]", inner_ts);
     }
 
@@ -48,8 +68,17 @@ pub fn normalize_pg_type_to_ts(pg_type: &str) -> String {
         "float8" | "double precision" => "number".to_string(),
         "numeric" | "decimal" => "number".to_string(),
 
-        // int8, bigint -> string
-        "int8" | "bigint" | "bigserial" => "string".to_string(),
+        // int8, bigint -> string for postgres/pg, bigint for bun
+        "int8" | "bigint" | "bigserial" | "serial8" => match driver {
+            DriverTarget::Bun => "bigint".to_string(),
+            DriverTarget::Postgres | DriverTarget::Pg => "string".to_string(),
+        },
+
+        // bytea -> Buffer for postgres/pg, Uint8Array for bun
+        "bytea" => match driver {
+            DriverTarget::Bun => "Uint8Array".to_string(),
+            DriverTarget::Postgres | DriverTarget::Pg => "Buffer".to_string(),
+        },
 
         // text, varchar, uuid -> string
         "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" | "uuid" | "citext" => {
@@ -59,16 +88,16 @@ pub fn normalize_pg_type_to_ts(pg_type: &str) -> String {
         // bool -> boolean
         "bool" | "boolean" => "boolean".to_string(),
 
-        // timestamptz, timestamp, date -> Date | string
+        // date -> string ("YYYY-MM-DD") across all drivers
+        "date" => "string".to_string(),
+
+        // timestamp, timestamptz -> Date across all drivers
         "timestamptz"
         | "timestamp with time zone"
         | "timestamp"
-        | "timestamp without time zone"
-        | "date"
-        | "time"
-        | "timetz"
-        | "time with time zone"
-        | "time without time zone" => "Date | string".to_string(),
+        | "timestamp without time zone" => "Date".to_string(),
+
+        "time" | "timetz" | "time with time zone" | "time without time zone" => "string".to_string(),
 
         // json, jsonb -> unknown
         "json" | "jsonb" => "unknown".to_string(),
@@ -101,14 +130,26 @@ pub fn extract_type_name(type_name: &pg_query::protobuf::TypeName) -> String {
 }
 
 impl Catalog {
-    /// Loads and executes all `.sql` migration files in `dir` sorted alphanumerically.
-    pub fn load_from_dir<P: AsRef<Path>>(dir: P) -> Result<Self, String> {
+    pub fn new(driver: DriverTarget) -> Self {
+        Self {
+            tables: HashMap::new(),
+            driver,
+        }
+    }
+
+    pub fn with_driver(mut self, driver: DriverTarget) -> Self {
+        self.driver = driver;
+        self
+    }
+
+    /// Loads and executes all `.sql` migration files in `dir` sorted alphanumerically with specified driver target.
+    pub fn load_from_dir_with_driver<P: AsRef<Path>>(dir: P, driver: DriverTarget) -> Result<Self, String> {
         let dir_path = dir.as_ref();
         if !dir_path.exists() {
             return Err(format!("Migrations directory does not exist: {}", dir_path.display()));
         }
 
-        let mut catalog = Catalog::default();
+        let mut catalog = Catalog::new(driver);
         let mut files: Vec<PathBuf> = Vec::new();
 
         for entry in walkdir::WalkDir::new(dir_path).follow_links(true) {
@@ -116,9 +157,9 @@ impl Catalog {
             let path = entry.path();
             if path.is_file()
                 && let Some(ext) = path.extension()
-                    && ext.eq_ignore_ascii_case("sql") {
-                        files.push(path.to_path_buf());
-                    }
+                && ext.eq_ignore_ascii_case("sql") {
+                    files.push(path.to_path_buf());
+                }
         }
 
         // Migrations MUST be sorted deterministically by filename/path before building the catalog
@@ -133,6 +174,11 @@ impl Catalog {
         }
 
         Ok(catalog)
+    }
+
+    /// Loads and executes all `.sql` migration files in `dir` sorted alphanumerically.
+    pub fn load_from_dir<P: AsRef<Path>>(dir: P) -> Result<Self, String> {
+        Self::load_from_dir_with_driver(dir, DriverTarget::default())
     }
 
     /// Parses SQL string and applies DDL statements to the catalog state.
@@ -185,7 +231,7 @@ impl Catalog {
                         .as_ref()
                         .map(extract_type_name)
                         .unwrap_or_else(|| "text".to_string());
-                    let ts_type = normalize_pg_type_to_ts(&pg_type);
+                    let ts_type = normalize_pg_type_to_ts(&pg_type, self.driver);
 
                     let mut is_not_null = col.is_not_null;
                     for c in &col.constraints {
@@ -256,8 +302,7 @@ impl Catalog {
                                 .as_ref()
                                 .map(extract_type_name)
                                 .unwrap_or_else(|| "text".to_string());
-                            let ts_type = normalize_pg_type_to_ts(&pg_type);
-
+                            let ts_type = normalize_pg_type_to_ts(&pg_type, self.driver);
                             let mut is_not_null = col.is_not_null;
                             for c in &col.constraints {
                                 if let Some(NodeEnum::Constraint(constr)) = &c.node
@@ -289,7 +334,7 @@ impl Catalog {
                                 .as_ref()
                                 .map(extract_type_name)
                                 .unwrap_or_else(|| "text".to_string());
-                            let ts_type = normalize_pg_type_to_ts(&pg_type);
+                            let ts_type = normalize_pg_type_to_ts(&pg_type, self.driver);
                             if let Some(existing_col) =
                                 table.columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(col_name))
                             {
@@ -380,7 +425,7 @@ mod tests {
         assert!(meta_col.is_nullable);
 
         let created_col = table.get_column("created_at").unwrap();
-        assert_eq!(created_col.ts_type, "Date | string");
+        assert_eq!(created_col.ts_type, "Date");
         assert!(!created_col.is_nullable);
     }
 

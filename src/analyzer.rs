@@ -1,5 +1,5 @@
 use crate::catalog::{extract_type_name, normalize_pg_type_to_ts, Catalog, ColumnMetadata, TableMetadata};
-use pg_query::protobuf::{AExprKind, JoinType};
+use pg_query::protobuf::{AExprKind, BoolExprType, JoinType, NullTestType};
 use pg_query::NodeEnum;
 use std::collections::HashMap;
 
@@ -8,6 +8,7 @@ pub struct QueryParam {
     pub index: usize,
     pub name: String,
     pub ts_type: String,
+    pub is_optional: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,13 @@ struct TableInScope {
     table_name: String,
     alias: String,
     is_nullable: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ParamInfo {
+    suggested_name: Option<String>,
+    inferred_type: Option<String>,
+    is_optional: bool,
 }
 
 /// Converts a string (e.g. "get_user_with_posts.sql" or "get_user") to PascalCase ("GetUserWithPosts").
@@ -129,7 +137,7 @@ pub fn analyze_query(
     }
 
     let select = select_stmt.ok_or_else(|| "No SELECT statement found in query".to_string())?;
-    let mut param_map: HashMap<i32, (Option<String>, Option<String>)> = HashMap::new();
+    let mut param_map: HashMap<i32, ParamInfo> = HashMap::new();
 
     let fields = analyze_select_stmt(select, catalog, &mut param_map)?;
 
@@ -141,8 +149,9 @@ pub fn analyze_query(
     let mut used_names: HashMap<String, usize> = HashMap::new();
 
     for idx in param_indices {
-        let (suggested_name, inferred_type) = param_map.get(&idx).unwrap();
-        let base_name = suggested_name
+        let info = param_map.get(&idx).unwrap();
+        let base_name = info
+            .suggested_name
             .clone()
             .unwrap_or_else(|| format!("param{}", idx));
 
@@ -158,7 +167,8 @@ pub fn analyze_query(
         params.push(QueryParam {
             index: idx as usize,
             name: final_name,
-            ts_type: inferred_type.clone().unwrap_or_else(|| "unknown".to_string()),
+            ts_type: info.inferred_type.clone().unwrap_or_else(|| "unknown".to_string()),
+            is_optional: info.is_optional,
         });
     }
 
@@ -173,7 +183,7 @@ pub fn analyze_query(
 fn analyze_select_stmt(
     select: &pg_query::protobuf::SelectStmt,
     catalog: &Catalog,
-    param_map: &mut HashMap<i32, (Option<String>, Option<String>)>,
+    param_map: &mut HashMap<i32, ParamInfo>,
 ) -> Result<Vec<QueryField>, String> {
     // Check if this SelectStmt is a setop (like UNION) where projections are in larg
     if select.target_list.is_empty()
@@ -242,12 +252,24 @@ fn analyze_select_stmt(
 
     if let Some(limit_node) = &select.limit_count
         && let Some(NodeEnum::ParamRef(p)) = &limit_node.node {
-            param_map.entry(p.number).or_insert((Some("limit".to_string()), Some("number".to_string())));
+            let entry = param_map.entry(p.number).or_default();
+            if entry.suggested_name.is_none() {
+                entry.suggested_name = Some("limit".to_string());
+            }
+            if entry.inferred_type.is_none() {
+                entry.inferred_type = Some("number".to_string());
+            }
         }
 
     if let Some(offset_node) = &select.limit_offset
         && let Some(NodeEnum::ParamRef(p)) = &offset_node.node {
-            param_map.entry(p.number).or_insert((Some("offset".to_string()), Some("number".to_string())));
+            let entry = param_map.entry(p.number).or_default();
+            if entry.suggested_name.is_none() {
+                entry.suggested_name = Some("offset".to_string());
+            }
+            if entry.inferred_type.is_none() {
+                entry.inferred_type = Some("number".to_string());
+            }
         }
 
     Ok(fields)
@@ -558,7 +580,7 @@ fn resolve_target(
                 .as_ref()
                 .map(extract_type_name)
                 .unwrap_or_else(|| "unknown".to_string());
-            let ts_type = normalize_pg_type_to_ts(&pg_type);
+            let ts_type = normalize_pg_type_to_ts(&pg_type, catalog.driver);
             fields.push(QueryField { name, ts_type });
             Ok(())
         }
@@ -693,14 +715,110 @@ fn extract_column_info(
     }
 }
 
+struct OptionalFilterMatch {
+    param_num: i32,
+    cast_opt: Option<String>,
+    alias_opt: Option<String>,
+    col_name: String,
+}
+
+fn match_null_test_param(node: &pg_query::protobuf::Node) -> Option<(i32, Option<String>)> {
+    if let Some(NodeEnum::NullTest(nt)) = &node.node
+        && nt.nulltesttype == NullTestType::IsNull as i32
+        && let Some(arg) = &nt.arg
+    {
+        return extract_param_info(arg);
+    }
+    None
+}
+
+fn match_equality_col_param(
+    node: &pg_query::protobuf::Node,
+) -> Option<(i32, Option<String>, Option<String>, String)> {
+    if let Some(NodeEnum::AExpr(ae)) = &node.node
+        && ae.kind == AExprKind::AexprOp as i32
+        && ae.name.first().and_then(extract_string).as_deref() == Some("=")
+    {
+        let param_opt_l = ae.lexpr.as_ref().and_then(|n| extract_param_info(n));
+        let col_opt_l = ae.lexpr.as_ref().and_then(|n| extract_column_info(n));
+
+        let param_opt_r = ae.rexpr.as_ref().and_then(|n| extract_param_info(n));
+        let col_opt_r = ae.rexpr.as_ref().and_then(|n| extract_column_info(n));
+
+        if let (Some((param_num, cast_opt)), Some((alias_opt, col_name))) =
+            (param_opt_r, col_opt_l)
+        {
+            return Some((param_num, cast_opt, alias_opt, col_name));
+        } else if let (Some((param_num, cast_opt)), Some((alias_opt, col_name))) =
+            (param_opt_l, col_opt_r)
+        {
+            return Some((param_num, cast_opt, alias_opt, col_name));
+        }
+    }
+    None
+}
+
+fn match_optional_filter(be: &pg_query::protobuf::BoolExpr) -> Option<OptionalFilterMatch> {
+    if be.boolop != BoolExprType::OrExpr as i32 || be.args.len() != 2 {
+        return None;
+    }
+
+    let arm0 = &be.args[0];
+    let arm1 = &be.args[1];
+
+    // Case 1: arm0 is NullTest($N), arm1 is col = $N
+    if let Some((p_null, cast_null)) = match_null_test_param(arm0)
+        && let Some((p_eq, cast_eq, alias_opt, col_name)) = match_equality_col_param(arm1)
+        && p_null == p_eq
+    {
+        let cast_opt = cast_null.or(cast_eq);
+        return Some(OptionalFilterMatch {
+            param_num: p_null,
+            cast_opt,
+            alias_opt,
+            col_name,
+        });
+    }
+
+    // Case 2: arm0 is col = $N, arm1 is NullTest($N)
+    if let Some((p_eq, cast_eq, alias_opt, col_name)) = match_equality_col_param(arm0)
+        && let Some((p_null, cast_null)) = match_null_test_param(arm1)
+        && p_null == p_eq
+    {
+        let cast_opt = cast_null.or(cast_eq);
+        return Some(OptionalFilterMatch {
+            param_num: p_null,
+            cast_opt,
+            alias_opt,
+            col_name,
+        });
+    }
+
+    None
+}
+
 fn resolve_params_in_expr(
     expr: &pg_query::protobuf::Node,
     catalog: &Catalog,
     tables: &[TableInScope],
-    param_map: &mut HashMap<i32, (Option<String>, Option<String>)>,
+    param_map: &mut HashMap<i32, ParamInfo>,
 ) -> Result<(), String> {
     match &expr.node {
         Some(NodeEnum::BoolExpr(be)) => {
+            if let Some(m) = match_optional_filter(be) {
+                record_param(
+                    m.param_num,
+                    m.cast_opt,
+                    m.alias_opt,
+                    &m.col_name,
+                    catalog,
+                    tables,
+                    param_map,
+                    true,
+                )?;
+                return Ok(());
+            }
+
             for arg in &be.args {
                 resolve_params_in_expr(arg, catalog, tables, param_map)?;
             }
@@ -724,6 +842,7 @@ fn resolve_params_in_expr(
                         catalog,
                         tables,
                         param_map,
+                        false,
                     )?;
                 } else if let (Some((param_num, cast_opt)), Some((alias_opt, col_name))) =
                     (param_opt_l, col_opt_r)
@@ -736,6 +855,7 @@ fn resolve_params_in_expr(
                         catalog,
                         tables,
                         param_map,
+                        false,
                     )?;
                 } else {
                     // Recurse both branches
@@ -755,17 +875,18 @@ fn resolve_params_in_expr(
                         .type_name
                         .as_ref()
                         .map(extract_type_name)
-                        .map(|t| normalize_pg_type_to_ts(&t));
-                    param_map
-                        .entry(p.number)
-                        .or_insert((None, ts_type));
+                        .map(|t| normalize_pg_type_to_ts(&t, catalog.driver));
+                    let entry = param_map.entry(p.number).or_default();
+                    if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
+                        entry.inferred_type = ts_type;
+                    }
                 } else {
                     resolve_params_in_expr(arg, catalog, tables, param_map)?;
                 }
             }
         }
         Some(NodeEnum::ParamRef(p)) => {
-            param_map.entry(p.number).or_insert((None, None));
+            param_map.entry(p.number).or_default();
         }
         Some(NodeEnum::NullTest(nt)) => {
             if let Some(arg) = &nt.arg {
@@ -777,6 +898,7 @@ fn resolve_params_in_expr(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_param(
     param_num: i32,
     cast_opt: Option<String>,
@@ -784,9 +906,10 @@ fn record_param(
     col_name: &str,
     catalog: &Catalog,
     tables: &[TableInScope],
-    param_map: &mut HashMap<i32, (Option<String>, Option<String>)>,
+    param_map: &mut HashMap<i32, ParamInfo>,
+    is_optional: bool,
 ) -> Result<(), String> {
-    let mut resolved_type: Option<String> = cast_opt.map(|c| normalize_pg_type_to_ts(&c));
+    let mut resolved_type: Option<String> = cast_opt.map(|c| normalize_pg_type_to_ts(&c, catalog.driver));
 
     // Lookup column to verify and get type if not explicitly cast
     let col_meta = if let Some(alias) = alias_opt {
@@ -815,12 +938,15 @@ fn record_param(
             resolved_type = Some(col.ts_type.clone());
         }
 
-    let entry = param_map.entry(param_num).or_insert((None, None));
-    if entry.0.is_none() {
-        entry.0 = Some(col_name.to_string());
+    let entry = param_map.entry(param_num).or_default();
+    if is_optional {
+        entry.is_optional = true;
     }
-    if entry.1.is_none() || entry.1.as_deref() == Some("unknown") {
-        entry.1 = resolved_type;
+    if entry.suggested_name.is_none() {
+        entry.suggested_name = Some(col_name.to_string());
+    }
+    if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
+        entry.inferred_type = resolved_type;
     }
 
     Ok(())
@@ -1069,5 +1195,36 @@ RIGHT JOIN posts p ON p.user_id = u.id;
         assert_eq!(analyzed.fields[2].ts_type, "string[] | null");
         assert_eq!(analyzed.fields[3].name, "defaults");
         assert_eq!(analyzed.fields[3].ts_type, "string[]");
+    }
+
+    #[test]
+    fn test_optional_dynamic_filter() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql("
+                CREATE TABLE users (
+                    id UUID PRIMARY KEY,
+                    name TEXT NOT NULL
+                );
+            ")
+            .unwrap();
+
+        let query_sql = "
+            SELECT id, name FROM users WHERE ($1::text IS NULL OR name = $1) AND id = $2;
+        ";
+        let analyzed = analyze_query(query_sql, &catalog, Some("optional_filter.sql")).unwrap();
+        assert_eq!(analyzed.params.len(), 2);
+
+        let p1 = &analyzed.params[0];
+        assert_eq!(p1.index, 1);
+        assert_eq!(p1.name, "name");
+        assert_eq!(p1.ts_type, "string");
+        assert!(p1.is_optional);
+
+        let p2 = &analyzed.params[1];
+        assert_eq!(p2.index, 2);
+        assert_eq!(p2.name, "id");
+        assert_eq!(p2.ts_type, "string");
+        assert!(!p2.is_optional);
     }
 }

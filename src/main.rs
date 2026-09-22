@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use sqltype::analyzer::analyze_query;
-use sqltype::catalog::Catalog;
+use sqltype::catalog::{Catalog, DriverTarget};
 use sqltype::codegen::generate_file_ts;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -28,6 +28,10 @@ enum Commands {
         /// Directory containing SQL query files
         #[arg(long, short = 'q')]
         queries: PathBuf,
+
+        /// Driver target profile (postgres, pg, bun)
+        #[arg(long, short = 'd', value_enum, default_value_t = DriverTarget::Postgres)]
+        driver: DriverTarget,
     },
     /// Emits .ts files for all valid queries
     Generate {
@@ -46,6 +50,10 @@ enum Commands {
         /// Watch for file changes and re-generate TypeScript types incrementally
         #[arg(long, short = 'w')]
         watch: bool,
+
+        /// Driver target profile (postgres, pg, bun)
+        #[arg(long, short = 'd', value_enum, default_value_t = DriverTarget::Postgres)]
+        driver: DriverTarget,
     },
 }
 
@@ -71,8 +79,8 @@ fn discover_sql_files<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-fn run_check(migrations_dir: &Path, queries_dir: &Path) -> Result<(), ()> {
-    let catalog = match Catalog::load_from_dir(migrations_dir) {
+fn run_check(migrations_dir: &Path, queries_dir: &Path, driver: DriverTarget) -> Result<(), ()> {
+    let catalog = match Catalog::load_from_dir_with_driver(migrations_dir, driver) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[Error] Failed to load migrations: {}", e);
@@ -138,8 +146,13 @@ fn run_check(migrations_dir: &Path, queries_dir: &Path) -> Result<(), ()> {
     }
 }
 
-fn run_generate(migrations_dir: &Path, queries_dir: &Path, out_dir: &Path) -> Result<(), ()> {
-    let catalog = match Catalog::load_from_dir(migrations_dir) {
+fn run_generate(
+    migrations_dir: &Path,
+    queries_dir: &Path,
+    out_dir: &Path,
+    driver: DriverTarget,
+) -> Result<(), ()> {
+    let catalog = match Catalog::load_from_dir_with_driver(migrations_dir, driver) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[Error] Failed to load migrations: {}", e);
@@ -236,16 +249,18 @@ fn main() {
         Commands::Check {
             migrations,
             queries,
-        } => run_check(&migrations, &queries),
+            driver,
+        } => run_check(&migrations, &queries, driver),
         Commands::Generate {
             migrations,
             queries,
             out,
             watch,
+            driver,
         } => {
-            let res = run_generate(&migrations, &queries, &out);
+            let res = run_generate(&migrations, &queries, &out, driver);
             if res.is_ok() && watch {
-                if let Err(e) = sqltype::watcher::run_watch(&migrations, &queries, &out) {
+                if let Err(e) = sqltype::watcher::run_watch(&migrations, &queries, &out, driver) {
                     eprintln!("[Watch Error] {}", e);
                     Err(())
                 } else {
