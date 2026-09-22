@@ -295,6 +295,34 @@ impl JoinKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOpKind {
+    None,
+    Union,
+    Intersect,
+    Except,
+}
+
+impl From<SetOperation> for SetOpKind {
+    fn from(op: SetOperation) -> Self {
+        match op {
+            SetOperation::SetopNone | SetOperation::Undefined => SetOpKind::None,
+            SetOperation::SetopUnion => SetOpKind::Union,
+            SetOperation::SetopIntersect => SetOpKind::Intersect,
+            SetOperation::SetopExcept => SetOpKind::Except,
+        }
+    }
+}
+
+impl SetOpKind {
+    pub fn from_i32(val: i32) -> Self {
+        match SetOperation::try_from(val) {
+            Ok(op) => SetOpKind::from(op),
+            Err(_) => SetOpKind::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TableBinding {
     pub base_table: String,
@@ -736,7 +764,7 @@ fn process_with_clause_with_params(
 
             // Check if recursive CTE: with_clause.recursive is true and query is a SetopUnion with larg & rarg
             let is_recursive_cte = with_clause.recursive
-                && cte_select.op == SetOperation::SetopUnion as i32
+                && SetOpKind::from(cte_select.op()) == SetOpKind::Union
                 && cte_select.larg.is_some()
                 && cte_select.rarg.is_some();
 
@@ -875,40 +903,175 @@ fn process_with_clause_with_params(
     Ok(())
 }
 
+fn validate_setop_sort_clause(
+    sort_clause: &[pg_query::protobuf::Node],
+    projected_columns: &[ColumnMetadata],
+) -> Result<(), String> {
+    for item in sort_clause {
+        let sb = match &item.node {
+            Some(NodeEnum::SortBy(sb)) => sb,
+            _ => {
+                return Err(
+                    "Only output column names or 1-based ordinals are allowed in set operation ORDER BY".to_string(),
+                );
+            }
+        };
+
+        let node = match &sb.node {
+            Some(n) => n,
+            None => {
+                return Err(
+                    "Only output column names or 1-based ordinals are allowed in set operation ORDER BY".to_string(),
+                );
+            }
+        };
+
+        match &node.node {
+            Some(NodeEnum::ColumnRef(cr)) => {
+                if cr.fields.len() > 1 {
+                    let full_name: Vec<String> =
+                        cr.fields.iter().filter_map(extract_string).collect();
+                    return Err(format!(
+                        "Qualified column name \"{}\" is not allowed in set operation ORDER BY",
+                        full_name.join(".")
+                    ));
+                }
+                if let Some(first) = cr.fields.first()
+                    && let Some(col_name) = extract_string(first)
+                    && !projected_columns
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(&col_name))
+                {
+                    return Err(format!(
+                        "Column \"{}\" in ORDER BY does not exist in set operation result",
+                        col_name
+                    ));
+                }
+            }
+            Some(NodeEnum::AConst(ac)) => {
+                if let Some(pg_query::protobuf::a_const::Val::Ival(int_val)) = &ac.val {
+                    let pos = int_val.ival;
+                    if pos < 1 || pos as usize > projected_columns.len() {
+                        return Err(format!(
+                            "ORDER BY position {} is out of range: must be between 1 and {}",
+                            pos,
+                            projected_columns.len()
+                        ));
+                    }
+                } else {
+                    return Err(
+                        "Only output column names or 1-based ordinals are allowed in set operation ORDER BY".to_string(),
+                    );
+                }
+            }
+            _ => {
+                return Err(
+                    "Only output column names or 1-based ordinals are allowed in set operation ORDER BY".to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn infer_select_projected_columns(
     select: &pg_query::protobuf::SelectStmt,
     catalog: &Catalog,
     parent_scope: &QueryScope,
     param_map: &mut HashMap<i32, ParamInfo>,
 ) -> Result<Vec<ColumnMetadata>, String> {
-    // Check if this SelectStmt is a setop (like UNION) where projections are in larg
-    if select.target_list.is_empty()
-        && let Some(l_sel) = &select.larg
-    {
-        let l_cols = infer_select_projected_columns(l_sel, catalog, parent_scope, param_map)?;
-        if let Some(r_sel) = &select.rarg {
-            let r_cols = infer_select_projected_columns(r_sel, catalog, parent_scope, param_map)?;
-            if l_cols.len() == r_cols.len() {
-                let mut unified_cols = Vec::new();
-                for (i, l_col) in l_cols.iter().enumerate() {
-                    let r_col = &r_cols[i];
-                    let l_pg = PgType::from_pg_str(&l_col.pg_type);
-                    let r_pg = PgType::from_pg_str(&r_col.pg_type);
-                    let unified_pg = unify_cte_types(&l_pg, &r_pg).unwrap_or(l_pg);
-                    let is_nullable = l_col.is_nullable || r_col.is_nullable;
-                    let ts_type = unified_pg.to_ts(catalog);
-                    unified_cols.push(ColumnMetadata {
-                        name: l_col.name.clone(),
-                        pg_type: unified_pg.to_pg_str(),
-                        ts_type,
-                        is_nullable,
-                        has_default: false,
-                    });
+    let op_kind = SetOpKind::from(select.op());
+    if op_kind != SetOpKind::None {
+        let mut query_scope = QueryScope::with_ctes_from(parent_scope);
+        if let Some(wc) = &select.with_clause {
+            process_with_clause_with_params(wc, &mut query_scope, catalog, param_map)?;
+        }
+
+        let left_stmt = select
+            .larg
+            .as_ref()
+            .ok_or_else(|| format!("Set operation {:?} missing left query", op_kind))?;
+        let right_stmt = select
+            .rarg
+            .as_ref()
+            .ok_or_else(|| format!("Set operation {:?} missing right query", op_kind))?;
+
+        let left_cols =
+            infer_select_projected_columns(left_stmt, catalog, &query_scope, param_map)?;
+        let right_cols =
+            infer_select_projected_columns(right_stmt, catalog, &query_scope, param_map)?;
+
+        if left_cols.len() != right_cols.len() {
+            return Err(format!(
+                "Each {:?} query must have the same number of columns: expected {}, found {}",
+                op_kind,
+                left_cols.len(),
+                right_cols.len()
+            ));
+        }
+
+        let mut unified_cols = Vec::with_capacity(left_cols.len());
+        for (i, left_col) in left_cols.iter().enumerate() {
+            let right_col = &right_cols[i];
+            let left_pg = PgType::from_pg_str(&left_col.pg_type);
+            let right_pg = PgType::from_pg_str(&right_col.pg_type);
+            let unified_pg = unify_types(&left_pg, &right_pg)?;
+
+            let is_nullable = match op_kind {
+                SetOpKind::Union => left_col.is_nullable || right_col.is_nullable,
+                SetOpKind::Intersect | SetOpKind::Except => left_col.is_nullable,
+                SetOpKind::None => unreachable!(),
+            };
+
+            let ts_type = unified_pg.to_ts(catalog);
+            unified_cols.push(ColumnMetadata {
+                name: left_col.name.clone(),
+                pg_type: unified_pg.to_pg_str(),
+                ts_type,
+                is_nullable,
+                has_default: false,
+            });
+        }
+
+        if !select.sort_clause.is_empty() {
+            validate_setop_sort_clause(&select.sort_clause, &unified_cols)?;
+        }
+
+        if let Some(limit_node) = &select.limit_count {
+            let param_num = if let Some(NodeEnum::ParamRef(p)) = &limit_node.node {
+                Some(p.number)
+            } else {
+                extract_param_info(limit_node).map(|(n, _)| n)
+            };
+            if let Some(num) = param_num {
+                let entry = param_map.entry(num).or_default();
+                if entry.suggested_name.is_none() {
+                    entry.suggested_name = Some("limit".to_string());
                 }
-                return Ok(unified_cols);
+                if entry.inferred_type.is_none() {
+                    entry.inferred_type = Some("number".to_string());
+                }
             }
         }
-        return Ok(l_cols);
+
+        if let Some(offset_node) = &select.limit_offset {
+            let param_num = if let Some(NodeEnum::ParamRef(p)) = &offset_node.node {
+                Some(p.number)
+            } else {
+                extract_param_info(offset_node).map(|(n, _)| n)
+            };
+            if let Some(num) = param_num {
+                let entry = param_map.entry(num).or_default();
+                if entry.suggested_name.is_none() {
+                    entry.suggested_name = Some("offset".to_string());
+                }
+                if entry.inferred_type.is_none() {
+                    entry.inferred_type = Some("number".to_string());
+                }
+            }
+        }
+
+        return Ok(unified_cols);
     }
 
     // 0. Register CTEs from with_clause
@@ -942,27 +1105,37 @@ fn infer_select_projected_columns(
         resolve_params_in_expr(where_node, catalog, &query_scope, param_map)?;
     }
 
-    if let Some(limit_node) = &select.limit_count
-        && let Some(NodeEnum::ParamRef(p)) = &limit_node.node
-    {
-        let entry = param_map.entry(p.number).or_default();
-        if entry.suggested_name.is_none() {
-            entry.suggested_name = Some("limit".to_string());
-        }
-        if entry.inferred_type.is_none() {
-            entry.inferred_type = Some("number".to_string());
+    if let Some(limit_node) = &select.limit_count {
+        let param_num = if let Some(NodeEnum::ParamRef(p)) = &limit_node.node {
+            Some(p.number)
+        } else {
+            extract_param_info(limit_node).map(|(n, _)| n)
+        };
+        if let Some(num) = param_num {
+            let entry = param_map.entry(num).or_default();
+            if entry.suggested_name.is_none() {
+                entry.suggested_name = Some("limit".to_string());
+            }
+            if entry.inferred_type.is_none() {
+                entry.inferred_type = Some("number".to_string());
+            }
         }
     }
 
-    if let Some(offset_node) = &select.limit_offset
-        && let Some(NodeEnum::ParamRef(p)) = &offset_node.node
-    {
-        let entry = param_map.entry(p.number).or_default();
-        if entry.suggested_name.is_none() {
-            entry.suggested_name = Some("offset".to_string());
-        }
-        if entry.inferred_type.is_none() {
-            entry.inferred_type = Some("number".to_string());
+    if let Some(offset_node) = &select.limit_offset {
+        let param_num = if let Some(NodeEnum::ParamRef(p)) = &offset_node.node {
+            Some(p.number)
+        } else {
+            extract_param_info(offset_node).map(|(n, _)| n)
+        };
+        if let Some(num) = param_num {
+            let entry = param_map.entry(num).or_default();
+            if entry.suggested_name.is_none() {
+                entry.suggested_name = Some("offset".to_string());
+            }
+            if entry.inferred_type.is_none() {
+                entry.inferred_type = Some("number".to_string());
+            }
         }
     }
 
@@ -3496,5 +3669,183 @@ RIGHT JOIN posts p ON p.user_id = u.id;
         ";
         let err = analyze_query(sql, &catalog, None).unwrap_err();
         assert!(err.contains("WITH query name \"a\" specified more than once"));
+    }
+
+    #[test]
+    fn test_setop_union_all_widening_and_nullability() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "
+            CREATE TABLE tbl_a (
+                id INT NOT NULL,
+                val VARCHAR(50) NOT NULL
+            );
+            CREATE TABLE tbl_b (
+                id BIGINT,
+                val TEXT
+            );
+        ",
+            )
+            .unwrap();
+
+        let query = "
+-- name: GetCombined
+SELECT id, val FROM tbl_a
+UNION ALL
+SELECT id, val FROM tbl_b;
+        ";
+        let analyzed = analyze_query(query, &catalog, None).unwrap();
+        assert_eq!(analyzed.fields.len(), 2);
+
+        // id: int4 + int8 -> int8. Is nullable because tbl_b.id is nullable
+        assert_eq!(analyzed.fields[0].name, "id");
+        assert_eq!(analyzed.fields[0].ts_type, "string | null");
+
+        // val: varchar + text -> text. Is nullable because tbl_b.val is nullable
+        assert_eq!(analyzed.fields[1].name, "val");
+        assert_eq!(analyzed.fields[1].ts_type, "string | null");
+    }
+
+    #[test]
+    fn test_setop_except_nullability_retainment() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "
+            CREATE TABLE active_users (
+                id UUID NOT NULL,
+                name TEXT NOT NULL
+            );
+            CREATE TABLE suspended_users (
+                id UUID,
+                name TEXT
+            );
+        ",
+            )
+            .unwrap();
+
+        let except_query = "
+-- name: GetActiveNotSuspended
+SELECT id, name FROM active_users
+EXCEPT
+SELECT id, name FROM suspended_users;
+        ";
+        let analyzed_except = analyze_query(except_query, &catalog, None).unwrap();
+        assert_eq!(analyzed_except.fields.len(), 2);
+        // Candidate rows strictly from left branch (active_users), which is NOT NULL
+        assert_eq!(analyzed_except.fields[0].name, "id");
+        assert_eq!(analyzed_except.fields[0].ts_type, "string");
+        assert_eq!(analyzed_except.fields[1].name, "name");
+        assert_eq!(analyzed_except.fields[1].ts_type, "string");
+
+        let intersect_query = "
+-- name: GetActiveAndSuspended
+SELECT id, name FROM active_users
+INTERSECT
+SELECT id, name FROM suspended_users;
+        ";
+        let analyzed_intersect = analyze_query(intersect_query, &catalog, None).unwrap();
+        assert_eq!(analyzed_intersect.fields.len(), 2);
+        assert_eq!(analyzed_intersect.fields[0].name, "id");
+        assert_eq!(analyzed_intersect.fields[0].ts_type, "string");
+        assert_eq!(analyzed_intersect.fields[1].name, "name");
+        assert_eq!(analyzed_intersect.fields[1].ts_type, "string");
+    }
+
+    #[test]
+    fn test_setop_column_count_mismatch() {
+        let catalog = Catalog::default();
+        let query = "
+SELECT 1 AS a, 2 AS b
+UNION
+SELECT 3 AS a;
+        ";
+        let err = analyze_query(query, &catalog, None).unwrap_err();
+        assert!(err.contains(
+            "Each Union query must have the same number of columns: expected 2, found 1"
+        ));
+    }
+
+    #[test]
+    fn test_setop_nested_tree() {
+        let catalog = setup_test_catalog();
+
+        let query = "
+-- name: GetNestedSet
+(
+    SELECT u.id, u.email FROM users u
+    UNION ALL
+    SELECT u.id, u.email FROM users u
+)
+EXCEPT
+SELECT u.id, u.email FROM users u
+ORDER BY email DESC, 1 ASC
+LIMIT $1 OFFSET $2;
+        ";
+        let analyzed = analyze_query(query, &catalog, None).unwrap();
+        assert_eq!(analyzed.name, "GetNestedSet");
+        assert_eq!(analyzed.fields.len(), 2);
+        assert_eq!(analyzed.fields[0].name, "id");
+        assert_eq!(analyzed.fields[0].ts_type, "string");
+        assert_eq!(analyzed.fields[1].name, "email");
+        assert_eq!(analyzed.fields[1].ts_type, "string");
+
+        // Validate parameter inference for LIMIT and OFFSET
+        assert_eq!(analyzed.params.len(), 2);
+        assert_eq!(analyzed.params[0].index, 1);
+        assert_eq!(analyzed.params[0].name, "limit");
+        assert_eq!(analyzed.params[0].ts_type, "number");
+        assert_eq!(analyzed.params[1].index, 2);
+        assert_eq!(analyzed.params[1].name, "offset");
+        assert_eq!(analyzed.params[1].ts_type, "number");
+    }
+
+    #[test]
+    fn test_setop_order_by_validation() {
+        let catalog = setup_test_catalog();
+
+        // 1. Qualified column name error
+        let err_qualified = analyze_query(
+            "SELECT id FROM users UNION SELECT id FROM users ORDER BY users.id;",
+            &catalog,
+            None,
+        )
+        .unwrap_err();
+        assert!(err_qualified.contains(
+            "Qualified column name \"users.id\" is not allowed in set operation ORDER BY"
+        ));
+
+        // 2. Nonexistent column name
+        let err_nonexistent = analyze_query(
+            "SELECT id FROM users UNION SELECT id FROM users ORDER BY non_existent_col;",
+            &catalog,
+            None,
+        )
+        .unwrap_err();
+        assert!(err_nonexistent.contains(
+            "Column \"non_existent_col\" in ORDER BY does not exist in set operation result"
+        ));
+
+        // 3. Positional ordinal out of range
+        let err_out_of_range = analyze_query(
+            "SELECT id FROM users UNION SELECT id FROM users ORDER BY 5;",
+            &catalog,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err_out_of_range
+                .contains("ORDER BY position 5 is out of range: must be between 1 and 1")
+        );
+
+        // 4. Positional ordinal 0 (out of range)
+        let err_zero = analyze_query(
+            "SELECT id FROM users UNION SELECT id FROM users ORDER BY 0;",
+            &catalog,
+            None,
+        )
+        .unwrap_err();
+        assert!(err_zero.contains("ORDER BY position 0 is out of range: must be between 1 and 1"));
     }
 }

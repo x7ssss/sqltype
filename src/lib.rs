@@ -6,8 +6,8 @@ pub mod ts_scanner;
 pub mod watcher;
 
 pub use analyzer::{
-    ColumnMeta, JoinKind, PgType, QueryScope, ScopeContext, TableBinding, unify_cte_types,
-    unify_types,
+    ColumnMeta, JoinKind, PgType, QueryScope, ScopeContext, SetOpKind, TableBinding,
+    unify_cte_types, unify_types,
 };
 pub use catalog::DriverTarget;
 pub use codegen::{CodegenOptions, get_output_file_name};
