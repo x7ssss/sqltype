@@ -8,6 +8,9 @@ on:
     branches:
       - main
 
+env:
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: "node24"
+
 jobs:
   test:
     name: Lint and Test
