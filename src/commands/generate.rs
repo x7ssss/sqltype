@@ -228,20 +228,7 @@ pub fn run_generate(
     );
 
     if args.watch {
-        let watch_out = args
-            .out
-            .as_deref()
-            .or(args.queries.as_deref())
-            .unwrap_or(Path::new("queries"));
-        let queries_dir = args.queries.as_deref().unwrap_or(Path::new("queries"));
-        crate::watcher::run_watch(
-            &migrations_dir,
-            queries_dir,
-            watch_out,
-            driver,
-            args.wrappers,
-        )
-        .map_err(|e| format!("Watch mode error: {}", e))?;
+        return crate::commands::watch::execute_watch(args, root, explicit_config);
     }
 
     Ok(())

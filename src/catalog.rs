@@ -69,6 +69,8 @@ pub struct Catalog {
     pub driver: DriverTarget,
 }
 
+pub type SchemaCatalog = Catalog;
+
 /// Normalizes PostgreSQL types to TypeScript primitives according to driver target specifications.
 pub fn normalize_pg_type_to_ts(pg_type: &str, driver: DriverTarget) -> String {
     let lower = pg_type.to_ascii_lowercase();

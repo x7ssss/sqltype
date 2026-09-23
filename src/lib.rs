@@ -12,7 +12,7 @@ pub use analyzer::{
     ColumnMeta, InferredType, JoinKind, PgType, QueryScope, ScopeContext, SetOpKind, TableBinding,
     unify_cte_types, unify_types,
 };
-pub use catalog::DriverTarget;
+pub use catalog::{Catalog, DriverTarget, SchemaCatalog};
 pub use cli::{CheckArgs, Cli, Commands, GenerateArgs, InitArgs, LspArgs};
 pub use codegen::{
     CodegenOptions, format_property_key, get_output_file_name, is_valid_js_identifier,

@@ -1,6 +1,7 @@
 pub mod check;
 pub mod generate;
 pub mod init;
+pub mod watch;
 
 use crate::config::SqltypeConfig;
 use crate::ts_scanner::{is_query_file, is_ts_js_file};

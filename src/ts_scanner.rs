@@ -25,6 +25,7 @@ pub fn is_query_file(path: &Path) -> bool {
     };
 
     if file_name.ends_with(".sqltype.ts")
+        || file_name.ends_with(".sql.ts")
         || file_name.ends_with(".generated.ts")
         || file_name.ends_with(".d.ts")
     {

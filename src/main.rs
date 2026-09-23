@@ -3,6 +3,7 @@ use sqltype::cli::{Cli, Commands};
 use sqltype::commands::check::run_check;
 use sqltype::commands::generate::run_generate;
 use sqltype::commands::init::run_init;
+use sqltype::commands::watch::execute_watch;
 use std::env;
 use std::process::ExitCode;
 
@@ -13,7 +14,14 @@ fn main() -> ExitCode {
     let res = match &cli.command {
         Commands::Init(args) => run_init(args),
         Commands::Check(args) => run_check(args, &root, cli.config.as_deref()),
-        Commands::Generate(args) => run_generate(args, &root, cli.config.as_deref()),
+        Commands::Generate(args) => {
+            if args.watch {
+                execute_watch(args, &root, cli.config.as_deref())
+            } else {
+                run_generate(args, &root, cli.config.as_deref())
+            }
+        }
+        Commands::Watch(args) => execute_watch(args, &root, cli.config.as_deref()),
         Commands::Lsp(args) => {
             let mig = if args.migrations.is_relative() {
                 root.join(&args.migrations)

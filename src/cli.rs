@@ -28,6 +28,9 @@ pub enum Commands {
     /// Compiles queries and emits TypeScript types and driver wrappers
     Generate(GenerateArgs),
 
+    /// Watch for file changes and re-generate TypeScript types incrementally
+    Watch(GenerateArgs),
+
     /// Starts the Language Server Protocol (LSP) server for IDE integration
     Lsp(LspArgs),
 }
@@ -93,7 +96,7 @@ pub struct GenerateArgs {
     pub out: Option<PathBuf>,
 
     /// Watch for file changes and re-generate TypeScript types incrementally
-    #[arg(long, short = 'W', default_value_t = false)]
+    #[arg(long, short = 'w', default_value_t = false)]
     pub watch: bool,
 
     /// Driver target profile (postgres, pg, bun)
@@ -101,7 +104,7 @@ pub struct GenerateArgs {
     pub driver: Option<DriverTarget>,
 
     /// Generate type-safe query execution wrappers
-    #[arg(long, short = 'w', default_value_t = false)]
+    #[arg(long, default_value_t = false)]
     pub wrappers: bool,
 
     /// Number of worker threads for parallel query analysis
