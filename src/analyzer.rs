@@ -65,6 +65,12 @@ pub enum PgType {
     JsonDynamicObject,
     Custom(String),
     Array(Box<PgType>),
+    Vector(Option<usize>),
+    HalfVec(Option<usize>),
+    Geometry,
+    Geography,
+    Box2D,
+    Box3D,
 }
 
 impl PgType {
@@ -74,7 +80,13 @@ impl PgType {
         if let Some(inner) = trimmed.strip_suffix("[]") {
             return PgType::Array(Box::new(PgType::from_pg_str(inner)));
         }
-        match trimmed {
+        let (base, typmod) = if let Some((head, rest)) = trimmed.split_once('(') {
+            let mod_str = rest.trim_end_matches(')').trim();
+            (head.trim(), Some(mod_str))
+        } else {
+            (trimmed, None)
+        };
+        match base {
             "int2" | "smallint" | "smallserial" => PgType::Int2,
             "int4" | "integer" | "int" | "serial" => PgType::Int4,
             "int8" | "bigint" | "bigserial" | "serial8" => PgType::Int8,
@@ -93,6 +105,18 @@ impl PgType {
             "bytea" => PgType::Bytea,
             "json" => PgType::JsonRaw,
             "jsonb" => PgType::JsonbRaw,
+            "vector" => {
+                let dim = typmod.and_then(|m| m.parse::<usize>().ok());
+                PgType::Vector(dim)
+            }
+            "halfvec" => {
+                let dim = typmod.and_then(|m| m.parse::<usize>().ok());
+                PgType::HalfVec(dim)
+            }
+            "geometry" => PgType::Geometry,
+            "geography" => PgType::Geography,
+            "box2d" => PgType::Box2D,
+            "box3d" => PgType::Box3D,
             "unknown" => PgType::Unknown,
             other => PgType::Custom(other.to_string()),
         }
@@ -149,6 +173,48 @@ impl PgType {
                     format!("{{ {} }}", inner)
                 }
             }
+            PgType::Vector(_) => {
+                if let Some(override_ts) = catalog.type_overrides.get("vector") {
+                    override_ts.clone()
+                } else {
+                    "number[]".to_string()
+                }
+            }
+            PgType::HalfVec(_) => {
+                if let Some(override_ts) = catalog.type_overrides.get("halfvec") {
+                    override_ts.clone()
+                } else {
+                    "number[]".to_string()
+                }
+            }
+            PgType::Geometry => {
+                if let Some(override_ts) = catalog.type_overrides.get("geometry") {
+                    override_ts.clone()
+                } else {
+                    "GeoJSON.Geometry".to_string()
+                }
+            }
+            PgType::Geography => {
+                if let Some(override_ts) = catalog.type_overrides.get("geography") {
+                    override_ts.clone()
+                } else {
+                    "GeoJSON.Geometry".to_string()
+                }
+            }
+            PgType::Box2D => {
+                if let Some(override_ts) = catalog.type_overrides.get("box2d") {
+                    override_ts.clone()
+                } else {
+                    "string".to_string()
+                }
+            }
+            PgType::Box3D => {
+                if let Some(override_ts) = catalog.type_overrides.get("box3d") {
+                    override_ts.clone()
+                } else {
+                    "string".to_string()
+                }
+            }
             PgType::Custom(name) => catalog.resolve_type(name),
             PgType::Array(inner) => {
                 format!("Array<{}>", inner.to_ts(catalog))
@@ -180,6 +246,14 @@ impl PgType {
             | PgType::JsonObject(_)
             | PgType::JsonArray(_)
             | PgType::JsonDynamicObject => "jsonb".to_string(),
+            PgType::Vector(None) => "vector".to_string(),
+            PgType::Vector(Some(d)) => format!("vector({})", d),
+            PgType::HalfVec(None) => "halfvec".to_string(),
+            PgType::HalfVec(Some(d)) => format!("halfvec({})", d),
+            PgType::Geometry => "geometry".to_string(),
+            PgType::Geography => "geography".to_string(),
+            PgType::Box2D => "box2d".to_string(),
+            PgType::Box3D => "box3d".to_string(),
             PgType::Custom(name) => name.clone(),
             PgType::Array(inner) => format!("{}[]", inner.to_pg_str()),
         }
@@ -281,6 +355,44 @@ pub fn unify_types(a: &PgType, b: &PgType) -> Result<PgType, String> {
         return Ok(PgType::Array(Box::new(inner)));
     }
 
+    // Vector types
+    if let (PgType::Vector(dim_a), PgType::Vector(dim_b)) = (a, b) {
+        if dim_a == dim_b {
+            return Ok(PgType::Vector(*dim_a));
+        }
+        if dim_a.is_none() {
+            return Ok(PgType::Vector(*dim_b));
+        }
+        if dim_b.is_none() {
+            return Ok(PgType::Vector(*dim_a));
+        }
+        return Ok(PgType::Vector(None));
+    }
+    if let (PgType::HalfVec(dim_a), PgType::HalfVec(dim_b)) = (a, b) {
+        if dim_a == dim_b {
+            return Ok(PgType::HalfVec(*dim_a));
+        }
+        if dim_a.is_none() {
+            return Ok(PgType::HalfVec(*dim_b));
+        }
+        if dim_b.is_none() {
+            return Ok(PgType::HalfVec(*dim_a));
+        }
+        return Ok(PgType::HalfVec(None));
+    }
+    if matches!(a, PgType::Geometry) && matches!(b, PgType::Geometry) {
+        return Ok(PgType::Geometry);
+    }
+    if matches!(a, PgType::Geography) && matches!(b, PgType::Geography) {
+        return Ok(PgType::Geography);
+    }
+    if matches!(a, PgType::Box2D) && matches!(b, PgType::Box2D) {
+        return Ok(PgType::Box2D);
+    }
+    if matches!(a, PgType::Box3D) && matches!(b, PgType::Box3D) {
+        return Ok(PgType::Box3D);
+    }
+
     // JSON types hierarchy & unification
     if is_json_type(a) && is_json_type(b) {
         return unify_json_types(a, b);
@@ -290,6 +402,59 @@ pub fn unify_types(a: &PgType, b: &PgType) -> Result<PgType, String> {
         "Cannot unify incompatible types: {:?} and {:?}",
         a, b
     ))
+}
+
+pub fn resolve_type_name(tn: &pg_query::protobuf::TypeName, catalog: &Catalog) -> PgType {
+    let mut names = Vec::new();
+    for node in &tn.names {
+        if let Some(NodeEnum::String(s)) = &node.node {
+            names.push(s.sval.as_str());
+        }
+    }
+
+    let base_name = names.last().copied().unwrap_or("text").to_ascii_lowercase();
+    let is_array = !tn.array_bounds.is_empty();
+
+    let mut inner = match base_name.as_str() {
+        "vector" => {
+            let dim = extract_typmod_dim(tn);
+            PgType::Vector(dim)
+        }
+        "halfvec" => {
+            let dim = extract_typmod_dim(tn);
+            PgType::HalfVec(dim)
+        }
+        "geometry" => PgType::Geometry,
+        "geography" => PgType::Geography,
+        "box2d" => PgType::Box2D,
+        "box3d" => PgType::Box3D,
+        _ => {
+            if let Some(ext_t) = catalog.extension_types.get(&base_name) {
+                ext_t.clone()
+            } else {
+                let full_str = extract_type_name(tn);
+                PgType::from_pg_str(&full_str)
+            }
+        }
+    };
+
+    if is_array && !matches!(inner, PgType::Array(_)) {
+        inner = PgType::Array(Box::new(inner));
+    }
+
+    inner
+}
+
+fn extract_typmod_dim(tn: &pg_query::protobuf::TypeName) -> Option<usize> {
+    for tm in &tn.typmods {
+        if let Some(NodeEnum::AConst(ac)) = &tm.node
+            && let Some(pg_query::protobuf::a_const::Val::Ival(iv)) = &ac.val
+            && iv.ival > 0
+        {
+            return Some(iv.ival as usize);
+        }
+    }
+    None
 }
 
 fn is_json_type(t: &PgType) -> bool {
@@ -2352,13 +2517,16 @@ fn infer_expr(
                 })
             }
         }
+        Some(NodeEnum::ParamRef(_)) => Ok(InferredExpr {
+            pg_type: PgType::Unknown,
+            is_nullable: false,
+        }),
         Some(NodeEnum::TypeCast(tc)) => {
-            let pg_type_str = tc
-                .type_name
-                .as_ref()
-                .map(extract_type_name)
-                .unwrap_or_else(|| "unknown".to_string());
-            let pg_type = PgType::from_pg_str(&pg_type_str);
+            let pg_type = if let Some(tn) = &tc.type_name {
+                resolve_type_name(tn, catalog)
+            } else {
+                PgType::Unknown
+            };
             let is_nullable = if let Some(arg) = &tc.arg {
                 if let Some(NodeEnum::AConst(ac)) = &arg.node {
                     ac.isnull
@@ -2647,10 +2815,37 @@ fn infer_expr(
                             is_nullable: !has_non_nullable,
                         })
                     }
-                    _ => Ok(InferredExpr {
-                        pg_type: PgType::Unknown,
-                        is_nullable: true,
-                    }),
+                    _ => {
+                        let arg_types: Vec<PgType> = fc
+                            .args
+                            .iter()
+                            .map(|arg| {
+                                infer_expr(arg, catalog, scope)
+                                    .map(|inf| inf.pg_type)
+                                    .unwrap_or(PgType::Unknown)
+                            })
+                            .collect();
+                        if let Some(fn_def) =
+                            catalog.resolve_function_with_args(&func_name, &arg_types)
+                        {
+                            let mut is_nullable = false;
+                            for arg in &fc.args {
+                                if let Ok(inf) = infer_expr(arg, catalog, scope)
+                                    && inf.is_nullable
+                                {
+                                    is_nullable = true;
+                                }
+                            }
+                            return Ok(InferredExpr {
+                                pg_type: fn_def.returns.clone(),
+                                is_nullable,
+                            });
+                        }
+                        Ok(InferredExpr {
+                            pg_type: PgType::Unknown,
+                            is_nullable: true,
+                        })
+                    }
                 }
             }
         }
@@ -2829,6 +3024,10 @@ fn infer_expr(
                     let pg_type =
                         if is_numeric_type(&l_inf.pg_type) && is_numeric_type(&r_inf.pg_type) {
                             unify_types(&l_inf.pg_type, &r_inf.pg_type).unwrap_or(PgType::Numeric)
+                        } else if let Some(ext_op) =
+                            catalog.resolve_operator(&op, &l_inf.pg_type, &r_inf.pg_type)
+                        {
+                            ext_op.returns.clone()
                         } else {
                             PgType::Numeric
                         };
@@ -2884,6 +3083,14 @@ fn infer_expr(
                 }
                 _ => {
                     let is_nullable = l_inf.is_nullable || r_inf.is_nullable;
+                    if let Some(ext_op) =
+                        catalog.resolve_operator(&op, &l_inf.pg_type, &r_inf.pg_type)
+                    {
+                        return Ok(InferredType {
+                            pg_type: ext_op.returns.clone(),
+                            is_nullable,
+                        });
+                    }
                     Ok(InferredType {
                         pg_type: PgType::Unknown,
                         is_nullable,
@@ -3389,17 +3596,75 @@ fn resolve_params_in_expr(
                 let col_opt_r = ae.rexpr.as_ref().and_then(|n| extract_column_info(n));
 
                 if let (Some((param_num, cast_opt)), Some((alias_opt, col_name))) =
-                    (param_opt_r, col_opt_l)
+                    (&param_opt_r, &col_opt_l)
                 {
                     record_param(
-                        param_num, cast_opt, alias_opt, &col_name, catalog, scope, param_map, false,
+                        *param_num,
+                        cast_opt.clone(),
+                        alias_opt.clone(),
+                        col_name,
+                        catalog,
+                        scope,
+                        param_map,
+                        false,
                     )?;
                 } else if let (Some((param_num, cast_opt)), Some((alias_opt, col_name))) =
-                    (param_opt_l, col_opt_r)
+                    (&param_opt_l, &col_opt_r)
                 {
                     record_param(
-                        param_num, cast_opt, alias_opt, &col_name, catalog, scope, param_map, false,
+                        *param_num,
+                        cast_opt.clone(),
+                        alias_opt.clone(),
+                        col_name,
+                        catalog,
+                        scope,
+                        param_map,
+                        false,
                     )?;
+                } else if let Some((param_num, cast_opt)) = param_opt_r
+                    && let Some(lexpr) = &ae.lexpr
+                    && let Ok(l_inf) = infer_expr(lexpr, catalog, scope)
+                    && l_inf.pg_type != PgType::Unknown
+                    && let Some(ext_op) =
+                        catalog.resolve_operator(&op, &l_inf.pg_type, &PgType::Unknown)
+                {
+                    let ts_type = cast_opt
+                        .map(|c| catalog.resolve_type(&c))
+                        .unwrap_or_else(|| {
+                            if matches!(ext_op.right, PgType::Vector(_) | PgType::HalfVec(_)) {
+                                l_inf.pg_type.to_ts(catalog)
+                            } else {
+                                ext_op.right.to_ts(catalog)
+                            }
+                        });
+                    let entry = param_map.entry(param_num).or_default();
+                    if entry.inferred_type.is_none()
+                        || entry.inferred_type.as_deref() == Some("unknown")
+                    {
+                        entry.inferred_type = Some(ts_type);
+                    }
+                } else if let Some((param_num, cast_opt)) = param_opt_l
+                    && let Some(rexpr) = &ae.rexpr
+                    && let Ok(r_inf) = infer_expr(rexpr, catalog, scope)
+                    && r_inf.pg_type != PgType::Unknown
+                    && let Some(ext_op) =
+                        catalog.resolve_operator(&op, &PgType::Unknown, &r_inf.pg_type)
+                {
+                    let ts_type = cast_opt
+                        .map(|c| catalog.resolve_type(&c))
+                        .unwrap_or_else(|| {
+                            if matches!(ext_op.left, PgType::Vector(_) | PgType::HalfVec(_)) {
+                                r_inf.pg_type.to_ts(catalog)
+                            } else {
+                                ext_op.left.to_ts(catalog)
+                            }
+                        });
+                    let entry = param_map.entry(param_num).or_default();
+                    if entry.inferred_type.is_none()
+                        || entry.inferred_type.as_deref() == Some("unknown")
+                    {
+                        entry.inferred_type = Some(ts_type);
+                    }
                 } else {
                     // Recurse both branches
                     if let Some(lexpr) = &ae.lexpr {
@@ -3472,8 +3737,45 @@ fn resolve_params_in_expr(
             }
         }
         Some(NodeEnum::FuncCall(fc)) => {
-            for arg in &fc.args {
-                resolve_params_in_expr(arg, catalog, scope, param_map)?;
+            let func_name = extract_func_name(&fc.funcname);
+            let arg_types: Vec<PgType> = fc
+                .args
+                .iter()
+                .map(|arg| {
+                    infer_expr(arg, catalog, scope)
+                        .map(|inf| inf.pg_type)
+                        .unwrap_or(PgType::Unknown)
+                })
+                .collect();
+
+            let fn_def = catalog.resolve_function_with_args(&func_name, &arg_types);
+
+            for (i, arg) in fc.args.iter().enumerate() {
+                if let Some((param_num, cast_opt)) = extract_param_info(arg) {
+                    let expected_type = fn_def.and_then(|f| {
+                        if i < f.params.len() {
+                            Some(&f.params[i])
+                        } else if f.variadic && !f.params.is_empty() {
+                            f.params.last()
+                        } else {
+                            None
+                        }
+                    });
+
+                    let resolved = cast_opt
+                        .map(|c| catalog.resolve_type(&c))
+                        .or_else(|| expected_type.map(|t| t.to_ts(catalog)));
+
+                    let entry = param_map.entry(param_num).or_default();
+                    if (entry.inferred_type.is_none()
+                        || entry.inferred_type.as_deref() == Some("unknown"))
+                        && resolved.is_some()
+                    {
+                        entry.inferred_type = resolved;
+                    }
+                } else {
+                    resolve_params_in_expr(arg, catalog, scope, param_map)?;
+                }
             }
         }
         Some(NodeEnum::SubLink(sl)) => {
@@ -3593,7 +3895,7 @@ fn record_param(
     if let Some(col) = col_meta
         && resolved_type.is_none()
     {
-        resolved_type = Some(col.ts_type.clone());
+        resolved_type = Some(catalog.resolve_type(&col.pg_type));
     }
 
     let entry = param_map.entry(param_num).or_default();
@@ -5084,5 +5386,91 @@ FROM users u;
         assert_eq!(analyzed2.fields[0].ts_type, "Array<string>");
         assert_eq!(analyzed2.fields[1].name, "empty_ints");
         assert_eq!(analyzed2.fields[1].ts_type, "Array<number>");
+    }
+
+    #[test]
+    fn test_pgvector_query_analysis() {
+        let ddl = "CREATE EXTENSION IF NOT EXISTS vector; CREATE TABLE items (id serial PRIMARY KEY, embedding vector(1536) NOT NULL);";
+        let mut catalog = Catalog::default();
+        catalog.apply_sql(ddl).unwrap();
+
+        let query = "SELECT id, embedding <=> $1 AS distance FROM items ORDER BY distance LIMIT 5;";
+        let analyzed = analyze_query(query, &catalog, None).unwrap();
+
+        // Verify fields
+        assert_eq!(analyzed.fields.len(), 2);
+        assert_eq!(analyzed.fields[0].name, "id");
+        assert_eq!(analyzed.fields[0].ts_type, "number");
+        assert_eq!(analyzed.fields[1].name, "distance");
+        assert_eq!(analyzed.fields[1].ts_type, "number");
+
+        // Verify $1 parameter
+        assert_eq!(analyzed.params.len(), 1);
+        assert_eq!(analyzed.params[0].index, 1);
+        assert_eq!(analyzed.params[0].ts_type, "number[]");
+    }
+
+    #[test]
+    fn test_pgvector_with_type_override() {
+        let ddl = "CREATE EXTENSION IF NOT EXISTS vector; CREATE TABLE items (id serial PRIMARY KEY, embedding vector(1536) NOT NULL);";
+        let mut catalog = Catalog::default();
+        catalog.apply_sql(ddl).unwrap();
+        catalog
+            .type_overrides
+            .insert("vector".to_string(), "Float32Array".to_string());
+
+        let query = "SELECT id, embedding <=> $1 AS distance FROM items ORDER BY distance LIMIT 5;";
+        let analyzed = analyze_query(query, &catalog, None).unwrap();
+
+        assert_eq!(analyzed.params.len(), 1);
+        assert_eq!(analyzed.params[0].index, 1);
+        assert_eq!(analyzed.params[0].ts_type, "Float32Array");
+        assert_eq!(analyzed.fields[1].ts_type, "number");
+    }
+
+    #[test]
+    fn test_postgis_query_analysis() {
+        let ddl = "CREATE EXTENSION IF NOT EXISTS postgis; CREATE TABLE places (id serial, location geometry(Point, 4326) NOT NULL);";
+        let mut catalog = Catalog::default();
+        catalog.apply_sql(ddl).unwrap();
+
+        let query = "SELECT id FROM places WHERE ST_DWithin(location, ST_MakePoint($1, $2), $3);";
+        let analyzed = analyze_query(query, &catalog, None).unwrap();
+
+        // Verify output field
+        assert_eq!(analyzed.fields.len(), 1);
+        assert_eq!(analyzed.fields[0].name, "id");
+        assert_eq!(analyzed.fields[0].ts_type, "number");
+
+        // Verify parameters: $1: number, $2: number, $3: number
+        assert_eq!(analyzed.params.len(), 3);
+        let mut sorted_params = analyzed.params.clone();
+        sorted_params.sort_by_key(|p| p.index);
+        assert_eq!(sorted_params[0].index, 1);
+        assert_eq!(sorted_params[0].ts_type, "number");
+        assert_eq!(sorted_params[1].index, 2);
+        assert_eq!(sorted_params[1].ts_type, "number");
+        assert_eq!(sorted_params[2].index, 3);
+        assert_eq!(sorted_params[2].ts_type, "number");
+    }
+
+    #[test]
+    fn test_postgis_operators_and_functions() {
+        let ddl = "CREATE EXTENSION IF NOT EXISTS postgis; CREATE TABLE places (id serial, location geometry(Point, 4326) NOT NULL);";
+        let mut catalog = Catalog::default();
+        catalog.apply_sql(ddl).unwrap();
+
+        let query = "SELECT location <-> ST_MakePoint($1, $2) AS dist, ST_AsGeoJSON(location) AS geojson FROM places;";
+        let analyzed = analyze_query(query, &catalog, None).unwrap();
+
+        assert_eq!(analyzed.fields.len(), 2);
+        assert_eq!(analyzed.fields[0].name, "dist");
+        assert_eq!(analyzed.fields[0].ts_type, "number");
+        assert_eq!(analyzed.fields[1].name, "geojson");
+        assert_eq!(analyzed.fields[1].ts_type, "string");
+
+        assert_eq!(analyzed.params.len(), 2);
+        assert_eq!(analyzed.params[0].ts_type, "number");
+        assert_eq!(analyzed.params[1].ts_type, "number");
     }
 }

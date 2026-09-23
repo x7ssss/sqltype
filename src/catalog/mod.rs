@@ -1,7 +1,12 @@
 use pg_query::NodeEnum;
 use pg_query::protobuf::{AlterTableType, ConstrType};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+use crate::analyzer::PgType;
+use crate::catalog::extensions::{ExtensionFunction, ExtensionOperator};
+
+pub mod extensions;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnMetadata {
@@ -67,9 +72,36 @@ pub struct Catalog {
     pub tables: HashMap<String, TableMetadata>,
     pub enums: HashMap<String, Vec<String>>,
     pub driver: DriverTarget,
+    pub type_overrides: HashMap<String, String>,
+    pub extensions: HashSet<String>,
+    pub extension_types: HashMap<String, PgType>,
+    pub extension_operators: Vec<ExtensionOperator>,
+    pub extension_functions: HashMap<String, Vec<ExtensionFunction>>,
 }
 
 pub type SchemaCatalog = Catalog;
+
+pub fn is_type_compatible(actual: &PgType, expected: &PgType) -> bool {
+    if actual == expected {
+        return true;
+    }
+    if *actual == PgType::Unknown || *expected == PgType::Unknown {
+        return true;
+    }
+    match (actual, expected) {
+        (PgType::Vector(_), PgType::Vector(_)) => true,
+        (PgType::HalfVec(_), PgType::HalfVec(_)) => true,
+        (PgType::Geometry, PgType::Geometry) => true,
+        (PgType::Geography, PgType::Geography) => true,
+        (PgType::Box2D, PgType::Box2D) => true,
+        (PgType::Box3D, PgType::Box3D) => true,
+        (a, PgType::Float8) if crate::analyzer::is_numeric_type(a) => true,
+        (a, PgType::Numeric) if crate::analyzer::is_numeric_type(a) => true,
+        (a, PgType::Int4) if crate::analyzer::is_numeric_type(a) => true,
+        (PgType::Text | PgType::Varchar, PgType::Text) => true,
+        _ => false,
+    }
+}
 
 /// Normalizes PostgreSQL types to TypeScript primitives according to driver target specifications.
 pub fn normalize_pg_type_to_ts(pg_type: &str, driver: DriverTarget) -> String {
@@ -82,7 +114,13 @@ pub fn normalize_pg_type_to_ts(pg_type: &str, driver: DriverTarget) -> String {
         return format!("{}[]", inner_ts);
     }
 
-    match lower {
+    let base = if let Some((head, _)) = lower.split_once('(') {
+        head.trim()
+    } else {
+        lower
+    };
+
+    match base {
         // int2, int4, float4, float8 -> number
         "int2" | "smallint" | "smallserial" => "number".to_string(),
         "int4" | "integer" | "int" | "serial" => "number".to_string(),
@@ -125,6 +163,15 @@ pub fn normalize_pg_type_to_ts(pg_type: &str, driver: DriverTarget) -> String {
         // json, jsonb -> unknown
         "json" | "jsonb" => "unknown".to_string(),
 
+        // pgvector
+        "vector" | "halfvec" => "number[]".to_string(),
+
+        // PostGIS
+        "geometry" | "geography" => "GeoJSON.Geometry".to_string(),
+
+        // Spatial box types
+        "box2d" | "box3d" => "string".to_string(),
+
         _ => "unknown".to_string(),
     }
 }
@@ -145,10 +192,33 @@ pub fn extract_type_name(type_name: &pg_query::protobuf::TypeName) -> String {
         "text"
     };
 
+    let mut typmod_str = String::new();
+    if !type_name.typmods.is_empty()
+        && (base_name.eq_ignore_ascii_case("vector") || base_name.eq_ignore_ascii_case("halfvec"))
+    {
+        let mut parts = Vec::new();
+        for tm in &type_name.typmods {
+            if let Some(NodeEnum::AConst(ac)) = &tm.node
+                && let Some(val) = &ac.val
+            {
+                match val {
+                    pg_query::protobuf::a_const::Val::Ival(i) => parts.push(i.ival.to_string()),
+                    pg_query::protobuf::a_const::Val::Sval(s) => parts.push(s.sval.clone()),
+                    _ => {}
+                }
+            }
+        }
+        if !parts.is_empty() {
+            typmod_str = format!("({})", parts.join(", "));
+        }
+    }
+
+    let full_name = format!("{}{}", base_name, typmod_str);
+
     if !type_name.array_bounds.is_empty() {
-        format!("{}[]", base_name)
+        format!("{}[]", full_name)
     } else {
-        base_name.to_string()
+        full_name
     }
 }
 
@@ -158,6 +228,65 @@ impl Catalog {
             tables: HashMap::new(),
             enums: HashMap::new(),
             driver,
+            type_overrides: HashMap::new(),
+            extensions: HashSet::new(),
+            extension_types: HashMap::new(),
+            extension_operators: Vec::new(),
+            extension_functions: HashMap::new(),
+        }
+    }
+
+    pub fn with_overrides(mut self, overrides: HashMap<String, String>) -> Self {
+        self.type_overrides = overrides;
+        self
+    }
+
+    pub fn resolve_operator(
+        &self,
+        op_name: &str,
+        left: &PgType,
+        right: &PgType,
+    ) -> Option<&ExtensionOperator> {
+        self.extension_operators.iter().find(|op| {
+            op.name == op_name
+                && is_type_compatible(left, &op.left)
+                && is_type_compatible(right, &op.right)
+        })
+    }
+
+    pub fn resolve_function(&self, name: &str, arg_count: usize) -> Option<&ExtensionFunction> {
+        if let Some(funcs) = self.extension_functions.get(&name.to_ascii_lowercase()) {
+            funcs
+                .iter()
+                .find(|f| f.variadic || f.params.len() == arg_count)
+        } else {
+            None
+        }
+    }
+
+    pub fn resolve_function_with_args(
+        &self,
+        name: &str,
+        arg_types: &[PgType],
+    ) -> Option<&ExtensionFunction> {
+        if let Some(funcs) = self.extension_functions.get(&name.to_ascii_lowercase()) {
+            for f in funcs {
+                if f.variadic || f.params.len() == arg_types.len() {
+                    let matches = f
+                        .params
+                        .iter()
+                        .zip(arg_types.iter())
+                        .all(|(expected, actual)| is_type_compatible(actual, expected));
+                    if matches {
+                        return Some(f);
+                    }
+                }
+            }
+            funcs
+                .iter()
+                .find(|f| f.variadic || f.params.len() == arg_types.len())
+        } else {
+            None
         }
     }
 
@@ -176,7 +305,21 @@ impl Catalog {
             }
         }
 
-        if let Some(vals) = self.enums.get(lower) {
+        let base = if let Some((head, _)) = lower.split_once('(') {
+            head.trim()
+        } else {
+            lower
+        };
+
+        if let Some(override_ts) = self
+            .type_overrides
+            .get(base)
+            .or_else(|| self.type_overrides.get(lower))
+        {
+            return override_ts.clone();
+        }
+
+        if let Some(vals) = self.enums.get(lower).or_else(|| self.enums.get(base)) {
             if vals.is_empty() {
                 return "string".to_string();
             }
@@ -262,9 +405,51 @@ impl Catalog {
                     Some(NodeEnum::CreateEnumStmt(create_enum)) => {
                         self.handle_create_enum_stmt(create_enum)?;
                     }
+                    Some(NodeEnum::CreateExtensionStmt(create_ext)) => {
+                        self.handle_create_extension_stmt(create_ext)?;
+                    }
                     _ => {}
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn handle_create_extension_stmt(
+        &mut self,
+        stmt: &pg_query::protobuf::CreateExtensionStmt,
+    ) -> Result<(), String> {
+        let name = stmt.extname.to_ascii_lowercase();
+        if self.extensions.contains(&name) {
+            if stmt.if_not_exists {
+                return Ok(());
+            } else {
+                return Err(format!("Extension \"{}\" already exists", name));
+            }
+        }
+
+        let registry = extensions::ExtensionRegistry::default();
+        if let Some(ext_def) = registry.get(&name) {
+            self.extensions.insert(name);
+            for ext_type in ext_def.types() {
+                self.extension_types
+                    .insert(ext_type.name.to_ascii_lowercase(), ext_type.pg_type.clone());
+                for alias in ext_type.aliases {
+                    self.extension_types
+                        .insert(alias.to_ascii_lowercase(), ext_type.pg_type.clone());
+                }
+            }
+            for op in ext_def.operators() {
+                self.extension_operators.push(op);
+            }
+            for func in ext_def.functions() {
+                self.extension_functions
+                    .entry(func.name.to_ascii_lowercase())
+                    .or_default()
+                    .push(func);
+            }
+        } else {
+            self.extensions.insert(name);
         }
         Ok(())
     }
@@ -322,7 +507,16 @@ impl Catalog {
                         .unwrap_or_else(|| "text".to_string());
                     let ts_type = self.resolve_type(&pg_type);
 
-                    let mut is_not_null = col.is_not_null;
+                    let mut is_not_null = col.is_not_null
+                        || matches!(
+                            pg_type.to_ascii_lowercase().as_str(),
+                            "serial"
+                                | "bigserial"
+                                | "smallserial"
+                                | "serial8"
+                                | "serial4"
+                                | "serial2"
+                        );
                     let mut has_default = matches!(
                         pg_type.to_ascii_lowercase().as_str(),
                         "serial" | "bigserial" | "smallserial" | "serial8" | "serial4" | "serial2"
@@ -407,7 +601,16 @@ impl Catalog {
                             .map(extract_type_name)
                             .unwrap_or_else(|| "text".to_string());
                         let ts_type = self.resolve_type(&pg_type);
-                        let mut is_not_null = col.is_not_null;
+                        let mut is_not_null = col.is_not_null
+                            || matches!(
+                                pg_type.to_ascii_lowercase().as_str(),
+                                "serial"
+                                    | "bigserial"
+                                    | "smallserial"
+                                    | "serial8"
+                                    | "serial4"
+                                    | "serial2"
+                            );
                         let mut has_default = matches!(
                             pg_type.to_ascii_lowercase().as_str(),
                             "serial"
