@@ -88,6 +88,8 @@ jobs:
     permissions:
       contents: write
       id-token: write
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
     steps:
       - name: Checkout repository
@@ -96,8 +98,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20.x"
-          registry-url: "https://registry.npmjs.org"
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
 
       - name: Download all binary artifacts
         uses: actions/download-artifact@v4
@@ -134,8 +136,8 @@ jobs:
             # Update package.json version
             npm version "$VERSION" --prefix "$PKG_DIR" --no-git-tag-version --allow-same-version
 
-            # Publish platform package with provenance
-            npm publish "$PKG_DIR" --access public --provenance
+            # Publish platform package
+            npm publish "$PKG_DIR" --access public
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -159,8 +161,8 @@ jobs:
             require('fs').writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
           "
 
-          # Publish root package with provenance
-          npm publish "$PKG_DIR" --access public --provenance
+          # Publish root package
+          npm publish "$PKG_DIR" --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
