@@ -213,6 +213,22 @@ pub fn run_generate(
                         )
                     })?;
                     println!("  Generated: {}", out_file_path.display());
+
+                    // Also emit companion .sql.ts if not declaration-only
+                    if !declaration_only {
+                        let sql_ts_path = if let Some(out) = &args.out {
+                            let queries_base =
+                                args.queries.as_deref().unwrap_or(Path::new("queries"));
+                            let rel_path = file.strip_prefix(queries_base).unwrap_or(file);
+                            out.join(rel_path).with_extension("sql.ts")
+                        } else {
+                            file.with_extension("sql.ts")
+                        };
+                        if sql_ts_path != out_file_path {
+                            let _ = atomic_write(&sql_ts_path, &ts_code);
+                        }
+                    }
+
                     generated_file_count += 1;
                 }
             }
