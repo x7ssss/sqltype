@@ -98,6 +98,17 @@ impl PgType {
         }
     }
 
+    pub fn element_type(&self) -> Option<&PgType> {
+        match self {
+            PgType::Array(inner) => Some(inner.as_ref()),
+            _ => None,
+        }
+    }
+
+    pub fn to_array(&self) -> PgType {
+        PgType::Array(Box::new(self.clone()))
+    }
+
     pub fn to_ts(&self, catalog: &Catalog) -> String {
         match self {
             PgType::Unknown => "unknown".to_string(),
@@ -140,12 +151,7 @@ impl PgType {
             }
             PgType::Custom(name) => catalog.resolve_type(name),
             PgType::Array(inner) => {
-                let inner_ts = inner.to_ts(catalog);
-                if inner_ts.contains('|') {
-                    format!("({})[]", inner_ts)
-                } else {
-                    format!("{}[]", inner_ts)
-                }
+                format!("Array<{}>", inner.to_ts(catalog))
             }
         }
     }
@@ -1880,6 +1886,9 @@ fn resolve_from_clause_node(
         Some(NodeEnum::RangeSubselect(rss)) => {
             resolve_range_subselect(rss, catalog, active_scope, param_map)
         }
+        Some(NodeEnum::RangeFunction(rf)) => {
+            resolve_range_function(rf, catalog, active_scope, param_map)
+        }
         _ => Ok(QueryScope::default()),
     }
 }
@@ -2186,6 +2195,99 @@ fn resolve_range_subselect(
         .insert(alias_name.to_ascii_lowercase(), col_names);
     scope.add_binding(binding)?;
     Ok(scope)
+}
+
+fn extract_func_call_from_range_function(
+    rf: &pg_query::protobuf::RangeFunction,
+) -> Option<&pg_query::protobuf::FuncCall> {
+    for func_node in &rf.functions {
+        if let Some(NodeEnum::List(list)) = &func_node.node
+            && let Some(first) = list.items.first()
+            && let Some(NodeEnum::FuncCall(fc)) = &first.node
+        {
+            return Some(fc);
+        } else if let Some(NodeEnum::FuncCall(fc)) = &func_node.node {
+            return Some(fc);
+        }
+    }
+    None
+}
+
+fn resolve_range_function(
+    rf: &pg_query::protobuf::RangeFunction,
+    catalog: &mut Catalog,
+    active_scope: &QueryScope,
+    param_map: &mut HashMap<i32, ParamInfo>,
+) -> Result<QueryScope, String> {
+    let fc = match extract_func_call_from_range_function(rf) {
+        Some(fc) => fc,
+        None => return Ok(QueryScope::default()),
+    };
+
+    let func_name = extract_func_name(&fc.funcname);
+    if func_name.eq_ignore_ascii_case("unnest") {
+        let arg = fc
+            .args
+            .first()
+            .ok_or_else(|| "unnest() requires at least one argument".to_string())?;
+
+        resolve_params_in_expr(arg, catalog, active_scope, param_map)?;
+        let arg_inferred = infer_expr(arg, catalog, active_scope)?;
+
+        let elem_pg = arg_inferred
+            .pg_type
+            .element_type()
+            .cloned()
+            .unwrap_or(PgType::Unknown);
+
+        let elem_ts = elem_pg.to_ts(catalog);
+
+        let (exposed_table_name, col_name, has_explicit_alias) = if let Some(alias) = &rf.alias {
+            let tbl = if !alias.aliasname.is_empty() {
+                alias.aliasname.clone()
+            } else {
+                "unnest".to_string()
+            };
+            let col = if let Some(first_col_node) = alias.colnames.first() {
+                extract_string(first_col_node).unwrap_or_else(|| tbl.clone())
+            } else if !alias.aliasname.is_empty() {
+                alias.aliasname.clone()
+            } else {
+                "unnest".to_string()
+            };
+            (tbl, col, true)
+        } else {
+            ("unnest".to_string(), "unnest".to_string(), false)
+        };
+
+        let col_meta = ColumnMetadata {
+            name: col_name.clone(),
+            pg_type: elem_pg.to_pg_str(),
+            ts_type: elem_ts,
+            is_nullable: arg_inferred.is_nullable,
+            has_default: false,
+        };
+
+        let mut columns = HashMap::new();
+        columns.insert(col_name.to_ascii_lowercase(), col_meta);
+
+        let binding = TableBinding {
+            base_table: exposed_table_name.clone(),
+            exposed_name: exposed_table_name.clone(),
+            has_explicit_alias,
+            is_null_padded: false,
+            columns,
+        };
+
+        let mut scope = QueryScope::with_ctes_from(active_scope);
+        scope
+            .cte_column_orders
+            .insert(exposed_table_name.to_ascii_lowercase(), vec![col_name]);
+        scope.add_binding(binding)?;
+        Ok(scope)
+    } else {
+        Ok(QueryScope::default())
+    }
 }
 
 fn infer_expr(
@@ -2618,8 +2720,21 @@ fn infer_expr(
                 })
             }
         }
+        Some(NodeEnum::ScalarArrayOpExpr(saoe)) => {
+            let mut is_nullable = false;
+            for arg in &saoe.args {
+                if let Ok(inf) = infer_expr(arg, catalog, scope)
+                    && inf.is_nullable
+                {
+                    is_nullable = true;
+                }
+            }
+            Ok(InferredExpr {
+                pg_type: PgType::Bool,
+                is_nullable,
+            })
+        }
         Some(NodeEnum::AExpr(ae)) => {
-            let op = ae.name.first().and_then(extract_string).unwrap_or_default();
             let l_inf = if let Some(l) = &ae.lexpr {
                 infer_expr(l, catalog, scope)?
             } else {
@@ -2636,6 +2751,16 @@ fn infer_expr(
                     is_nullable: false,
                 }
             };
+
+            if ae.kind == AExprKind::AexprOpAny as i32 || ae.kind == AExprKind::AexprOpAll as i32 {
+                let is_nullable = l_inf.is_nullable || r_inf.is_nullable;
+                return Ok(InferredType {
+                    pg_type: PgType::Bool,
+                    is_nullable,
+                });
+            }
+
+            let op = ae.name.first().and_then(extract_string).unwrap_or_default();
 
             match op.as_str() {
                 "->>" | "#>>" => Ok(InferredType {
@@ -2712,12 +2837,43 @@ fn infer_expr(
                         is_nullable,
                     })
                 }
-                "||" => {
+                "&&" | "@>" | "<@" => {
                     let is_nullable = l_inf.is_nullable || r_inf.is_nullable;
                     Ok(InferredType {
-                        pg_type: PgType::Text,
+                        pg_type: PgType::Bool,
                         is_nullable,
                     })
+                }
+                "||" => {
+                    let is_nullable = l_inf.is_nullable || r_inf.is_nullable;
+                    if let (PgType::Array(l_elem), PgType::Array(r_elem)) =
+                        (&l_inf.pg_type, &r_inf.pg_type)
+                    {
+                        let unified = unify_types(l_elem, r_elem).unwrap_or(PgType::Unknown);
+                        Ok(InferredType {
+                            pg_type: PgType::Array(Box::new(unified)),
+                            is_nullable,
+                        })
+                    } else if let PgType::Array(l_elem) = &l_inf.pg_type {
+                        let unified = unify_types(l_elem, &r_inf.pg_type)
+                            .unwrap_or_else(|_| l_elem.as_ref().clone());
+                        Ok(InferredType {
+                            pg_type: PgType::Array(Box::new(unified)),
+                            is_nullable,
+                        })
+                    } else if let PgType::Array(r_elem) = &r_inf.pg_type {
+                        let unified = unify_types(&l_inf.pg_type, r_elem)
+                            .unwrap_or_else(|_| r_elem.as_ref().clone());
+                        Ok(InferredType {
+                            pg_type: PgType::Array(Box::new(unified)),
+                            is_nullable,
+                        })
+                    } else {
+                        Ok(InferredType {
+                            pg_type: PgType::Text,
+                            is_nullable,
+                        })
+                    }
                 }
                 "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" => {
                     let is_nullable = l_inf.is_nullable || r_inf.is_nullable;
@@ -2736,13 +2892,13 @@ fn infer_expr(
             }
         }
         Some(NodeEnum::AArrayExpr(aae)) => {
-            let elem_type = if let Some(first) = aae.elements.first() {
-                infer_expr(first, catalog, scope)?.pg_type
-            } else {
-                PgType::Unknown
-            };
+            let mut unified_elem = PgType::Unknown;
+            for elem in &aae.elements {
+                let inf = infer_expr(elem, catalog, scope)?;
+                unified_elem = unify_types(&unified_elem, &inf.pg_type).unwrap_or(unified_elem);
+            }
             Ok(InferredExpr {
-                pg_type: PgType::Array(Box::new(elem_type)),
+                pg_type: PgType::Array(Box::new(unified_elem)),
                 is_nullable: false,
             })
         }
@@ -3028,6 +3184,146 @@ fn match_optional_filter(be: &pg_query::protobuf::BoolExpr) -> Option<OptionalFi
     None
 }
 
+fn resolve_scalar_array_comparison(
+    lhs: &pg_query::protobuf::Node,
+    rhs: &pg_query::protobuf::Node,
+    catalog: &Catalog,
+    scope: &QueryScope,
+    param_map: &mut HashMap<i32, ParamInfo>,
+) -> Result<(), String> {
+    let param_opt_l = extract_param_info(lhs);
+    let param_opt_r = extract_param_info(rhs);
+
+    if let Some((param_num, cast_opt)) = param_opt_r {
+        let mut resolved_type = cast_opt.map(|c| catalog.resolve_type(&c));
+        let mut col_name_opt = None;
+
+        if resolved_type.is_none() {
+            if let Ok(lhs_inf) = infer_expr(lhs, catalog, scope)
+                && lhs_inf.pg_type != PgType::Unknown
+            {
+                resolved_type = Some(lhs_inf.pg_type.to_array().to_ts(catalog));
+            }
+            if let Some((_, col_name)) = extract_column_info(lhs) {
+                col_name_opt = Some(col_name);
+            }
+        }
+
+        let entry = param_map.entry(param_num).or_default();
+        if let Some(col_name) = col_name_opt
+            && entry.suggested_name.is_none()
+        {
+            entry.suggested_name = Some(col_name);
+        }
+        if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
+            entry.inferred_type = resolved_type;
+        }
+
+        resolve_params_in_expr(lhs, catalog, scope, param_map)?;
+    } else if let Some((param_num, cast_opt)) = param_opt_l {
+        let mut resolved_type = cast_opt.map(|c| catalog.resolve_type(&c));
+        let mut col_name_opt = None;
+
+        if resolved_type.is_none() {
+            if let Ok(rhs_inf) = infer_expr(rhs, catalog, scope)
+                && let Some(elem) = rhs_inf.pg_type.element_type()
+            {
+                resolved_type = Some(elem.to_ts(catalog));
+            }
+            if let Some((_, col_name)) = extract_column_info(rhs) {
+                col_name_opt = Some(col_name);
+            }
+        }
+
+        let entry = param_map.entry(param_num).or_default();
+        if let Some(col_name) = col_name_opt
+            && entry.suggested_name.is_none()
+        {
+            entry.suggested_name = Some(col_name);
+        }
+        if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
+            entry.inferred_type = resolved_type;
+        }
+
+        resolve_params_in_expr(rhs, catalog, scope, param_map)?;
+    } else {
+        resolve_params_in_expr(lhs, catalog, scope, param_map)?;
+        resolve_params_in_expr(rhs, catalog, scope, param_map)?;
+    }
+
+    Ok(())
+}
+
+fn resolve_array_op_params(
+    lexpr: &pg_query::protobuf::Node,
+    rexpr: &pg_query::protobuf::Node,
+    catalog: &Catalog,
+    scope: &QueryScope,
+    param_map: &mut HashMap<i32, ParamInfo>,
+) -> Result<(), String> {
+    let param_opt_l = extract_param_info(lexpr);
+    let param_opt_r = extract_param_info(rexpr);
+
+    if let Some((param_num, cast_opt)) = param_opt_r {
+        let mut resolved_type = cast_opt.map(|c| catalog.resolve_type(&c));
+        let mut col_name_opt = None;
+
+        if resolved_type.is_none() {
+            if let Ok(lhs_inf) = infer_expr(lexpr, catalog, scope)
+                && lhs_inf.pg_type != PgType::Unknown
+            {
+                resolved_type = Some(lhs_inf.pg_type.to_ts(catalog));
+            }
+            if let Some((_, col_name)) = extract_column_info(lexpr) {
+                col_name_opt = Some(col_name);
+            }
+        }
+
+        let entry = param_map.entry(param_num).or_default();
+        if let Some(col_name) = col_name_opt
+            && entry.suggested_name.is_none()
+        {
+            entry.suggested_name = Some(col_name);
+        }
+        if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
+            entry.inferred_type = resolved_type;
+        }
+
+        resolve_params_in_expr(lexpr, catalog, scope, param_map)?;
+    } else if let Some((param_num, cast_opt)) = param_opt_l {
+        let mut resolved_type = cast_opt.map(|c| catalog.resolve_type(&c));
+        let mut col_name_opt = None;
+
+        if resolved_type.is_none() {
+            if let Ok(rhs_inf) = infer_expr(rexpr, catalog, scope)
+                && rhs_inf.pg_type != PgType::Unknown
+            {
+                resolved_type = Some(rhs_inf.pg_type.to_ts(catalog));
+            }
+            if let Some((_, col_name)) = extract_column_info(rexpr) {
+                col_name_opt = Some(col_name);
+            }
+        }
+
+        let entry = param_map.entry(param_num).or_default();
+        if let Some(col_name) = col_name_opt
+            && entry.suggested_name.is_none()
+        {
+            entry.suggested_name = Some(col_name);
+        }
+        if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
+            entry.inferred_type = resolved_type;
+        }
+
+        resolve_params_in_expr(rexpr, catalog, scope, param_map)?;
+    } else {
+        resolve_params_in_expr(lexpr, catalog, scope, param_map)?;
+        resolve_params_in_expr(rexpr, catalog, scope, param_map)?;
+    }
+
+    Ok(())
+}
+
 fn resolve_params_in_expr(
     expr: &pg_query::protobuf::Node,
     catalog: &Catalog,
@@ -3054,8 +3350,38 @@ fn resolve_params_in_expr(
                 resolve_params_in_expr(arg, catalog, scope, param_map)?;
             }
         }
+        Some(NodeEnum::ScalarArrayOpExpr(saoe)) => {
+            if saoe.args.len() == 2 {
+                resolve_scalar_array_comparison(
+                    &saoe.args[0],
+                    &saoe.args[1],
+                    catalog,
+                    scope,
+                    param_map,
+                )?;
+            } else {
+                for arg in &saoe.args {
+                    resolve_params_in_expr(arg, catalog, scope, param_map)?;
+                }
+            }
+        }
         Some(NodeEnum::AExpr(ae)) => {
+            if ae.kind == AExprKind::AexprOpAny as i32 || ae.kind == AExprKind::AexprOpAll as i32 {
+                if let (Some(lexpr), Some(rexpr)) = (&ae.lexpr, &ae.rexpr) {
+                    resolve_scalar_array_comparison(lexpr, rexpr, catalog, scope, param_map)?;
+                }
+                return Ok(());
+            }
+
             if ae.kind == AExprKind::AexprOp as i32 {
+                let op = ae.name.first().and_then(extract_string).unwrap_or_default();
+                if matches!(op.as_str(), "&&" | "@>" | "<@") {
+                    if let (Some(lexpr), Some(rexpr)) = (&ae.lexpr, &ae.rexpr) {
+                        resolve_array_op_params(lexpr, rexpr, catalog, scope, param_map)?;
+                    }
+                    return Ok(());
+                }
+
                 let param_opt_l = ae.lexpr.as_ref().and_then(|n| extract_param_info(n));
                 let col_opt_l = ae.lexpr.as_ref().and_then(|n| extract_column_info(n));
 
@@ -3082,6 +3408,13 @@ fn resolve_params_in_expr(
                     if let Some(rexpr) = &ae.rexpr {
                         resolve_params_in_expr(rexpr, catalog, scope, param_map)?;
                     }
+                }
+            } else {
+                if let Some(lexpr) = &ae.lexpr {
+                    resolve_params_in_expr(lexpr, catalog, scope, param_map)?;
+                }
+                if let Some(rexpr) = &ae.rexpr {
+                    resolve_params_in_expr(rexpr, catalog, scope, param_map)?;
                 }
             }
         }
@@ -3177,6 +3510,35 @@ fn resolve_params_in_expr(
         Some(NodeEnum::ResTarget(rt)) => {
             if let Some(val) = &rt.val {
                 resolve_params_in_expr(val, catalog, scope, param_map)?;
+            }
+        }
+        Some(NodeEnum::AArrayExpr(aae)) => {
+            let mut unified_elem = PgType::Unknown;
+            for elem in &aae.elements {
+                if extract_param_info(elem).is_none()
+                    && let Ok(inf) = infer_expr(elem, catalog, scope)
+                {
+                    unified_elem = unify_types(&unified_elem, &inf.pg_type).unwrap_or(unified_elem);
+                }
+            }
+            for elem in &aae.elements {
+                if let Some((param_num, cast_opt)) = extract_param_info(elem) {
+                    let resolved_type = cast_opt.map(|c| catalog.resolve_type(&c)).or_else(|| {
+                        if unified_elem != PgType::Unknown {
+                            Some(unified_elem.to_ts(catalog))
+                        } else {
+                            None
+                        }
+                    });
+                    let entry = param_map.entry(param_num).or_default();
+                    if entry.inferred_type.is_none()
+                        || entry.inferred_type.as_deref() == Some("unknown")
+                    {
+                        entry.inferred_type = resolved_type;
+                    }
+                } else {
+                    resolve_params_in_expr(elem, catalog, scope, param_map)?;
+                }
             }
         }
         _ => {}
@@ -3497,13 +3859,13 @@ RIGHT JOIN posts p ON p.user_id = u.id;
         let analyzed = analyze_query(query_sql, &catalog, Some("array_query.sql")).unwrap();
         assert_eq!(analyzed.fields.len(), 4);
         assert_eq!(analyzed.fields[0].name, "tags");
-        assert_eq!(analyzed.fields[0].ts_type, "string[]");
+        assert_eq!(analyzed.fields[0].ts_type, "Array<string>");
         assert_eq!(analyzed.fields[1].name, "scores");
-        assert_eq!(analyzed.fields[1].ts_type, "number[]");
+        assert_eq!(analyzed.fields[1].ts_type, "Array<number>");
         assert_eq!(analyzed.fields[2].name, "optional_tags");
-        assert_eq!(analyzed.fields[2].ts_type, "string[] | null");
+        assert_eq!(analyzed.fields[2].ts_type, "Array<string> | null");
         assert_eq!(analyzed.fields[3].name, "defaults");
-        assert_eq!(analyzed.fields[3].ts_type, "string[]");
+        assert_eq!(analyzed.fields[3].ts_type, "Array<string>");
     }
 
     #[test]
@@ -4628,5 +4990,99 @@ FROM users u;
         assert_eq!(analyzed.params[0].name, "expires_at");
         assert_eq!(analyzed.params[0].ts_type, "Date");
         assert_eq!(analyzed.fields.len(), 0);
+    }
+
+    #[test]
+    fn test_scalar_array_any_comparison() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "CREATE TABLE users (
+                    id UUID PRIMARY KEY,
+                    name TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+
+        let sql = "SELECT id FROM users WHERE id = ANY($1);";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.params.len(), 1);
+        assert_eq!(analyzed.params[0].name, "id");
+        assert_eq!(analyzed.params[0].ts_type, "Array<string>");
+        assert_eq!(analyzed.fields.len(), 1);
+        assert_eq!(analyzed.fields[0].name, "id");
+        assert_eq!(analyzed.fields[0].ts_type, "string");
+    }
+
+    #[test]
+    fn test_array_overlap_operator() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "CREATE TABLE posts (
+                    id UUID PRIMARY KEY,
+                    tags TEXT[] NOT NULL
+                );",
+            )
+            .unwrap();
+
+        let sql = "SELECT id FROM posts WHERE tags && $1;";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.params.len(), 1);
+        assert_eq!(analyzed.params[0].name, "tags");
+        assert_eq!(analyzed.params[0].ts_type, "Array<string>");
+        assert_eq!(analyzed.fields.len(), 1);
+        assert_eq!(analyzed.fields[0].name, "id");
+        assert_eq!(analyzed.fields[0].ts_type, "string");
+    }
+
+    #[test]
+    fn test_array_constructor() {
+        let catalog = Catalog::default();
+        let sql = "SELECT ARRAY[1, 2, 3] AS nums;";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.fields.len(), 1);
+        assert_eq!(analyzed.fields[0].name, "nums");
+        assert_eq!(analyzed.fields[0].ts_type, "Array<number>");
+    }
+
+    #[test]
+    fn test_range_function_unnest() {
+        let catalog = Catalog::default();
+        let sql = "SELECT item FROM unnest(ARRAY['a', 'b']) AS t(item);";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.fields.len(), 1);
+        assert_eq!(analyzed.fields[0].name, "item");
+        assert_eq!(analyzed.fields[0].ts_type, "string");
+    }
+
+    #[test]
+    fn test_array_operators_and_empty_constructor() {
+        let mut catalog = Catalog::default();
+        catalog
+            .apply_sql(
+                "CREATE TABLE items (
+                    id UUID PRIMARY KEY,
+                    tags TEXT[] NOT NULL
+                );",
+            )
+            .unwrap();
+
+        // Containment operator @>
+        let sql = "SELECT id FROM items WHERE tags @> $1;";
+        let analyzed = analyze_query(sql, &catalog, None).unwrap();
+        assert_eq!(analyzed.params.len(), 1);
+        assert_eq!(analyzed.params[0].name, "tags");
+        assert_eq!(analyzed.params[0].ts_type, "Array<string>");
+
+        // Array concatenation
+        let sql2 =
+            "SELECT ARRAY['a', 'b'] || ARRAY['c'] AS concatenated, ARRAY[]::int4[] AS empty_ints;";
+        let analyzed2 = analyze_query(sql2, &catalog, None).unwrap();
+        assert_eq!(analyzed2.fields.len(), 2);
+        assert_eq!(analyzed2.fields[0].name, "concatenated");
+        assert_eq!(analyzed2.fields[0].ts_type, "Array<string>");
+        assert_eq!(analyzed2.fields[1].name, "empty_ints");
+        assert_eq!(analyzed2.fields[1].ts_type, "Array<number>");
     }
 }
