@@ -1,6 +1,6 @@
 {
   "name": "@x7ssss/sqltype",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Ultra-fast, zero-runtime SQL-to-TypeScript compiler CLI",
   "bin": {
     "sqltype": "bin/sqltype.js"
@@ -33,10 +33,10 @@
     "url": "https://github.com/x7ssss/sqltype/issues"
   },
   "optionalDependencies": {
-    "@x7ssss/sqltype-linux-x64": "0.2.0",
-    "@x7ssss/sqltype-linux-arm64": "0.2.0",
-    "@x7ssss/sqltype-darwin-x64": "0.2.0",
-    "@x7ssss/sqltype-darwin-arm64": "0.2.0",
-    "@x7ssss/sqltype-win32-x64": "0.2.0"
+    "@x7ssss/sqltype-linux-x64": "0.3.0",
+    "@x7ssss/sqltype-linux-arm64": "0.3.0",
+    "@x7ssss/sqltype-darwin-x64": "0.3.0",
+    "@x7ssss/sqltype-darwin-arm64": "0.3.0",
+    "@x7ssss/sqltype-win32-x64": "0.3.0"
   }
 }

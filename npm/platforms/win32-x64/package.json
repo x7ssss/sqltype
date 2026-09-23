@@ -1,6 +1,6 @@
 {
   "name": "@x7ssss/sqltype-win32-x64",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Native sqltype binary for Windows x86_64",
   "os": ["win32"],
   "cpu": ["x64"],
