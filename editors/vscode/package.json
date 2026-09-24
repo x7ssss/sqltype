@@ -1,0 +1,51 @@
+{
+  "name": "sqltype",
+  "displayName": "SQLType",
+  "description": "High-performance SQL-to-TypeScript Language Server client",
+  "version": "0.3.0",
+  "publisher": "x7ssss",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/x7ssss/sqltype"
+  },
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:sql"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "SQLType",
+      "properties": {
+        "sqltype.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the sqltype executable."
+        },
+        "sqltype.migrationsPath": {
+          "type": "string",
+          "default": "migrations",
+          "description": "Migrations directory relative to workspace root."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.100.0",
+    "typescript": "^5.8.0"
+  }
+}

@@ -1,8 +1,14 @@
 {
-  "name": "@sqltype/darwin-arm64",
-  "version": "0.1.0",
-  "description": "Native sqltype binary for macOS arm64 (Apple Silicon)",
+  "name": "@x7ssss/sqltype-darwin-arm64",
+  "version": "0.3.0",
+  "description": "Native sqltype binary for macOS ARM64 (Apple Silicon)",
   "os": ["darwin"],
   "cpu": ["arm64"],
-  "license": "MIT"
+  "files": ["bin"],
+  "author": "x7ssss",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/x7ssss/sqltype"
+  }
 }

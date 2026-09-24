@@ -1,6 +1,8 @@
+use lsp_types::{HoverContents, Position};
 use sqltype::analyzer::analyze_query;
-use sqltype::catalog::Catalog;
-use sqltype::codegen::generate_file_ts;
+use sqltype::catalog::{Catalog, DriverTarget};
+use sqltype::codegen::{CodegenOptions, generate_file_ts, generate_file_ts_with_options};
+use sqltype::lsp::{resolve_hover, validate_sql};
 use std::fs;
 
 #[test]
@@ -84,13 +86,19 @@ SELECT
 FROM posts p
 WHERE p.published = $1;
     "#;
-    fs::write(queries_dir.join("find_posts_by_status.sql"), query_posts_by_status).unwrap();
+    fs::write(
+        queries_dir.join("find_posts_by_status.sql"),
+        query_posts_by_status,
+    )
+    .unwrap();
 
     // 3. Build in-memory schema catalog
     let catalog = Catalog::load_from_dir(&migrations_dir).expect("Failed to load catalog");
 
     // Verify catalog state
-    let users_table = catalog.get_table("users").expect("users table should exist");
+    let users_table = catalog
+        .get_table("users")
+        .expect("users table should exist");
     assert_eq!(users_table.columns.len(), 5);
     assert!(!users_table.get_column("id").unwrap().is_nullable);
     assert!(!users_table.get_column("email").unwrap().is_nullable);
@@ -98,7 +106,8 @@ WHERE p.published = $1;
     assert!(users_table.get_column("age").unwrap().is_nullable);
 
     // 4. Analyze queries
-    let analyzed_user = analyze_query(query_get_user, &catalog, Some("get_user_with_posts.sql")).unwrap();
+    let analyzed_user =
+        analyze_query(query_get_user, &catalog, Some("get_user_with_posts.sql")).unwrap();
     assert_eq!(analyzed_user.name, "GetUserWithPosts");
     assert_eq!(analyzed_user.params.len(), 1);
     assert_eq!(analyzed_user.params[0].name, "id");
@@ -114,7 +123,12 @@ WHERE p.published = $1;
     assert_eq!(analyzed_user.fields[3].name, "comment_count");
     assert_eq!(analyzed_user.fields[3].ts_type, "number");
 
-    let analyzed_posts = analyze_query(query_posts_by_status, &catalog, Some("find_posts_by_status.sql")).unwrap();
+    let analyzed_posts = analyze_query(
+        query_posts_by_status,
+        &catalog,
+        Some("find_posts_by_status.sql"),
+    )
+    .unwrap();
     assert_eq!(analyzed_posts.name, "FindPostsByStatus");
     assert_eq!(analyzed_posts.params.len(), 1);
     assert_eq!(analyzed_posts.params[0].name, "published");
@@ -136,7 +150,9 @@ WHERE p.published = $1;
     assert!(ts_user.contains("export const getUserWithPostsSql = `"));
     assert!(ts_user.contains("export type GetUserWithPostsQuery = {\n  sql: string;\n  params: GetUserWithPostsParams;\n  row: GetUserWithPostsRow;\n};"));
 
-    assert!(ts_posts.contains("export interface FindPostsByStatusParams {\n  published: boolean;\n}"));
+    assert!(
+        ts_posts.contains("export interface FindPostsByStatusParams {\n  published: boolean;\n}")
+    );
     assert!(ts_posts.contains("export interface FindPostsByStatusRow {\n  id: string;\n  title: string;\n  views: number;\n  published: boolean;\n}"));
     assert!(ts_posts.contains("export const findPostsByStatusSql = `"));
     assert!(ts_posts.contains("export type FindPostsByStatusQuery = {\n  sql: string;\n  params: FindPostsByStatusParams;\n  row: FindPostsByStatusRow;\n};"));
@@ -182,7 +198,8 @@ fn test_cte_and_expressions_integration() {
             title VARCHAR(255) NOT NULL
         );
         "#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let query_cte = r#"
 -- name: GetActiveUsersWithPosts
@@ -217,6 +234,476 @@ JOIN posts p ON p.user_id = au.id;
     assert!(ts.contains("next_age: number;"));
     assert!(ts.contains("display_name: string;"));
     assert!(ts.contains("title: string;"));
+
+    let _ = fs::remove_dir_all(base_dir);
+}
+
+#[test]
+fn test_dml_compiler_pipeline() {
+    let base_dir = std::env::temp_dir().join(format!(
+        "sqltype_dml_e2e_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let migrations_dir = base_dir.join("migrations");
+    let queries_dir = base_dir.join("queries");
+    let out_dir = base_dir.join("out");
+
+    fs::create_dir_all(&migrations_dir).unwrap();
+    fs::create_dir_all(&queries_dir).unwrap();
+    fs::create_dir_all(&out_dir).unwrap();
+
+    fs::write(
+        migrations_dir.join("001_init.sql"),
+        r#"
+        CREATE TABLE users (
+            id UUID PRIMARY KEY,
+            name VARCHAR(100) NOT NULL,
+            email TEXT NOT NULL,
+            age INT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        "#,
+    )
+    .unwrap();
+
+    let query_insert = r#"
+-- name: CreateUser
+INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id, created_at;
+    "#;
+    fs::write(queries_dir.join("create_user.sql"), query_insert).unwrap();
+
+    let query_update = r#"
+-- name: UpdateUser
+UPDATE users SET name = $1 WHERE id = $2 RETURNING id, name;
+    "#;
+    fs::write(queries_dir.join("update_user.sql"), query_update).unwrap();
+
+    let query_delete = r#"
+-- name: DeleteUser
+DELETE FROM users WHERE id = $1;
+    "#;
+    fs::write(queries_dir.join("delete_user.sql"), query_delete).unwrap();
+
+    let catalog = Catalog::load_from_dir(&migrations_dir).unwrap();
+
+    // 1. Analyze & verify CreateUser
+    let analyzed_insert = analyze_query(query_insert, &catalog, Some("create_user.sql")).unwrap();
+    assert_eq!(analyzed_insert.name, "CreateUser");
+    assert_eq!(analyzed_insert.params.len(), 2);
+    assert_eq!(analyzed_insert.params[0].name, "name");
+    assert_eq!(analyzed_insert.params[0].ts_type, "string");
+    assert_eq!(analyzed_insert.params[1].name, "email");
+    assert_eq!(analyzed_insert.params[1].ts_type, "string");
+    assert_eq!(analyzed_insert.fields.len(), 2);
+    assert_eq!(analyzed_insert.fields[0].name, "id");
+    assert_eq!(analyzed_insert.fields[0].ts_type, "string");
+    assert_eq!(analyzed_insert.fields[1].name, "created_at");
+    assert_eq!(analyzed_insert.fields[1].ts_type, "Date");
+
+    let ts_insert = generate_file_ts(&[analyzed_insert]);
+    assert!(
+        ts_insert
+            .contains("export interface CreateUserParams {\n  name: string;\n  email: string;\n}")
+    );
+    assert!(
+        ts_insert
+            .contains("export interface CreateUserRow {\n  id: string;\n  created_at: Date;\n}")
+    );
+    assert!(ts_insert.contains("export type CreateUserQuery = {\n  sql: string;\n  params: CreateUserParams;\n  row: CreateUserRow;\n};"));
+
+    // 2. Analyze & verify UpdateUser
+    let analyzed_update = analyze_query(query_update, &catalog, Some("update_user.sql")).unwrap();
+    assert_eq!(analyzed_update.name, "UpdateUser");
+    assert_eq!(analyzed_update.params.len(), 2);
+    assert_eq!(analyzed_update.params[0].name, "name");
+    assert_eq!(analyzed_update.params[0].ts_type, "string");
+    assert_eq!(analyzed_update.params[1].name, "id");
+    assert_eq!(analyzed_update.params[1].ts_type, "string");
+    assert_eq!(analyzed_update.fields.len(), 2);
+    assert_eq!(analyzed_update.fields[0].name, "id");
+    assert_eq!(analyzed_update.fields[0].ts_type, "string");
+    assert_eq!(analyzed_update.fields[1].name, "name");
+    assert_eq!(analyzed_update.fields[1].ts_type, "string");
+
+    let ts_update = generate_file_ts(&[analyzed_update]);
+    assert!(
+        ts_update
+            .contains("export interface UpdateUserParams {\n  name: string;\n  id: string;\n}")
+    );
+    assert!(
+        ts_update.contains("export interface UpdateUserRow {\n  id: string;\n  name: string;\n}")
+    );
+    assert!(ts_update.contains("export type UpdateUserQuery = {\n  sql: string;\n  params: UpdateUserParams;\n  row: UpdateUserRow;\n};"));
+
+    // 3. Analyze & verify DeleteUser
+    let analyzed_delete = analyze_query(query_delete, &catalog, Some("delete_user.sql")).unwrap();
+    assert_eq!(analyzed_delete.name, "DeleteUser");
+    assert_eq!(analyzed_delete.params.len(), 1);
+    assert_eq!(analyzed_delete.params[0].name, "id");
+    assert_eq!(analyzed_delete.params[0].ts_type, "string");
+    assert!(analyzed_delete.fields.is_empty());
+
+    let ts_delete = generate_file_ts(&[analyzed_delete]);
+    assert!(ts_delete.contains("export interface DeleteUserParams {\n  id: string;\n}"));
+    assert!(!ts_delete.contains("DeleteUserRow"));
+    assert!(!ts_delete.contains("row:"));
+    assert!(ts_delete.contains(
+        "export type DeleteUserQuery = {\n  sql: string;\n  params: DeleteUserParams;\n};"
+    ));
+
+    let _ = fs::remove_dir_all(base_dir);
+}
+
+#[test]
+fn test_lsp_integration_pipeline() {
+    let base_dir = std::env::temp_dir().join(format!(
+        "sqltype_lsp_e2e_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let migrations_dir = base_dir.join("migrations");
+    fs::create_dir_all(&migrations_dir).unwrap();
+
+    fs::write(
+        migrations_dir.join("001_create_accounts.sql"),
+        r#"
+        CREATE TABLE accounts (
+            id UUID PRIMARY KEY,
+            username VARCHAR(50) NOT NULL,
+            balance INT NOT NULL DEFAULT 0
+        );
+        "#,
+    )
+    .unwrap();
+
+    let catalog = Catalog::load_from_dir(&migrations_dir).unwrap();
+
+    // 1. Valid query produces zero diagnostics
+    let valid_sql = "SELECT id, username, balance FROM accounts WHERE id = $1;";
+    let diags_valid = validate_sql(valid_sql, &catalog);
+    assert!(diags_valid.is_empty());
+
+    // 2. Query with non-existent table produces diagnostic
+    let invalid_table_sql = "SELECT id FROM orders WHERE id = $1;";
+    let diags_table = validate_sql(invalid_table_sql, &catalog);
+    assert_eq!(diags_table.len(), 1);
+    assert!(
+        diags_table[0]
+            .message
+            .contains("Table \"orders\" does not exist in schema catalog")
+    );
+
+    // 3. Query with syntax error produces diagnostic with cursorpos
+    let syntax_err_sql = "SELECT * FROM;";
+    let diags_syntax = validate_sql(syntax_err_sql, &catalog);
+    assert_eq!(diags_syntax.len(), 1);
+    assert!(diags_syntax[0].message.contains("syntax error"));
+
+    // 4. Hover inspection on parameter
+    let hover_param = resolve_hover(
+        valid_sql,
+        Position {
+            line: 0,
+            character: 54, // on $1
+        },
+        &catalog,
+    );
+    assert!(hover_param.is_some());
+    if let Some(h) = hover_param
+        && let HoverContents::Markup(m) = h.contents
+    {
+        assert!(m.value.contains("Parameter `$1`"));
+        assert!(m.value.contains("TypeScript Type"));
+    }
+
+    // 5. Hover inspection on table
+    let hover_table = resolve_hover(
+        valid_sql,
+        Position {
+            line: 0,
+            character: 36, // on accounts
+        },
+        &catalog,
+    );
+    assert!(hover_table.is_some());
+    if let Some(h) = hover_table
+        && let HoverContents::Markup(m) = h.contents
+    {
+        assert!(m.value.contains("### Table `accounts`"));
+        assert!(m.value.contains("- `username`: `varchar`"));
+    }
+
+    let _ = fs::remove_dir_all(base_dir);
+}
+
+#[test]
+fn test_wrappers_integration_pipeline() {
+    let mut catalog = Catalog::default();
+    catalog
+        .apply_sql(
+            r#"
+            CREATE TABLE accounts (
+                id UUID PRIMARY KEY,
+                username VARCHAR(50) NOT NULL,
+                balance INT NOT NULL DEFAULT 0
+            );
+            "#,
+        )
+        .unwrap();
+
+    let query_insert = r#"
+-- name: CreateAccount
+INSERT INTO accounts (username, balance) VALUES ($1, $2) RETURNING id;
+    "#;
+    let analyzed_insert = analyze_query(query_insert, &catalog, None).unwrap();
+
+    let query_delete = r#"
+-- name: DeleteAccount
+DELETE FROM accounts WHERE id = $1;
+    "#;
+    let analyzed_delete = analyze_query(query_delete, &catalog, None).unwrap();
+
+    // 1. Postgres driver wrappers
+    let pg_options = CodegenOptions::new(DriverTarget::Postgres, true);
+    let pg_ts_insert =
+        generate_file_ts_with_options(std::slice::from_ref(&analyzed_insert), &pg_options);
+    assert!(pg_ts_insert.contains("export async function createAccount(sql: postgres.Sql, params: CreateAccountParams): Promise<CreateAccountRow[]> {"));
+    assert!(pg_ts_insert.contains("return await sql<CreateAccountRow[]>`${sql.unsafe(createAccountSql, [params.username, params.balance ?? null])}`;"));
+
+    let pg_ts_delete =
+        generate_file_ts_with_options(std::slice::from_ref(&analyzed_delete), &pg_options);
+    assert!(pg_ts_delete.contains("export async function deleteAccount(sql: postgres.Sql, params: DeleteAccountParams): Promise<void> {"));
+    assert!(pg_ts_delete.contains("await sql.unsafe(deleteAccountSql, [params.id]);"));
+
+    // 2. Node-postgres driver wrappers
+    let node_pg_options = CodegenOptions::new(DriverTarget::Pg, true);
+    let node_pg_ts_insert =
+        generate_file_ts_with_options(std::slice::from_ref(&analyzed_insert), &node_pg_options);
+    assert!(node_pg_ts_insert.contains("export async function createAccount(client: pg.ClientBase | pg.Pool, params: CreateAccountParams): Promise<CreateAccountRow[]> {"));
+    assert!(node_pg_ts_insert.contains("const res = await client.query<CreateAccountRow>(createAccountSql, [params.username, params.balance ?? null]);"));
+    assert!(node_pg_ts_insert.contains("return res.rows;"));
+
+    // 3. Bun driver wrappers
+    let bun_options = CodegenOptions::new(DriverTarget::Bun, true);
+    let bun_ts_insert =
+        generate_file_ts_with_options(std::slice::from_ref(&analyzed_insert), &bun_options);
+    assert!(bun_ts_insert.contains("export async function createAccount(sql: import(\"bun\").SQL, params: CreateAccountParams): Promise<CreateAccountRow[]> {"));
+    assert!(bun_ts_insert.contains("return await sql<CreateAccountRow[]>`${sql.raw(createAccountSql, [params.username, params.balance ?? null])}`;"));
+}
+
+#[test]
+fn test_inline_typescript_query_extraction_and_codegen() {
+    use sqltype::ts_scanner::scan_ts_queries;
+
+    let base_dir = std::env::temp_dir().join(format!(
+        "sqltype_inline_ts_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let migrations_dir = base_dir.join("migrations");
+    let queries_dir = base_dir.join("src").join("queries");
+
+    fs::create_dir_all(&migrations_dir).unwrap();
+    fs::create_dir_all(&queries_dir).unwrap();
+
+    // 1. Write migration
+    fs::write(
+        migrations_dir.join("001_create_users.sql"),
+        r#"
+        CREATE TABLE users (
+            id UUID PRIMARY KEY,
+            email TEXT NOT NULL,
+            status VARCHAR(20) NOT NULL
+        );
+        "#,
+    )
+    .unwrap();
+
+    // 2. Write TypeScript file containing inline SQL tagged template
+    let ts_file_path = queries_dir.join("users.ts");
+    fs::write(
+        &ts_file_path,
+        r#"
+        import { sql } from 'bun';
+
+        export const findActiveUsers = sql`
+          SELECT id, email FROM users WHERE status = 'active' AND id = $1;
+        `;
+        "#,
+    )
+    .unwrap();
+
+    // 3. Verify extraction directly via scanner
+    let ts_content = fs::read_to_string(&ts_file_path).unwrap();
+    let extracted = scan_ts_queries(&ts_content);
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].name.as_deref(), Some("FindActiveUsers"));
+    assert!(
+        extracted[0]
+            .sql
+            .contains("SELECT id, email FROM users WHERE status = 'active' AND id = $1;")
+    );
+
+    // 4. Verify catalog and query analysis
+    let catalog = Catalog::load_from_dir(&migrations_dir).unwrap();
+    let analyzed =
+        analyze_query(&extracted[0].sql, &catalog, extracted[0].name.as_deref()).unwrap();
+
+    assert_eq!(analyzed.name, "FindActiveUsers");
+    assert_eq!(analyzed.params.len(), 1);
+    assert_eq!(analyzed.params[0].name, "id");
+    assert_eq!(analyzed.params[0].ts_type, "string");
+    assert_eq!(analyzed.fields.len(), 2);
+    assert_eq!(analyzed.fields[0].name, "id");
+    assert_eq!(analyzed.fields[0].ts_type, "string");
+    assert_eq!(analyzed.fields[1].name, "email");
+    assert_eq!(analyzed.fields[1].ts_type, "string");
+
+    // 5. Verify codegen output with wrappers
+    let options = CodegenOptions::new(DriverTarget::Bun, true);
+    let ts_code = generate_file_ts_with_options(&[analyzed], &options);
+
+    assert!(ts_code.contains("export interface FindActiveUsersParams {\n  id: string;\n}"));
+    assert!(
+        ts_code
+            .contains("export interface FindActiveUsersRow {\n  id: string;\n  email: string;\n}")
+    );
+    assert!(ts_code.contains("export const findActiveUsersSql = `"));
+    assert!(ts_code.contains("export type FindActiveUsersQuery = {"));
+    assert!(ts_code.contains("export async function findActiveUsers(sql: import(\"bun\").SQL, params: FindActiveUsersParams): Promise<FindActiveUsersRow[]> {"));
+
+    // 6. Write sibling file and verify existence and content
+    let sibling_file_path = ts_file_path.with_extension("sqltype.ts");
+    fs::write(&sibling_file_path, &ts_code).unwrap();
+    assert!(sibling_file_path.exists());
+    let read_back = fs::read_to_string(&sibling_file_path).unwrap();
+    assert!(read_back.contains("FindActiveUsersRow"));
+
+    // Cleanup
+    let _ = fs::remove_dir_all(base_dir);
+}
+
+#[test]
+fn test_cli_commands_with_inline_typescript_files() {
+    let base_dir = std::env::temp_dir().join(format!(
+        "sqltype_cli_ts_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let migrations_dir = base_dir.join("migrations");
+    let queries_dir = base_dir.join("src").join("queries");
+
+    fs::create_dir_all(&migrations_dir).unwrap();
+    fs::create_dir_all(&queries_dir).unwrap();
+
+    fs::write(
+        migrations_dir.join("001_create_users.sql"),
+        r#"
+        CREATE TABLE users (
+            id UUID PRIMARY KEY,
+            email TEXT NOT NULL,
+            status VARCHAR(20) NOT NULL
+        );
+        "#,
+    )
+    .unwrap();
+
+    let ts_file = queries_dir.join("users.ts");
+    fs::write(
+        &ts_file,
+        r#"
+        import { sql } from 'bun';
+
+        export const findActiveUsers = sql`
+          SELECT id, email FROM users WHERE status = 'active' AND id = $1;
+        `;
+        "#,
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_sqltype");
+
+    // 1. Run `sqltype check` via CLI
+    let check_status = std::process::Command::new(binary)
+        .arg("check")
+        .arg("--migrations")
+        .arg(&migrations_dir)
+        .arg("--queries")
+        .arg(&queries_dir)
+        .arg("--wrappers")
+        .status()
+        .expect("failed to execute sqltype check");
+
+    assert!(
+        check_status.success(),
+        "sqltype check should succeed on valid inline query"
+    );
+
+    // 2. Run `sqltype generate` via CLI
+    let gen_status = std::process::Command::new(binary)
+        .arg("generate")
+        .arg("--migrations")
+        .arg(&migrations_dir)
+        .arg("--queries")
+        .arg(&queries_dir)
+        .arg("--wrappers")
+        .status()
+        .expect("failed to execute sqltype generate");
+
+    assert!(
+        gen_status.success(),
+        "sqltype generate should succeed on valid inline query"
+    );
+
+    // Sibling file users.sqltype.ts must exist
+    let sibling_file = queries_dir.join("users.sqltype.ts");
+    assert!(
+        sibling_file.exists(),
+        "sibling users.sqltype.ts must be generated"
+    );
+    let generated_content = fs::read_to_string(&sibling_file).unwrap();
+    assert!(generated_content.contains("export interface FindActiveUsersParams"));
+    assert!(generated_content.contains("export interface FindActiveUsersRow"));
+    assert!(generated_content.contains("export async function findActiveUsers"));
+
+    // 3. Test invalid query failure
+    let bad_ts_file = queries_dir.join("bad.ts");
+    fs::write(
+        &bad_ts_file,
+        r#"
+        const getNonExistent = sql`
+          SELECT * FROM non_existent_table;
+        `;
+        "#,
+    )
+    .unwrap();
+
+    let bad_check_status = std::process::Command::new(binary)
+        .arg("check")
+        .arg("--migrations")
+        .arg(&migrations_dir)
+        .arg("--queries")
+        .arg(&queries_dir)
+        .status()
+        .expect("failed to execute sqltype check on bad query");
+
+    assert!(
+        !bad_check_status.success(),
+        "sqltype check should fail when query references missing table"
+    );
 
     let _ = fs::remove_dir_all(base_dir);
 }

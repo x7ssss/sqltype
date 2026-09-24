@@ -1,13 +1,16 @@
 {
-  "name": "sqltype",
-  "version": "0.1.0",
+  "name": "@x7ssss/sqltype",
+  "version": "0.3.0",
   "description": "Ultra-fast, zero-runtime SQL-to-TypeScript compiler CLI",
   "bin": {
-    "sqltype": "./bin/sqltype"
+    "sqltype": "bin/sqltype.js"
   },
-  "main": "./bin/sqltype",
+  "main": "bin/sqltype.js",
+  "files": [
+    "bin"
+  ],
   "scripts": {
-    "test": "node ./bin/sqltype --help"
+    "test": "node bin/sqltype.js --help"
   },
   "keywords": [
     "sql",
@@ -19,17 +22,21 @@
     "type-safe",
     "zero-runtime"
   ],
-  "author": "Antigravity Systems Team",
+  "author": "x7ssss",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/sqltype/sqltype"
+    "url": "https://github.com/x7ssss/sqltype.git"
+  },
+  "homepage": "https://github.com/x7ssss/sqltype#readme",
+  "bugs": {
+    "url": "https://github.com/x7ssss/sqltype/issues"
   },
   "optionalDependencies": {
-    "@sqltype/linux-x64": "0.1.0",
-    "@sqltype/linux-arm64": "0.1.0",
-    "@sqltype/darwin-x64": "0.1.0",
-    "@sqltype/darwin-arm64": "0.1.0",
-    "@sqltype/win32-x64": "0.1.0"
+    "@x7ssss/sqltype-linux-x64": "0.3.0",
+    "@x7ssss/sqltype-linux-arm64": "0.3.0",
+    "@x7ssss/sqltype-darwin-x64": "0.3.0",
+    "@x7ssss/sqltype-darwin-arm64": "0.3.0",
+    "@x7ssss/sqltype-win32-x64": "0.3.0"
   }
 }

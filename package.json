@@ -1,0 +1,16 @@
+{
+  "name": "sqltype",
+  "version": "0.3.0",
+  "private": true,
+  "description": "High-performance PostgreSQL-to-TypeScript compiler and language server",
+  "author": "x7ssss",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/x7ssss/sqltype.git"
+  },
+  "bugs": {
+    "url": "https://github.com/x7ssss/sqltype/issues"
+  },
+  "homepage": "https://github.com/x7ssss/sqltype#readme"
+}

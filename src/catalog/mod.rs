@@ -1,0 +1,941 @@
+use pg_query::NodeEnum;
+use pg_query::protobuf::{AlterTableType, ConstrType};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use crate::analyzer::PgType;
+use crate::catalog::extensions::{ExtensionFunction, ExtensionOperator};
+
+pub mod extensions;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnMetadata {
+    pub name: String,
+    pub pg_type: String,
+    pub ts_type: String,
+    pub is_nullable: bool,
+    pub has_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableMetadata {
+    pub name: String,
+    pub schema: Option<String>,
+    pub columns: Vec<ColumnMetadata>,
+}
+
+impl TableMetadata {
+    pub fn get_column(&self, name: &str) -> Option<&ColumnMetadata> {
+        self.columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+    }
+
+    pub fn get_column_mut(&mut self, name: &str) -> Option<&mut ColumnMetadata> {
+        self.columns
+            .iter_mut()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+    }
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum DriverTarget {
+    #[default]
+    Postgres,
+    Pg,
+    Bun,
+}
+
+impl std::fmt::Display for DriverTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DriverTarget::Postgres => write!(f, "postgres"),
+            DriverTarget::Pg => write!(f, "pg"),
+            DriverTarget::Bun => write!(f, "bun"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Catalog {
+    pub tables: HashMap<String, TableMetadata>,
+    pub enums: HashMap<String, Vec<String>>,
+    pub driver: DriverTarget,
+    pub type_overrides: HashMap<String, String>,
+    pub extensions: HashSet<String>,
+    pub extension_types: HashMap<String, PgType>,
+    pub extension_operators: Vec<ExtensionOperator>,
+    pub extension_functions: HashMap<String, Vec<ExtensionFunction>>,
+}
+
+pub type SchemaCatalog = Catalog;
+
+pub fn is_type_compatible(actual: &PgType, expected: &PgType) -> bool {
+    if actual == expected {
+        return true;
+    }
+    if *actual == PgType::Unknown || *expected == PgType::Unknown {
+        return true;
+    }
+    match (actual, expected) {
+        (PgType::Vector(_), PgType::Vector(_)) => true,
+        (PgType::HalfVec(_), PgType::HalfVec(_)) => true,
+        (PgType::Geometry, PgType::Geometry) => true,
+        (PgType::Geography, PgType::Geography) => true,
+        (PgType::Box2D, PgType::Box2D) => true,
+        (PgType::Box3D, PgType::Box3D) => true,
+        (a, PgType::Float8) if crate::analyzer::is_numeric_type(a) => true,
+        (a, PgType::Numeric) if crate::analyzer::is_numeric_type(a) => true,
+        (a, PgType::Int4) if crate::analyzer::is_numeric_type(a) => true,
+        (PgType::Text | PgType::Varchar, PgType::Text) => true,
+        _ => false,
+    }
+}
+
+/// Normalizes PostgreSQL types to TypeScript primitives according to driver target specifications.
+pub fn normalize_pg_type_to_ts(pg_type: &str, driver: DriverTarget) -> String {
+    let lower = pg_type.to_ascii_lowercase();
+    let lower = lower.trim();
+
+    // Check array suffix e.g. text[] or int[]
+    if let Some(inner) = lower.strip_suffix("[]") {
+        let inner_ts = normalize_pg_type_to_ts(inner, driver);
+        return format!("{}[]", inner_ts);
+    }
+
+    let base = if let Some((head, _)) = lower.split_once('(') {
+        head.trim()
+    } else {
+        lower
+    };
+
+    match base {
+        // int2, int4, float4, float8 -> number
+        "int2" | "smallint" | "smallserial" => "number".to_string(),
+        "int4" | "integer" | "int" | "serial" => "number".to_string(),
+        "float4" | "real" => "number".to_string(),
+        "float8" | "double precision" => "number".to_string(),
+        "numeric" | "decimal" => "number".to_string(),
+
+        // int8, bigint -> string for postgres/pg, bigint for bun
+        "int8" | "bigint" | "bigserial" | "serial8" => match driver {
+            DriverTarget::Bun => "bigint".to_string(),
+            DriverTarget::Postgres | DriverTarget::Pg => "string".to_string(),
+        },
+
+        // bytea -> Buffer for postgres/pg, Uint8Array for bun
+        "bytea" => match driver {
+            DriverTarget::Bun => "Uint8Array".to_string(),
+            DriverTarget::Postgres | DriverTarget::Pg => "Buffer".to_string(),
+        },
+
+        // text, varchar, uuid -> string
+        "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" | "uuid"
+        | "citext" => "string".to_string(),
+
+        // bool -> boolean
+        "bool" | "boolean" => "boolean".to_string(),
+
+        // date -> string ("YYYY-MM-DD") across all drivers
+        "date" => "string".to_string(),
+
+        // timestamp, timestamptz -> Date across all drivers
+        "timestamptz"
+        | "timestamp with time zone"
+        | "timestamp"
+        | "timestamp without time zone" => "Date".to_string(),
+
+        "time" | "timetz" | "time with time zone" | "time without time zone" => {
+            "string".to_string()
+        }
+
+        // json, jsonb -> unknown
+        "json" | "jsonb" => "unknown".to_string(),
+
+        // pgvector
+        "vector" | "halfvec" => "number[]".to_string(),
+
+        // PostGIS
+        "geometry" | "geography" => "GeoJSON.Geometry".to_string(),
+
+        // Spatial box types
+        "box2d" | "box3d" => "string".to_string(),
+
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Extracts the normalized PostgreSQL type name from a TypeName AST node.
+pub fn extract_type_name(type_name: &pg_query::protobuf::TypeName) -> String {
+    let mut names = Vec::new();
+    for node in &type_name.names {
+        if let Some(NodeEnum::String(s)) = &node.node {
+            names.push(s.sval.as_str());
+        }
+    }
+
+    // In pg_query, names may be ["pg_catalog", "int4"] or ["uuid"] or ["public", "my_type"]
+    let base_name = if let Some(&last) = names.last() {
+        last
+    } else {
+        "text"
+    };
+
+    let mut typmod_str = String::new();
+    if !type_name.typmods.is_empty()
+        && (base_name.eq_ignore_ascii_case("vector") || base_name.eq_ignore_ascii_case("halfvec"))
+    {
+        let mut parts = Vec::new();
+        for tm in &type_name.typmods {
+            if let Some(NodeEnum::AConst(ac)) = &tm.node
+                && let Some(val) = &ac.val
+            {
+                match val {
+                    pg_query::protobuf::a_const::Val::Ival(i) => parts.push(i.ival.to_string()),
+                    pg_query::protobuf::a_const::Val::Sval(s) => parts.push(s.sval.clone()),
+                    _ => {}
+                }
+            }
+        }
+        if !parts.is_empty() {
+            typmod_str = format!("({})", parts.join(", "));
+        }
+    }
+
+    let full_name = format!("{}{}", base_name, typmod_str);
+
+    if !type_name.array_bounds.is_empty() {
+        format!("{}[]", full_name)
+    } else {
+        full_name
+    }
+}
+
+impl Catalog {
+    pub fn new(driver: DriverTarget) -> Self {
+        Self {
+            tables: HashMap::new(),
+            enums: HashMap::new(),
+            driver,
+            type_overrides: HashMap::new(),
+            extensions: HashSet::new(),
+            extension_types: HashMap::new(),
+            extension_operators: Vec::new(),
+            extension_functions: HashMap::new(),
+        }
+    }
+
+    pub fn with_overrides(mut self, overrides: HashMap<String, String>) -> Self {
+        self.type_overrides = overrides;
+        self
+    }
+
+    pub fn resolve_operator(
+        &self,
+        op_name: &str,
+        left: &PgType,
+        right: &PgType,
+    ) -> Option<&ExtensionOperator> {
+        self.extension_operators.iter().find(|op| {
+            op.name == op_name
+                && is_type_compatible(left, &op.left)
+                && is_type_compatible(right, &op.right)
+        })
+    }
+
+    pub fn resolve_function(&self, name: &str, arg_count: usize) -> Option<&ExtensionFunction> {
+        if let Some(funcs) = self.extension_functions.get(&name.to_ascii_lowercase()) {
+            funcs
+                .iter()
+                .find(|f| f.variadic || f.params.len() == arg_count)
+        } else {
+            None
+        }
+    }
+
+    pub fn resolve_function_with_args(
+        &self,
+        name: &str,
+        arg_types: &[PgType],
+    ) -> Option<&ExtensionFunction> {
+        if let Some(funcs) = self.extension_functions.get(&name.to_ascii_lowercase()) {
+            for f in funcs {
+                if f.variadic || f.params.len() == arg_types.len() {
+                    let matches = f
+                        .params
+                        .iter()
+                        .zip(arg_types.iter())
+                        .all(|(expected, actual)| is_type_compatible(actual, expected));
+                    if matches {
+                        return Some(f);
+                    }
+                }
+            }
+            funcs
+                .iter()
+                .find(|f| f.variadic || f.params.len() == arg_types.len())
+        } else {
+            None
+        }
+    }
+
+    /// Resolves a PostgreSQL type name to its TypeScript type representation,
+    /// checking for registered custom ENUM types before falling back to default primitives.
+    pub fn resolve_type(&self, pg_type: &str) -> String {
+        let lower = pg_type.to_ascii_lowercase();
+        let lower = lower.trim();
+
+        if let Some(inner) = lower.strip_suffix("[]") {
+            let inner_ts = self.resolve_type(inner);
+            if inner_ts.contains('|') {
+                return format!("({})[]", inner_ts);
+            } else {
+                return format!("{}[]", inner_ts);
+            }
+        }
+
+        let base = if let Some((head, _)) = lower.split_once('(') {
+            head.trim()
+        } else {
+            lower
+        };
+
+        if let Some(override_ts) = self
+            .type_overrides
+            .get(base)
+            .or_else(|| self.type_overrides.get(lower))
+        {
+            return override_ts.clone();
+        }
+
+        if let Some(vals) = self.enums.get(lower).or_else(|| self.enums.get(base)) {
+            if vals.is_empty() {
+                return "string".to_string();
+            }
+            return vals
+                .iter()
+                .map(|v| format!("\"{}\"", v))
+                .collect::<Vec<_>>()
+                .join(" | ");
+        }
+
+        normalize_pg_type_to_ts(pg_type, self.driver)
+    }
+
+    pub fn with_driver(mut self, driver: DriverTarget) -> Self {
+        self.driver = driver;
+        self
+    }
+
+    /// Loads and executes all `.sql` migration files in `dir` sorted alphanumerically with specified driver target.
+    pub fn load_from_dir_with_driver<P: AsRef<Path>>(
+        dir: P,
+        driver: DriverTarget,
+    ) -> Result<Self, String> {
+        let dir_path = dir.as_ref();
+        if !dir_path.exists() {
+            return Err(format!(
+                "Migrations directory does not exist: {}",
+                dir_path.display()
+            ));
+        }
+
+        let mut catalog = Catalog::new(driver);
+        let mut files: Vec<PathBuf> = Vec::new();
+
+        for entry in walkdir::WalkDir::new(dir_path).follow_links(true) {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            if path.is_file()
+                && let Some(ext) = path.extension()
+                && ext.eq_ignore_ascii_case("sql")
+            {
+                files.push(path.to_path_buf());
+            }
+        }
+
+        // Migrations MUST be sorted deterministically by filename/path before building the catalog
+        files.sort();
+
+        for file_path in files {
+            let content = std::fs::read_to_string(&file_path)
+                .map_err(|e| format!("Failed to read migration {}: {}", file_path.display(), e))?;
+            catalog
+                .apply_sql(&content)
+                .map_err(|e| format!("Failed to parse migration {}: {}", file_path.display(), e))?;
+        }
+
+        Ok(catalog)
+    }
+
+    /// Loads and executes all `.sql` migration files in `dir` sorted alphanumerically.
+    pub fn load_from_dir<P: AsRef<Path>>(dir: P) -> Result<Self, String> {
+        Self::load_from_dir_with_driver(dir, DriverTarget::default())
+    }
+
+    /// Parses SQL string and applies DDL statements to the catalog state.
+    pub fn apply_sql(&mut self, sql: &str) -> Result<(), String> {
+        let parsed = pg_query::parse(sql).map_err(|e| e.to_string())?;
+        self.apply_parsed(&parsed.protobuf)?;
+        Ok(())
+    }
+
+    /// Applies parsed statements to the catalog state.
+    pub fn apply_parsed(&mut self, result: &pg_query::protobuf::ParseResult) -> Result<(), String> {
+        for stmt in &result.stmts {
+            if let Some(node) = &stmt.stmt {
+                match &node.node {
+                    Some(NodeEnum::CreateStmt(create_stmt)) => {
+                        self.handle_create_stmt(create_stmt)?;
+                    }
+                    Some(NodeEnum::AlterTableStmt(alter_stmt)) => {
+                        self.handle_alter_table_stmt(alter_stmt)?;
+                    }
+                    Some(NodeEnum::CreateEnumStmt(create_enum)) => {
+                        self.handle_create_enum_stmt(create_enum)?;
+                    }
+                    Some(NodeEnum::CreateExtensionStmt(create_ext)) => {
+                        self.handle_create_extension_stmt(create_ext)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_create_extension_stmt(
+        &mut self,
+        stmt: &pg_query::protobuf::CreateExtensionStmt,
+    ) -> Result<(), String> {
+        let name = stmt.extname.to_ascii_lowercase();
+        if self.extensions.contains(&name) {
+            if stmt.if_not_exists {
+                return Ok(());
+            } else {
+                return Err(format!("Extension \"{}\" already exists", name));
+            }
+        }
+
+        let registry = extensions::ExtensionRegistry::default();
+        if let Some(ext_def) = registry.get(&name) {
+            self.extensions.insert(name);
+            for ext_type in ext_def.types() {
+                self.extension_types
+                    .insert(ext_type.name.to_ascii_lowercase(), ext_type.pg_type.clone());
+                for alias in ext_type.aliases {
+                    self.extension_types
+                        .insert(alias.to_ascii_lowercase(), ext_type.pg_type.clone());
+                }
+            }
+            for op in ext_def.operators() {
+                self.extension_operators.push(op);
+            }
+            for func in ext_def.functions() {
+                self.extension_functions
+                    .entry(func.name.to_ascii_lowercase())
+                    .or_default()
+                    .push(func);
+            }
+        } else {
+            self.extensions.insert(name);
+        }
+        Ok(())
+    }
+
+    fn handle_create_enum_stmt(
+        &mut self,
+        stmt: &pg_query::protobuf::CreateEnumStmt,
+    ) -> Result<(), String> {
+        let mut name_parts = Vec::new();
+        for node in &stmt.type_name {
+            if let Some(NodeEnum::String(s)) = &node.node {
+                name_parts.push(s.sval.as_str());
+            }
+        }
+        let enum_name = match name_parts.last() {
+            Some(&name) => name.to_ascii_lowercase(),
+            None => return Ok(()),
+        };
+
+        let mut values = Vec::new();
+        for node in &stmt.vals {
+            if let Some(NodeEnum::String(s)) = &node.node {
+                values.push(s.sval.clone());
+            }
+        }
+
+        self.enums.insert(enum_name, values);
+        Ok(())
+    }
+
+    fn handle_create_stmt(&mut self, stmt: &pg_query::protobuf::CreateStmt) -> Result<(), String> {
+        let rel = match &stmt.relation {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        let table_name = rel.relname.to_ascii_lowercase();
+        let schema = if rel.schemaname.is_empty() {
+            None
+        } else {
+            Some(rel.schemaname.to_ascii_lowercase())
+        };
+
+        let mut columns: Vec<ColumnMetadata> = Vec::new();
+        let mut table_pk_cols: Vec<String> = Vec::new();
+
+        for elt in &stmt.table_elts {
+            match &elt.node {
+                Some(NodeEnum::ColumnDef(col)) => {
+                    let col_name = col.colname.clone();
+                    let pg_type = col
+                        .type_name
+                        .as_ref()
+                        .map(extract_type_name)
+                        .unwrap_or_else(|| "text".to_string());
+                    let ts_type = self.resolve_type(&pg_type);
+
+                    let mut is_not_null = col.is_not_null
+                        || matches!(
+                            pg_type.to_ascii_lowercase().as_str(),
+                            "serial"
+                                | "bigserial"
+                                | "smallserial"
+                                | "serial8"
+                                | "serial4"
+                                | "serial2"
+                        );
+                    let mut has_default = matches!(
+                        pg_type.to_ascii_lowercase().as_str(),
+                        "serial" | "bigserial" | "smallserial" | "serial8" | "serial4" | "serial2"
+                    );
+                    for c in &col.constraints {
+                        if let Some(NodeEnum::Constraint(constr)) = &c.node {
+                            if constr.contype == ConstrType::ConstrPrimary as i32
+                                || constr.contype == ConstrType::ConstrNotnull as i32
+                            {
+                                is_not_null = true;
+                            } else if constr.contype == ConstrType::ConstrDefault as i32 {
+                                has_default = true;
+                            }
+                        }
+                    }
+
+                    columns.push(ColumnMetadata {
+                        name: col_name,
+                        pg_type,
+                        ts_type,
+                        is_nullable: !is_not_null,
+                        has_default,
+                    });
+                }
+                Some(NodeEnum::Constraint(constr))
+                    if constr.contype == ConstrType::ConstrPrimary as i32 =>
+                {
+                    for key in &constr.keys {
+                        if let Some(NodeEnum::String(s)) = &key.node {
+                            table_pk_cols.push(s.sval.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Apply table-level primary key constraints
+        for pk_col in table_pk_cols {
+            if let Some(col) = columns
+                .iter_mut()
+                .find(|c| c.name.eq_ignore_ascii_case(&pk_col))
+            {
+                col.is_nullable = false;
+            }
+        }
+
+        let table_meta = TableMetadata {
+            name: table_name.clone(),
+            schema,
+            columns,
+        };
+
+        self.tables.insert(table_name, table_meta);
+        Ok(())
+    }
+
+    fn handle_alter_table_stmt(
+        &mut self,
+        stmt: &pg_query::protobuf::AlterTableStmt,
+    ) -> Result<(), String> {
+        let rel = match &stmt.relation {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        let table_name = rel.relname.to_ascii_lowercase();
+        if !self.tables.contains_key(&table_name) {
+            return Ok(());
+        }
+
+        for cmd_node in &stmt.cmds {
+            if let Some(NodeEnum::AlterTableCmd(cmd)) = &cmd_node.node {
+                if cmd.subtype == AlterTableType::AtAddColumn as i32 {
+                    if let Some(def_node) = &cmd.def
+                        && let Some(NodeEnum::ColumnDef(col)) = &def_node.node
+                    {
+                        let col_name = col.colname.clone();
+                        let pg_type = col
+                            .type_name
+                            .as_ref()
+                            .map(extract_type_name)
+                            .unwrap_or_else(|| "text".to_string());
+                        let ts_type = self.resolve_type(&pg_type);
+                        let mut is_not_null = col.is_not_null
+                            || matches!(
+                                pg_type.to_ascii_lowercase().as_str(),
+                                "serial"
+                                    | "bigserial"
+                                    | "smallserial"
+                                    | "serial8"
+                                    | "serial4"
+                                    | "serial2"
+                            );
+                        let mut has_default = matches!(
+                            pg_type.to_ascii_lowercase().as_str(),
+                            "serial"
+                                | "bigserial"
+                                | "smallserial"
+                                | "serial8"
+                                | "serial4"
+                                | "serial2"
+                        );
+                        for c in &col.constraints {
+                            if let Some(NodeEnum::Constraint(constr)) = &c.node {
+                                if constr.contype == ConstrType::ConstrPrimary as i32
+                                    || constr.contype == ConstrType::ConstrNotnull as i32
+                                {
+                                    is_not_null = true;
+                                } else if constr.contype == ConstrType::ConstrDefault as i32 {
+                                    has_default = true;
+                                }
+                            }
+                        }
+
+                        if let Some(table) = self.tables.get_mut(&table_name) {
+                            table
+                                .columns
+                                .retain(|c| !c.name.eq_ignore_ascii_case(&col_name));
+                            table.columns.push(ColumnMetadata {
+                                name: col_name,
+                                pg_type,
+                                ts_type,
+                                is_nullable: !is_not_null,
+                                has_default,
+                            });
+                        }
+                    }
+                } else if cmd.subtype == AlterTableType::AtDropColumn as i32 {
+                    let col_name = &cmd.name;
+                    if let Some(table) = self.tables.get_mut(&table_name) {
+                        table
+                            .columns
+                            .retain(|c| !c.name.eq_ignore_ascii_case(col_name));
+                    }
+                } else if cmd.subtype == AlterTableType::AtAlterColumnType as i32 {
+                    let col_name = &cmd.name;
+                    if let Some(def_node) = &cmd.def
+                        && let Some(NodeEnum::ColumnDef(col)) = &def_node.node
+                    {
+                        let pg_type = col
+                            .type_name
+                            .as_ref()
+                            .map(extract_type_name)
+                            .unwrap_or_else(|| "text".to_string());
+                        let ts_type = self.resolve_type(&pg_type);
+                        if let Some(table) = self.tables.get_mut(&table_name)
+                            && let Some(existing_col) = table
+                                .columns
+                                .iter_mut()
+                                .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                        {
+                            existing_col.pg_type = pg_type;
+                            existing_col.ts_type = ts_type;
+                        }
+                    }
+                } else if cmd.subtype == AlterTableType::AtSetNotNull as i32 {
+                    let col_name = &cmd.name;
+                    if let Some(table) = self.tables.get_mut(&table_name)
+                        && let Some(existing_col) = table
+                            .columns
+                            .iter_mut()
+                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                    {
+                        existing_col.is_nullable = false;
+                    }
+                } else if cmd.subtype == AlterTableType::AtDropNotNull as i32 {
+                    let col_name = &cmd.name;
+                    if let Some(table) = self.tables.get_mut(&table_name)
+                        && let Some(existing_col) = table
+                            .columns
+                            .iter_mut()
+                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                    {
+                        existing_col.is_nullable = true;
+                    }
+                } else if cmd.subtype == AlterTableType::AtColumnDefault as i32 {
+                    let col_name = &cmd.name;
+                    if let Some(table) = self.tables.get_mut(&table_name)
+                        && let Some(existing_col) = table
+                            .columns
+                            .iter_mut()
+                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                    {
+                        existing_col.has_default = cmd.def.is_some();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Looks up a table in the catalog by table name (case-insensitive) or schema-qualified name.
+    pub fn get_table(&self, name: &str) -> Option<&TableMetadata> {
+        let lower = name.to_ascii_lowercase();
+        if let Some(t) = self.tables.get(&lower) {
+            return Some(t);
+        }
+        if let Some((_, table_part)) = lower.rsplit_once('.')
+            && let Some(t) = self.tables.get(table_part)
+        {
+            return Some(t);
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_table_parsing() {
+        let sql = "
+            CREATE TABLE users (
+                id UUID PRIMARY KEY,
+                email TEXT NOT NULL,
+                age INT,
+                bio VARCHAR(500),
+                is_admin BOOLEAN NOT NULL DEFAULT false,
+                metadata JSONB,
+                created_at TIMESTAMPTZ NOT NULL
+            );
+        ";
+        let mut catalog = Catalog::default();
+        catalog.apply_sql(sql).unwrap();
+
+        let table = catalog
+            .get_table("users")
+            .expect("users table should exist");
+        assert_eq!(table.name, "users");
+        assert_eq!(table.columns.len(), 7);
+
+        let id_col = table.get_column("id").unwrap();
+        assert_eq!(id_col.ts_type, "string");
+        assert!(!id_col.is_nullable);
+
+        let email_col = table.get_column("email").unwrap();
+        assert_eq!(email_col.ts_type, "string");
+        assert!(!email_col.is_nullable);
+
+        let age_col = table.get_column("age").unwrap();
+        assert_eq!(age_col.ts_type, "number");
+        assert!(age_col.is_nullable);
+
+        let bio_col = table.get_column("bio").unwrap();
+        assert_eq!(bio_col.ts_type, "string");
+        assert!(bio_col.is_nullable);
+
+        let admin_col = table.get_column("is_admin").unwrap();
+        assert_eq!(admin_col.ts_type, "boolean");
+        assert!(!admin_col.is_nullable);
+
+        let meta_col = table.get_column("metadata").unwrap();
+        assert_eq!(meta_col.ts_type, "unknown");
+        assert!(meta_col.is_nullable);
+
+        let created_col = table.get_column("created_at").unwrap();
+        assert_eq!(created_col.ts_type, "Date");
+        assert!(!created_col.is_nullable);
+    }
+
+    #[test]
+    fn test_sequential_ddl_alters() {
+        let mut catalog = Catalog::default();
+
+        // 1. Initial CREATE TABLE
+        catalog
+            .apply_sql("CREATE TABLE products (id UUID PRIMARY KEY, name TEXT NOT NULL);")
+            .unwrap();
+        let table = catalog.get_table("products").unwrap();
+        assert_eq!(table.columns.len(), 2);
+
+        // 2. ALTER TABLE ADD COLUMN
+        catalog
+            .apply_sql("ALTER TABLE products ADD COLUMN price NUMERIC NOT NULL;")
+            .unwrap();
+        let table = catalog.get_table("products").unwrap();
+        assert_eq!(table.columns.len(), 3);
+        let price_col = table.get_column("price").unwrap();
+        assert_eq!(price_col.ts_type, "number");
+        assert!(!price_col.is_nullable);
+
+        // 3. ALTER TABLE ALTER COLUMN TYPE
+        catalog
+            .apply_sql("ALTER TABLE products ALTER COLUMN name TYPE VARCHAR(255);")
+            .unwrap();
+        let table = catalog.get_table("products").unwrap();
+        let name_col = table.get_column("name").unwrap();
+        assert_eq!(name_col.ts_type, "string");
+        assert_eq!(name_col.pg_type, "varchar");
+        assert!(!name_col.is_nullable);
+
+        // 4. ALTER TABLE DROP COLUMN
+        catalog
+            .apply_sql("ALTER TABLE products DROP COLUMN price;")
+            .unwrap();
+        let table = catalog.get_table("products").unwrap();
+        assert_eq!(table.columns.len(), 2);
+        assert!(table.get_column("price").is_none());
+
+        // 5. ALTER TABLE ADD COLUMN and ALTER NOT NULL
+        catalog
+            .apply_sql("ALTER TABLE products ADD COLUMN views INT;")
+            .unwrap();
+        let views_col = catalog
+            .get_table("products")
+            .unwrap()
+            .get_column("views")
+            .unwrap();
+        assert!(views_col.is_nullable);
+
+        catalog
+            .apply_sql("ALTER TABLE products ALTER COLUMN views SET NOT NULL;")
+            .unwrap();
+        let views_col = catalog
+            .get_table("products")
+            .unwrap()
+            .get_column("views")
+            .unwrap();
+        assert!(!views_col.is_nullable);
+
+        catalog
+            .apply_sql("ALTER TABLE products ALTER COLUMN views DROP NOT NULL;")
+            .unwrap();
+        let views_col = catalog
+            .get_table("products")
+            .unwrap()
+            .get_column("views")
+            .unwrap();
+        assert!(views_col.is_nullable);
+    }
+
+    #[test]
+    fn test_table_level_primary_key() {
+        let sql = "
+            CREATE TABLE order_items (
+                order_id UUID,
+                item_id INT,
+                quantity INT NOT NULL,
+                PRIMARY KEY (order_id, item_id)
+            );
+        ";
+        let mut catalog = Catalog::default();
+        catalog.apply_sql(sql).unwrap();
+
+        let table = catalog.get_table("order_items").unwrap();
+        assert!(!table.get_column("order_id").unwrap().is_nullable);
+        assert!(!table.get_column("item_id").unwrap().is_nullable);
+        assert!(!table.get_column("quantity").unwrap().is_nullable);
+    }
+
+    #[test]
+    fn test_load_from_dir_deterministic_sorting() {
+        use std::fs;
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sqltype_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        // Write migration 002 first, then 001
+        fs::write(
+            temp_dir.join("002_add_col.sql"),
+            "ALTER TABLE items ADD COLUMN price INT NOT NULL;",
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.join("001_create.sql"),
+            "CREATE TABLE items (id UUID PRIMARY KEY);",
+        )
+        .unwrap();
+
+        let catalog = Catalog::load_from_dir(&temp_dir).unwrap();
+        let table = catalog
+            .get_table("items")
+            .expect("items table should exist");
+        assert_eq!(table.columns.len(), 2);
+        assert!(!table.get_column("id").unwrap().is_nullable);
+        assert!(!table.get_column("price").unwrap().is_nullable);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_create_enum_type() {
+        let sql = "
+            CREATE TYPE user_role AS ENUM ('admin', 'editor', 'viewer');
+            CREATE TABLE team_members (
+                id UUID PRIMARY KEY,
+                role user_role NOT NULL,
+                backup_roles user_role[]
+            );
+        ";
+        let mut catalog = Catalog::default();
+        catalog.apply_sql(sql).unwrap();
+
+        assert_eq!(
+            catalog.resolve_type("user_role"),
+            "\"admin\" | \"editor\" | \"viewer\""
+        );
+        assert_eq!(
+            catalog.resolve_type("user_role[]"),
+            "(\"admin\" | \"editor\" | \"viewer\")[]"
+        );
+
+        let table = catalog.get_table("team_members").unwrap();
+        let role_col = table.get_column("role").unwrap();
+        assert_eq!(role_col.ts_type, "\"admin\" | \"editor\" | \"viewer\"");
+        assert!(!role_col.is_nullable);
+
+        let backup_col = table.get_column("backup_roles").unwrap();
+        assert_eq!(
+            backup_col.ts_type,
+            "(\"admin\" | \"editor\" | \"viewer\")[]"
+        );
+        assert!(backup_col.is_nullable);
+    }
+}

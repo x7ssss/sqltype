@@ -1,8 +1,14 @@
 {
-  "name": "@sqltype/linux-x64",
-  "version": "0.1.0",
+  "name": "@x7ssss/sqltype-linux-x64",
+  "version": "0.3.0",
   "description": "Native sqltype binary for Linux x86_64",
   "os": ["linux"],
   "cpu": ["x64"],
-  "license": "MIT"
+  "files": ["bin"],
+  "author": "x7ssss",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/x7ssss/sqltype"
+  }
 }
