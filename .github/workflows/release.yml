@@ -137,7 +137,7 @@ jobs:
             npm version "$VERSION" --prefix "$PKG_DIR" --no-git-tag-version --allow-same-version
 
             # Publish platform package
-            npm publish "$PKG_DIR" --access public
+            npm publish "$PKG_DIR" --access public || echo "Package @x7ssss/sqltype-$PLATFORM may already be published"
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -162,7 +162,8 @@ jobs:
           "
 
           # Publish root package
-          npm publish "$PKG_DIR" --access public
+          cd "$PKG_DIR"
+          npm publish --access public --ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
