@@ -1,28 +1,91 @@
 # sqltype
 
-> **Ultra-fast, local-first SQL-to-TypeScript compiler CLI and Language Server in Rust.**  
-> Write raw PostgreSQL queries with compile-time type safety. **Zero** Docker containers. **Zero** WASM overhead. **Sub-10ms** codegen & LSP.
+[![Release](https://img.shields.io/badge/npm-v1.4.0-blue.svg)](https://www.npmjs.com/package/@x7ssss/sqltype)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Runtime Dependencies](https://img.shields.io/badge/dependencies-0%20(standalone%20Rust)-success.svg)](https://github.com/x7sss/sqltype)
+[![Rust Version](https://img.shields.io/badge/rust-%3E%3D1.75.0-orange.svg)](https://www.rust-lang.org/)
+[![Tests](https://img.shields.io/badge/tests-40%20passed-brightgreen.svg)](https://github.com/x7sss/sqltype)
 
-[![Release](https://img.shields.io/badge/npm-%40x7ssss%2Fsqltype-blue.svg)](https://www.npmjs.com/package/@x7ssss/sqltype)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-40%20passed-brightgreen.svg)]()
-
----
-
-## Why sqltype?
-
-Modern TypeScript database tools often force an undesirable trade-off:
-- **ORMs (Prisma, Drizzle)** introduce proprietary query DSLs, runtime overhead, and complex migration engines.
-- **PgTyped** requires an active PostgreSQL connection or Docker instance running during compilation to infer types.
-- **sqlc-gen-typescript** runs heavy 69MB WASM blobs in Node.js, introducing significant compile-time latency.
-
-**`sqltype`** eliminates these compromises. By embedding PostgreSQL's native C-parser (`libpg_query`) into a standalone Rust binary, `sqltype` parses raw migration DDL files offline to build an exact in-memory schema catalog and analyzes SQL query ASTs in **sub-10ms**, emitting clean, zero-dependency TypeScript types and SQL constants.
+Ultra-fast, local-first PostgreSQL SQL-to-TypeScript compiler CLI and Language Server written in pure Rust. Embeds PostgreSQL's native grammar parser to compile migration DDL catalogs and analyze SQL query ASTs in sub-10ms with zero Docker containers, zero WASM overhead, and absolute compile-time type safety.
 
 ---
 
-## Performance Benchmarks
+## 🏛️ System Architecture
 
-Benchmarks measured on an Apple Silicon M-series / AMD Ryzen 9 workstation across 100 queries and 25 migration DDL tables:
+`sqltype` links directly against PostgreSQL's native C-parser (`libpg_query`) inside a standalone Rust executable. Migration DDL files are compiled into an in-memory catalog, allowing complex query ASTs, Common Table Expressions, and outer joins to resolve without a running database engine:
+
+```
+┌─────────────────────────┐     ┌─────────────────────────┐
+│  migrations/*.sql (DDL) │     │    queries/*.sql (DML)  │
+└────────────┬────────────┘     └────────────┬────────────┘
+             │                               │
+             ▼                               ▼
+┌─────────────────────────┐     ┌─────────────────────────┐
+│   libpg_query C-Parser  │     │   libpg_query C-Parser  │
+│  (Native PG 16 Grammar) │     │  (Native PG 16 Grammar) │
+└────────────┬────────────┘     └────────────┬────────────┘
+             │                               │
+             ▼                               │
+┌─────────────────────────┐                  │
+│ In-Memory Schema Catalog│                  │
+│ • Tables & Column Types │                  │
+│ • Custom ENUM Registries│                  │
+│ • Atomic ArcSwap Reload │                  │
+└────────────┬────────────┘                  │
+             │                               │
+             └───────────────┬───────────────┘
+                             │
+                             ▼
+              ┌─────────────────────────────┐
+              │  AST Analysis & Scoping     │
+              │  • CTE Scope Overlay Engine │
+              │  • Join Nullability Mapper  │
+              │  • Nullable Parameter Bypass│
+              └──────────────┬──────────────┘
+                             │
+                             ▼
+              ┌─────────────────────────────┐
+              │  Driver Profile Transpiler  │
+              │  • postgres.js              │
+              │  • node-postgres (pg)       │
+              │  • Bun.sql                  │
+              └──────────────┬──────────────┘
+                             │
+            ┌────────────────┴────────────────┐
+            ▼                                 ▼
+┌──────────────────────────────┐  ┌──────────────────────────────┐
+│   Zero-Dep TypeScript Codegen│  │ Sub-10ms Language Server     │
+│ • Immutable SQL String Const │  │ • stdio JSON-RPC Diagnostics │
+│ • Strict Params & Row Types  │  │ • Lock-Free Hot-Reload       │
+│ • Async Execution Wrappers   │  │ • Rich Parameter/Table Hover │
+└──────────────────────────────┘  └──────────────────────────────┘
+```
+
+1. **DDL Parsing**: Ingests raw `.sql` migration files using PostgreSQL's native C grammar (`pg_query_parse`).
+2. **Catalog Construction**: Builds an exact in-memory representation of tables, column nullability, defaults, and custom ENUM types.
+3. **Query AST Traversal**: Analyzes query parse trees to resolve table references, parameter positions (`$1`, `$2`), projections, and aliasing.
+4. **Scope & Nullability Overlay**: Recursively evaluates Common Table Expressions (CTEs), resolves column masking, and adjusts nullability for `LEFT`, `RIGHT`, and `FULL` outer joins.
+5. **Driver Profile Mapping**: Maps SQL engine types (`int8`, `uuid`, `timestamptz`, `bytea`) to exact TypeScript primitives based on target runtime drivers (`postgres.js`, `pg`, `Bun.sql`).
+6. **Artifact Emission & LSP Services**: Emits zero-dependency TypeScript contracts, generates typed async execution wrappers, and powers sub-10ms editor diagnostics over stdio.
+
+---
+
+## 🎯 The Concrete Problem
+
+Modern TypeScript database workflows suffer from critical engineering compromises across reliability, developer ergonomics, and build latency:
+
+- **WASM Engine Latency & Memory Bloat:** Alternative compilers relying on WASM bundles (such as `sqlc-gen-typescript`) package 69 MB WebAssembly binaries into Node.js processes. Cold compilation incurs 2,000ms+ latency and consumes hundreds of megabytes of V8 heap space, rendering watch mode unusable in large monorepos.
+- **Docker Daemon Coupling & Network Round-Trips:** Tools like `PgTyped` mandate a running PostgreSQL container during local development and CI pipelines to infer types via `PREPARE` statements. A single unapplied migration, container crash, or network timeout breaks compilation and stalls CI validation.
+- **ORM Runtime Abstraction Taxes:** ORMs such as Prisma and Drizzle force teams into proprietary query DSLs, introduce runtime query translation penalties, and lack support for advanced SQL features like recursive CTEs, window functions, and native lateral joins.
+- **Dynamic Filter Nullability Erasure:** Ad-hoc query generators fail to parse dynamic parameter bypass predicates like `WHERE ($1::text IS NULL OR name = $1)`. Consequently, parameters are marked as strictly non-nullable or forced into manual unsafe TypeScript type casts (`as unknown as string`).
+- **Outer Join Projection Nullability Bugs:** Hand-written or naive AST tools do not track relational join nullability down the projection tree. Right-side columns in `LEFT JOIN` operations are incorrectly emitted as non-nullable, triggering production runtime `TypeError: Cannot read properties of undefined` exceptions.
+- **Lock-Bound Schema Synchronization in LSP:** Existing language servers lock the entire diagnostic loop during schema updates, causing editor keystroke stuttering and degraded developer feedback loops.
+
+---
+
+## ⚡ Performance Benchmarks
+
+Measured on Apple Silicon M-series and AMD Ryzen 9 workstations across 100 queries and 25 migration DDL tables:
 
 | Metric | `sqltype` (Rust) | sqlc-gen-typescript (WASM) | PgTyped (Node) | Prisma (Engine) |
 | :--- | :--- | :--- | :--- | :--- |
@@ -35,13 +98,13 @@ Benchmarks measured on an Apple Silicon M-series / AMD Ryzen 9 workstation acros
 
 ---
 
-## Comparison
+## 🔍 Feature Comparison
 
 | Feature | `sqltype` | PgTyped | sqlc (TS) | Prisma |
 | :--- | :--- | :--- | :--- | :--- |
-| **Running Database Required** | **No** (Offline AST) | Yes (Docker / Postgres) | No | No (Dev schema engine) |
-| **Codegen Speed** | **< 10ms** (Native Rust) | 200–800ms (Network roundtrip) | 2–3s (69MB WASM) | 1–3s (Node / WASM) |
-| **Runtime Overhead** | **0 KB** (Pure types & strings) | Runtime helper | 0 KB | Heavy client library & engine |
+| **Running Database Required** | **No** (Offline AST) | Yes (Docker / Live DB) | No | No (Dev schema engine) |
+| **Codegen Speed** | **< 10ms** (Native Rust) | 200-800ms (Network RT) | 2-3s (69MB WASM) | 1-3s (Node / WASM) |
+| **Runtime Overhead** | **0 KB** (Pure types & SQL) | Runtime helper library | 0 KB | Heavy client library |
 | **Execution Wrappers** | **Built-in (`--wrappers`)** | Yes | Optional plugin | Proprietary client |
 | **Custom PostgreSQL ENUMs** | **Automatic (`"a" \| "b"`)** | Manual overrides | Partial | Handled |
 | **Outer Join Nullability** | **Automatic** (AST traversal) | Manual overrides / Flaky | Manual casts | Handled |
@@ -54,234 +117,148 @@ Benchmarks measured on an Apple Silicon M-series / AMD Ryzen 9 workstation acros
 
 ---
 
-## Comprehensive Feature Breakdown
+## 🛡️ Core Engineering Invariants
 
-### 1. Offline AST Analysis (Zero Docker, Zero Postgres)
-Uses PostgreSQL's native grammar parser via `libpg_query` directly compiled into Rust. Builds an exact schema catalog entirely from your migration `.sql` files without needing Docker or a live database.
+- **Zero Runtime Dependencies:** Emits pristine, self-contained TypeScript interfaces and raw SQL strings. Zero runtime libraries, zero helper shims, and zero node_modules additions in production.
+- **Embedded Native C-Parser:** Bundles PostgreSQL's native grammar parser (`libpg_query`) directly compiled into the native Rust binary. Eliminates Docker, external network access, and WASM runtime overhead.
+- **Sub-10ms Deterministic Compilation:** Guarantees sub-10ms cold codegen across production schemas and sub-1ms incremental reloads under watch mode. Output files are strictly deterministic with canonical ordering.
+- **Lock-Free Atomic Catalog Hot-Reloading:** The Language Server maintains schema catalogs inside an `ArcSwap` container. File modification events reload the catalog atomically without blocking diagnostic worker threads or editor input.
+- **Strict Driver Type Fidelity:** Matches driver-specific runtime behaviors (e.g. `int8` handling in `postgres.js` vs `Bun.sql`) directly at code generation time, preventing silent JavaScript numeric precision loss.
+- **Relational Nullability Safety:** Automatically propagates `NULL` semantics across `LEFT JOIN`, `RIGHT JOIN`, and `FULL JOIN` AST branches, protecting client code from unhandled `undefined` runtime property access.
 
-### 2. Strict Driver Target Profiles (`--driver postgres | pg | bun`)
-Fine-tune generated TypeScript primitives to match your database driver runtime:
-- **`postgres`** (default, `postgres.js`):
-  - `int8` / `bigint` -> `string`
-  - `bytea` -> `Buffer`
-  - `date` -> `string`
-  - `timestamp` / `timestamptz` -> `Date`
-- **`pg`** (`node-postgres`):
-  - `int8` / `bigint` -> `string`
-  - `bytea` -> `Buffer`
-  - `date` -> `string`
-  - `timestamp` / `timestamptz` -> `Date`
-- **`bun`** (`Bun.sql`):
-  - `int8` / `bigint` -> native JavaScript `bigint`
-  - `bytea` -> `Uint8Array`
-  - `date` -> `string`
-  - `timestamp` / `timestamptz` -> `Date`
+---
 
-### 3. Type-Safe Query Execution Wrappers (`-w, --wrappers`)
-When the `--wrappers` flag is enabled, `sqltype` generates typed async execution functions tailored to your driver target:
+## 📦 Installation & Distribution
 
-#### Driver: `postgres` (`postgres.js`)
-```typescript
-// Queries with rows (SELECT, INSERT/UPDATE/DELETE with RETURNING):
-export async function getUser(sql: postgres.Sql, params: GetUserParams): Promise<GetUserRow[]> {
-  return await sql<GetUserRow[]>`${sql.unsafe(getUserSql, [params.id])}`;
-}
-
-// Mutations without rows (DELETE, UPDATE without RETURNING):
-export async function deleteUser(sql: postgres.Sql, params: DeleteUserParams): Promise<void> {
-  await sql.unsafe(deleteUserSql, [params.id]);
-}
+### Run via npx (Zero Install)
+```bash
+npx @x7ssss/sqltype generate --migrations ./migrations --queries ./queries --out ./src/types
 ```
 
-#### Driver: `pg` (`node-postgres`)
-```typescript
-// Queries with rows:
-export async function getUser(client: pg.ClientBase | pg.Pool, params: GetUserParams): Promise<GetUserRow[]> {
-  const res = await client.query<GetUserRow>(getUserSql, [params.id]);
-  return res.rows;
-}
+### Install as devDependency (Recommended)
+```bash
+# npm
+npm install -D @x7ssss/sqltype
 
-// Mutations without rows:
-export async function deleteUser(client: pg.ClientBase | pg.Pool, params: DeleteUserParams): Promise<void> {
-  await client.query(deleteUserSql, [params.id]);
-}
+# pnpm
+pnpm add -D @x7ssss/sqltype
+
+# yarn
+yarn add -D @x7ssss/sqltype
 ```
 
-#### Driver: `bun` (`Bun.sql`)
-```typescript
-// Queries with rows:
-export async function getUser(sql: import("bun").SQL, params: GetUserParams): Promise<GetUserRow[]> {
-  return await sql<GetUserRow[]>`${sql.raw(getUserSql, [params.id])}`;
-}
-
-// Mutations without rows:
-export async function deleteUser(sql: import("bun").SQL, params: DeleteUserParams): Promise<void> {
-  await sql.raw(deleteUserSql, [params.id]);
-}
+### Compile from Source (Cargo)
+```bash
+git clone https://github.com/x7sss/sqltype.git
+cd sqltype
+cargo build --release
+./target/release/sqltype --version
 ```
 
-*Note: If a query accepts no parameters, the `params` argument is automatically omitted from the generated wrapper signature.*
+---
 
-### 4. Custom PostgreSQL ENUM Support
-`sqltype` automatically extracts `CREATE TYPE ... AS ENUM (...)` declarations in migration files and generates strict TypeScript string literal unions:
+## 🚀 Quickstart & Workflow
+
+### 1. Directory Structure
+
+```
+my-project/
+├── migrations/
+│   ├── 001_create_types.sql
+│   ├── 002_create_users.sql
+│   └── 003_create_posts.sql
+├── queries/
+│   ├── get_user_with_posts.sql
+│   ├── find_users_dynamic.sql
+│   ├── create_user.sql
+│   └── delete_post.sql
+└── src/
+    └── types/
+        └── (compiled .ts files emitted here)
+```
+
+### 2. Migration DDL Definitions
 
 ```sql
 -- migrations/001_create_types.sql
 CREATE TYPE user_status AS ENUM ('active', 'inactive', 'suspended');
 
+-- migrations/002_create_users.sql
 CREATE TABLE users (
-  id UUID PRIMARY KEY,
-  status user_status NOT NULL,
-  status_history user_status[]
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email VARCHAR(255) NOT NULL UNIQUE,
+  status user_status NOT NULL DEFAULT 'active',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- migrations/003_create_posts.sql
+CREATE TABLE posts (
+  id BIGSERIAL PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title VARCHAR(300) NOT NULL,
+  body TEXT NOT NULL,
+  published BOOLEAN NOT NULL DEFAULT false,
+  published_at TIMESTAMPTZ
 );
 ```
 
-Generated TypeScript mapping:
-```typescript
-export interface GetUserRow {
-  id: string;
-  status: "active" | "inactive" | "suspended";
-  status_history: ("active" | "inactive" | "suspended")[] | null;
-}
-```
+### 3. Query Definitions with Header Annotations
 
-### 5. AST Detection for Optional / Dynamic Filters
-`sqltype` statically detects nullable parameter bypass patterns in `WHERE` clauses:
-```sql
-WHERE ($1::text IS NULL OR name = $1) AND id = $2;
-```
-Recognizes that `$1` is optional and emits:
-```typescript
-export interface FindUserParams {
-  name?: string | null;
-  id: string;
-}
-```
-When generated with `--wrappers`, optional parameters are safely forwarded with null coalescing (`params.name ?? null`).
+Each `.sql` file in your queries directory must declare a `-- name: <QueryName>` annotation:
 
-### 6. Full DML Mutation Support (with and without `RETURNING`)
-Full static typing for mutations alongside queries:
-- **`INSERT`**: Correlates insert columns with parameter values; columns with database defaults or nullable definitions are treated as optional parameters where appropriate.
-- **`UPDATE`**: Analyzes `SET` target assignments and `WHERE` filter conditions.
-- **`DELETE`**: Maps filter parameters and validates table relations.
-- **`RETURNING` Clause**:
-  - **With `RETURNING`**: Generates both `<Query>Params` and `<Query>Row` interfaces.
-  - **Without `RETURNING`**: Emits pure mutation query types (`Params` only, omitting unnecessary empty row types).
-
-### 7. Static Join Nullability & CTE Scoping
-- **`LEFT JOIN`**: Right-hand table projections are automatically marked `| null`.
-- **`RIGHT JOIN`**: Left-hand table projections are automatically marked `| null`.
-- **`FULL JOIN`**: Projections from both sides are marked `| null`.
-- **`WITH` (Common Table Expressions)**: Recursively parses CTE queries, registering temporary projected schemas into a query-scoped catalog overlay.
-
-### 8. Expression & Function Resolution
-- Arithmetic (`+`, `-`, `*`, `/`) resolves to `number`.
-- `COALESCE(a, b)`: If any operand is statically non-nullable, the result is marked non-nullable.
-- Aggregate nullability: `COUNT(...)` is strictly `number`, while `SUM(...)` / `AVG(...)` evaluate to `number | null`.
-- PostgreSQL arrays (`text[]`, `int4[]`) correctly emit TypeScript array types (`string[]`, `number[]`).
-
-### 9. Sub-5ms Incremental Watch Mode (`-W, --watch`)
-Watches your query and migration files. Query changes re-analyze only the changed file against the cached catalog in `< 5ms`. Migration edits re-apply DDL and refresh all queries automatically.
-
-### 10. Sub-10ms Language Server Protocol (`sqltype lsp`)
-An ultra-fast Language Server Protocol server operating over stdio:
-- **Real-Time Syntax Diagnostics**: Maps PostgreSQL C-parser syntax errors directly to document line and column ranges via `cursorpos`.
-- **Schema Validation**: Traverses AST `RangeVar` relations against the schema catalog, flagging nonexistent tables with red squiggly underlines.
-- **Lock-Free Hot-Reloading**: Migration edits on disk reload the schema catalog atomically via `ArcSwap`, re-triggering instant validation across all open editor buffers.
-- **Rich Markdown Hover**:
-  - Hovering over `$N` displays parameter name, inferred PostgreSQL type, TypeScript type, and optional status.
-  - Hovering over tables shows table name and column schemas with nullability.
-  - Hovering over column references shows inferred PostgreSQL and TypeScript types.
-
----
-
-## Quickstart
-
-### 1. Installation
-
-Install as a project devDependency via npm:
-
-```bash
-npm install -D @x7ssss/sqltype
-# or run directly
-npx @x7ssss/sqltype generate --migrations ./migrations --queries ./queries --out ./types
-```
-
-Using other package managers:
-
-```bash
-# Using pnpm
-pnpm add -D @x7ssss/sqltype
-
-# Using yarn
-yarn add -D @x7ssss/sqltype
-
-# Using Cargo (compile from source)
-cargo install --path .
-```
-
-### 2. Directory Structure
-
-```
-my-project/
-├── migrations/
-│   ├── 001_create_users.sql
-│   └── 002_create_posts.sql
-├── queries/
-│   ├── get_user_with_posts.sql
-│   ├── find_posts_by_status.sql
-│   ├── create_user.sql
-│   └── delete_post.sql
-└── src/
-    └── types/
-        └── (generated .ts files emitted here)
-```
-
-### 3. Example Queries
-
-#### SELECT with CTE & Outer Joins:
 ```sql
 -- queries/get_user_with_posts.sql
 -- name: GetUserWithPosts
 WITH active_users AS (
-  SELECT id, email FROM users WHERE active = true
+  SELECT id, email, status FROM users WHERE status = 'active'
 )
 SELECT 
   au.id, 
   au.email, 
+  au.status,
+  p.id AS post_id,
   p.title AS post_title,
-  COUNT(c.id) AS comment_count
+  p.published
 FROM active_users au
 LEFT JOIN posts p ON p.user_id = au.id
-LEFT JOIN comments c ON c.post_id = p.id
-WHERE au.id = $1
-GROUP BY au.id, au.email, p.title;
+WHERE au.id = $1;
 ```
 
-#### INSERT with RETURNING:
+```sql
+-- queries/find_users_dynamic.sql
+-- name: FindUsersDynamic
+SELECT id, email, status, created_at
+FROM users
+WHERE ($1::text IS NULL OR email ILIKE '%' || $1 || '%')
+  AND ($2::user_status IS NULL OR status = $2)
+ORDER BY created_at DESC;
+```
+
 ```sql
 -- queries/create_user.sql
 -- name: CreateUser
-INSERT INTO users (email, first_name) 
+INSERT INTO users (email, status) 
 VALUES ($1, $2) 
-RETURNING id, created_at;
+RETURNING id, email, status, created_at;
 ```
 
-#### DELETE Mutation:
 ```sql
 -- queries/delete_post.sql
 -- name: DeletePost
-DELETE FROM posts WHERE id = $1;
+DELETE FROM posts WHERE id = $1 AND user_id = $2;
 ```
 
 ---
 
-## Generated TypeScript Output
+## 💻 Generated TypeScript Output
 
-Zero runtime overhead. Pure TypeScript types and SQL strings:
+When compiled with `sqltype generate -m ./migrations -q ./queries -o ./src/types --wrappers --driver postgres`:
 
 ```typescript
 // Autogenerated by sqltype. DO NOT EDIT.
+import type postgres from "postgres";
+
+export type UserStatus = "active" | "inactive" | "suspended";
 
 export interface GetUserWithPostsParams {
   id: string;
@@ -290,100 +267,157 @@ export interface GetUserWithPostsParams {
 export interface GetUserWithPostsRow {
   id: string;
   email: string;
+  status: UserStatus;
+  post_id: string | null;
   post_title: string | null;
-  comment_count: number;
+  published: boolean | null;
 }
 
 export const getUserWithPostsSql = `
   WITH active_users AS (
-    SELECT id, email FROM users WHERE active = true
+    SELECT id, email, status FROM users WHERE status = 'active'
   )
   SELECT 
     au.id, 
     au.email, 
+    au.status,
+    p.id AS post_id,
     p.title AS post_title,
-    COUNT(c.id) AS comment_count
+    p.published
   FROM active_users au
   LEFT JOIN posts p ON p.user_id = au.id
-  LEFT JOIN comments c ON c.post_id = p.id
-  WHERE au.id = $1
-  GROUP BY au.id, au.email, p.title;
+  WHERE au.id = $1;
 `;
 
-export type GetUserWithPostsQuery = {
-  sql: string;
-  params: GetUserWithPostsParams;
-  row: GetUserWithPostsRow;
-};
-```
-
-When generated with `--wrappers`:
-
-```typescript
 export async function getUserWithPosts(
   sql: postgres.Sql,
   params: GetUserWithPostsParams
 ): Promise<GetUserWithPostsRow[]> {
   return await sql<GetUserWithPostsRow[]>`${sql.unsafe(getUserWithPostsSql, [params.id])}`;
 }
+
+export interface FindUsersDynamicParams {
+  email?: string | null;
+  status?: UserStatus | null;
+}
+
+export interface FindUsersDynamicRow {
+  id: string;
+  email: string;
+  status: UserStatus;
+  created_at: Date;
+}
+
+export const findUsersDynamicSql = `
+  SELECT id, email, status, created_at
+  FROM users
+  WHERE ($1::text IS NULL OR email ILIKE '%' || $1 || '%')
+    AND ($2::user_status IS NULL OR status = $2)
+  ORDER BY created_at DESC;
+`;
+
+export async function findUsersDynamic(
+  sql: postgres.Sql,
+  params: FindUsersDynamicParams
+): Promise<FindUsersDynamicRow[]> {
+  return await sql<FindUsersDynamicRow[]>`${sql.unsafe(findUsersDynamicSql, [
+    params.email ?? null,
+    params.status ?? null,
+  ])}`;
+}
+
+export interface CreateUserParams {
+  email: string;
+  status: UserStatus;
+}
+
+export interface CreateUserRow {
+  id: string;
+  email: string;
+  status: UserStatus;
+  created_at: Date;
+}
+
+export const createUserSql = `
+  INSERT INTO users (email, status) 
+  VALUES ($1, $2) 
+  RETURNING id, email, status, created_at;
+`;
+
+export async function createUser(
+  sql: postgres.Sql,
+  params: CreateUserParams
+): Promise<CreateUserRow[]> {
+  return await sql<CreateUserRow[]>`${sql.unsafe(createUserSql, [params.email, params.status])}`;
+}
+
+export interface DeletePostParams {
+  id: string;
+  user_id: string;
+}
+
+export const deletePostSql = `
+  DELETE FROM posts WHERE id = $1 AND user_id = $2;
+`;
+
+export async function deletePost(
+  sql: postgres.Sql,
+  params: DeletePostParams
+): Promise<void> {
+  await sql.unsafe(deletePostSql, [params.id, params.user_id]);
+}
 ```
 
 ---
 
-## CLI Reference
+## ⚙️ Driver Target Profiles
 
-```
-Usage: sqltype <COMMAND>
+`sqltype` supports three distinct runtime driver targets via the `--driver` flag:
 
-Commands:
-  check     Validates all queries against the migration schema and exits with code 1 on type/column mismatch
-  generate  Emits .ts files for all valid queries
-  lsp       Starts the Language Server Protocol (LSP) server for real-time diagnostics and hover inspection
-  help      Print this message or the help of the given subcommand(s)
-
-Options:
-  -h, --help     Print help
-  -V, --version  Print version
-```
-
-### `sqltype check`
-Validate queries in CI/CD without generating files:
-```bash
-sqltype check --migrations ./migrations --queries ./queries --driver postgres
-```
-
-### `sqltype generate`
-Generate TypeScript definitions:
-```bash
-# Standard generation
-sqltype generate --migrations ./migrations --queries ./queries --out ./src/types
-
-# With execution wrappers enabled (-w, --wrappers)
-sqltype generate -m ./migrations -q ./queries -o ./src/types --wrappers
-
-# With Bun driver profile and wrappers
-sqltype generate -m ./migrations -q ./queries -o ./src/types --driver bun -w
-
-# With sub-5ms incremental watch mode (-W, --watch)
-sqltype generate -m ./migrations -q ./queries -o ./src/types --watch
-```
-
-### `sqltype lsp`
-Launch the Language Server Protocol server over stdio:
-```bash
-# Default migrations path (./migrations)
-sqltype lsp
-
-# Custom migrations directory
-sqltype lsp --migrations ./custom/migrations
-```
+| SQL Column Type | `postgres` (`postgres.js`) | `pg` (`node-postgres`) | `bun` (`Bun.sql`) | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| `int2` / `smallint` | `number` | `number` | `number` | Standard 16-bit integer |
+| `int4` / `integer` | `number` | `number` | `number` | Standard 32-bit integer |
+| `int8` / `bigint` | `string` | `string` | `bigint` | Bun returns native JS bigint; Node drivers emit string to avoid 53-bit float overflow |
+| `numeric` / `decimal` | `string` | `string` | `string` | Arbitrary precision preserved as string |
+| `float4` / `real` | `number` | `number` | `number` | IEEE 754 single precision |
+| `float8` / `double` | `number` | `number` | `number` | IEEE 754 double precision |
+| `boolean` | `boolean` | `boolean` | `boolean` | Canonical boolean |
+| `text` / `varchar` | `string` | `string` | `string` | UTF-8 encoded string |
+| `uuid` | `string` | `string` | `string` | 36-character canonical string |
+| `json` / `jsonb` | `unknown` | `unknown` | `unknown` | Structured JSON document |
+| `bytea` | `Buffer` | `Buffer` | `Uint8Array` | Binary buffer |
+| `date` | `string` | `string` | `string` | ISO 8601 calendar date string (`YYYY-MM-DD`) |
+| `timestamp` / `timestamptz` | `Date` | `Date` | `Date` | JavaScript Date object |
+| `user_status` (ENUM) | `"active" \| ...` | `"active" \| ...` | `"active" \| ...` | String literal union |
+| `text[]` (Arrays) | `string[]` | `string[]` | `string[]` | Homogeneous array types |
 
 ---
 
-## Editor Configuration (LSP)
+## 🌐 Language Server Protocol (`sqltype lsp`)
 
-### VS Code
-Configure using the generic LSP client or add to your `.vscode/settings.json`:
+`sqltype` includes an ultra-fast Language Server Protocol server operating directly over standard I/O:
+
+```
+[VS Code / Neovim / Helix]  <==== stdio (JSON-RPC 2.0) ====>  [sqltype lsp (Rust)]
+                                                                     │
+                                                      ArcSwap In-Memory Catalog
+                                                                     │
+                                                        libpg_query C-Parser
+```
+
+### Key LSP Capabilities:
+- **Instant Syntax Diagnostics**: Errors encountered by PostgreSQL's C parser are pinpointed directly in your editor with precise line and column squigglies via `cursorpos`.
+- **Relational Schema Diagnostics**: Validates table names, column references, and join predicates against the in-memory catalog in real time (< 2ms).
+- **Lock-Free Hot-Reloading**: Edits to files in the `--migrations` directory reload the schema catalog via `ArcSwap`, triggering immediate diagnostic passes across all open SQL files without restart.
+- **Rich Hover Documentation**:
+  - Hovering over `$N` displays inferred PostgreSQL type, TypeScript mapping, and optional status.
+  - Hovering over a table relation displays column listings, types, and nullability constraints.
+  - Hovering over projected expressions shows derived calculation types.
+
+### Editor Setup
+
+#### VS Code (`.vscode/settings.json`)
 ```json
 {
   "sql.languageServer": {
@@ -393,7 +427,7 @@ Configure using the generic LSP client or add to your `.vscode/settings.json`:
 }
 ```
 
-### Neovim (`nvim-lspconfig`)
+#### Neovim (`init.lua` with `nvim-lspconfig`)
 ```lua
 local lspconfig = require('lspconfig')
 local configs = require('lspconfig.configs')
@@ -412,7 +446,7 @@ end
 lspconfig.sqltype.setup({})
 ```
 
-### Helix (`languages.toml`)
+#### Helix (`languages.toml`)
 ```toml
 [language-server.sqltype]
 command = "sqltype"
@@ -425,16 +459,68 @@ language-servers = ["sqltype"]
 
 ---
 
-## About the Author
+## 📖 CLI Command Reference
 
-**x7ssss** is an independent systems and compiler developer specializing in high-performance developer tooling, type inference systems, and low-latency database engines in Rust.
+```text
+Usage: sqltype <COMMAND> [OPTIONS]
 
-- **GitHub**: [@x7ssss](https://github.com/x7ssss)
-- **Repository**: [x7ssss/sqltype](https://github.com/x7ssss/sqltype)
-- **Email**: babadookmariqn@gmail.com
+Commands:
+  check     Validates SQL queries against migration DDL schema catalogs (CI/CD gate)
+  generate  Compiles valid SQL queries into zero-dependency TypeScript definitions
+  lsp       Launches the Language Server Protocol engine over stdio
+  help      Print this message or subcommand help
+```
+
+### Global & Subcommand Flags
+
+| Command / Flag | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `check` | command | - | Validates queries without emitting files; exits with code 1 on error |
+| `generate` | command | - | Compiles queries into TypeScript definitions and SQL constants |
+| `lsp` | command | - | Starts Language Server Protocol engine over stdio |
+| `-m, --migrations <path>` | string | `./migrations` | Path to directory containing migration `.sql` DDL files |
+| `-q, --queries <path>` | string | `./queries` | Path to directory containing query `.sql` DML files |
+| `-o, --out <path>` | string | `./src/types` | Output directory for compiled TypeScript files (generate only) |
+| `-d, --driver <driver>` | enum | `postgres` | Target driver profile: `postgres` (postgres.js), `pg` (node-postgres), `bun` (Bun.sql) |
+| `-w, --wrappers` | flag | `false` | Emits typed async execution wrapper functions |
+| `-W, --watch` | flag | `false` | Enables sub-5ms incremental watch and recompilation loop |
+| `--strict` | flag | `false` | Disallows untyped `unknown` fallback on unresolvable expressions |
+| `--json` | flag | `false` | Emits machine-readable JSON output for CI/CD diagnostic reporting |
+| `-h, --help` | flag | - | Prints help information |
+| `-V, --version` | flag | - | Prints binary version string |
 
 ---
 
-## License
+## 🚦 SemVer 2.0 Exit Code Contract
 
-MIT © [x7ssss](https://github.com/x7ssss)
+`sqltype` implements a rigid exit code contract across all CLI subcommands to guarantee predictable CI/CD integration:
+
+| Exit Code | Classification | Description |
+| :--- | :--- | :--- |
+| `0` | `SUCCESS` | Schema parsed, queries validated, or TypeScript artifacts compiled successfully |
+| `1` | `TYPE_OR_SYNTAX_ERROR` | SQL syntax error, unknown table or column, or type mismatch against migration schema |
+| `2` | `CONFIG_ARG_ERROR` | Invalid CLI arguments, non-existent migration or query path, or invalid driver specification |
+| `3` | `IO_CATALOG_ERROR` | File permission error, unreadable DDL file, or unwriteable output destination |
+| `4` | `DRIVER_PROFILE_ERROR` | Driver incompatibility or invalid type coercion under selected profile |
+| `5` | `WATCH_OR_LSP_PANIC` | Unrecoverable watch loop failure or stdio communication channel abort |
+
+---
+
+## 🛡️ Failure & Production Safety Matrix
+
+| Threat / Invariant | Risk Level | Internal Defense Mechanism | Override Flag |
+| :--- | :--- | :--- | :--- |
+| **BigInt Precision Truncation** | `HIGH` | Drivers `postgres.js` and `pg` map `int8` to `string`; `Bun.sql` maps to native `bigint` | `--driver <name>` |
+| **Dynamic Filter Undefined Leaks** | `MEDIUM` | Static detection of `$1 IS NULL OR col = $1` marks parameter optional (`col?: T \| null`) | None (Automatic) |
+| **Outer Join Projection Errors** | `HIGH` | AST traversal marks outer join projected columns nullable (`col: T \| null`) | None (Automatic) |
+| **Unapplied Migration Drift** | `CRITICAL` | `sqltype check` fails in CI if query refers to non-existent schema relations | Fix migration DDL |
+| **Duplicate Query Names** | `MEDIUM` | Validates uniqueness of `-- name: <QueryName>` headers across all files | Rename query |
+| **LSP Worker Thread Lockups** | `LOW` | `ArcSwap` provides lock-free, atomic in-memory catalog swaps on file save | None (Built-in) |
+| **Untyped Expression Fallback** | `LOW` | Complex unresolvable expressions fall back to `unknown` | `--strict` (Fails if untyped) |
+| **Recursive CTE Infinite Traversal** | `MEDIUM` | Depth-bounded scope resolution for recursive CTE query graphs | None (Bounded) |
+
+---
+
+## 📄 License
+
+MIT © x7sss
