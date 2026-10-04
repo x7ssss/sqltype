@@ -1,20 +1,12 @@
-use crate::catalog::{Catalog, ColumnMetadata, DriverTarget, TableMetadata, extract_type_name};
+use crate::catalog::{Catalog, ColumnMetadata, DriverTarget, extract_type_name};
+pub use crate::nullability::{
+    ColumnBinding, JoinKind, TableBinding, format_nullable, project_ts_type, strip_root_null,
+};
 use pg_query::NodeEnum;
 use pg_query::protobuf::{
-    AExprKind, BoolExprType, JoinType, NullTestType, OnConflictAction, SetOperation, SubLinkType,
+    AExprKind, OnConflictAction, SetOperation, SubLinkType,
 };
-use std::collections::HashMap;
-
-fn format_nullable(ts_type: &str) -> String {
-    if ts_type == "unknown" {
-        return "unknown".to_string();
-    }
-    if ts_type.contains("| null") {
-        ts_type.to_string()
-    } else {
-        format!("{} | null", ts_type)
-    }
-}
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InferredType {
@@ -86,6 +78,7 @@ impl PgType {
         } else {
             (trimmed, None)
         };
+        let base = base.strip_prefix("pg_catalog.").unwrap_or(base);
         match base {
             "int2" | "smallint" | "smallserial" => PgType::Int2,
             "int4" | "integer" | "int" | "serial" => PgType::Int4,
@@ -567,13 +560,11 @@ pub fn unify_cte_types(anchor: &PgType, rec: &PgType) -> Result<PgType, String> 
     unify_types(anchor, rec)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueryParam {
-    pub index: usize,
-    pub name: String,
-    pub ts_type: String,
-    pub is_optional: bool,
-}
+pub use crate::params::{
+    QueryParam, ParamInfo, deduce_query_params, deduce_query_params_lossy,
+    finalize_params, resolve_params_in_expr, record_param, extract_param_info,
+    extract_column_info, bind_untyped_params_in_node, collect_param_refs,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryField {
@@ -591,45 +582,6 @@ pub struct AnalyzedQuery {
 
 pub type ColumnMeta = ColumnMetadata;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JoinKind {
-    Inner,
-    Left,
-    Right,
-    Full,
-    Semi,
-    Anti,
-}
-
-impl JoinKind {
-    pub fn from_join_type(jt: JoinType) -> Self {
-        match jt {
-            JoinType::JoinInner => JoinKind::Inner,
-            JoinType::JoinLeft => JoinKind::Left,
-            JoinType::JoinRight => JoinKind::Right,
-            JoinType::JoinFull => JoinKind::Full,
-            JoinType::JoinSemi => JoinKind::Semi,
-            JoinType::JoinAnti => JoinKind::Anti,
-            _ => JoinKind::Inner,
-        }
-    }
-
-    pub fn from_i32(val: i32) -> Self {
-        if val == JoinType::JoinLeft as i32 {
-            JoinKind::Left
-        } else if val == JoinType::JoinRight as i32 {
-            JoinKind::Right
-        } else if val == JoinType::JoinFull as i32 {
-            JoinKind::Full
-        } else if val == JoinType::JoinSemi as i32 {
-            JoinKind::Semi
-        } else if val == JoinType::JoinAnti as i32 {
-            JoinKind::Anti
-        } else {
-            JoinKind::Inner
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetOpKind {
@@ -659,25 +611,6 @@ impl SetOpKind {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct TableBinding {
-    pub base_table: String,
-    pub exposed_name: String,
-    pub has_explicit_alias: bool,
-    pub is_null_padded: bool,
-    pub columns: HashMap<String, ColumnMeta>,
-}
-
-impl TableBinding {
-    pub fn get_column(&self, name: &str) -> Option<&ColumnMeta> {
-        self.columns.get(name).or_else(|| {
-            self.columns
-                .values()
-                .find(|c| c.name.eq_ignore_ascii_case(name))
-        })
-    }
-}
-
 pub type ScopeContext = QueryScope;
 
 #[derive(Default, Debug, Clone)]
@@ -700,16 +633,10 @@ impl QueryScope {
 
     pub fn force_all_nullable(&mut self) {
         for binding in self.bindings.values_mut() {
-            binding.is_null_padded = true;
-            for col in binding.columns.values_mut() {
-                col.is_nullable = true;
-            }
+            binding.mark_null_producing();
         }
         for binding in self.tables.values_mut() {
-            binding.is_null_padded = true;
-            for col in binding.columns.values_mut() {
-                col.is_nullable = true;
-            }
+            binding.mark_null_producing();
         }
     }
 
@@ -758,12 +685,12 @@ impl QueryScope {
         &self,
         cr: &pg_query::protobuf::ColumnRef,
         catalog: &Catalog,
-    ) -> Result<(&ColumnMeta, bool), String> {
+    ) -> Result<(&ColumnBinding, bool), String> {
         if cr.fields.len() == 1 {
             let col_str = extract_string(&cr.fields[0])
                 .ok_or_else(|| "Invalid column reference name".to_string())?;
 
-            let mut matched: Vec<(&TableBinding, &ColumnMeta)> = Vec::new();
+            let mut matched: Vec<(&TableBinding, &ColumnBinding)> = Vec::new();
             for name in &self.binding_order {
                 if let Some(binding) = self.bindings.get(&name.to_ascii_lowercase())
                     && let Some(col) = binding.get_column(&col_str)
@@ -785,7 +712,13 @@ impl QueryScope {
                     .collect();
                 if non_excluded.len() == 1 {
                     let (binding, col) = non_excluded[0];
-                    let is_nullable = col.is_nullable || binding.is_null_padded;
+                    if binding.ambiguous_columns.contains(&col_str.to_ascii_lowercase()) {
+                        return Err(format!(
+                            "Column reference \"{}\" is ambiguous in join alias \"{}\"",
+                            col_str, binding.exposed_name
+                        ));
+                    }
+                    let is_nullable = col.effective_nullable(binding.is_null_producing());
                     return Ok((col, is_nullable));
                 }
 
@@ -801,7 +734,13 @@ impl QueryScope {
             }
 
             let (binding, col) = matched[0];
-            let is_nullable = col.is_nullable || binding.is_null_padded;
+            if binding.ambiguous_columns.contains(&col_str.to_ascii_lowercase()) {
+                return Err(format!(
+                    "Column reference \"{}\" is ambiguous in join alias \"{}\"",
+                    col_str, binding.exposed_name
+                ));
+            }
+            let is_nullable = col.effective_nullable(binding.is_null_producing());
             Ok((col, is_nullable))
         } else if cr.fields.len() == 2 {
             let target = extract_string(&cr.fields[0])
@@ -827,6 +766,13 @@ impl QueryScope {
                 .get(&target.to_ascii_lowercase())
                 .ok_or_else(|| format!("Unknown table alias \"{}\" in column reference", target))?;
 
+            if binding.ambiguous_columns.contains(&col_str.to_ascii_lowercase()) {
+                return Err(format!(
+                    "Column reference \"{}\" is ambiguous in join alias \"{}\"",
+                    col_str, binding.exposed_name
+                ));
+            }
+
             let col = binding.get_column(&col_str).ok_or_else(|| {
                 format!(
                     "Column \"{}\" not found on table \"{}\"",
@@ -834,7 +780,7 @@ impl QueryScope {
                 )
             })?;
 
-            let is_nullable = col.is_nullable || binding.is_null_padded;
+            let is_nullable = col.effective_nullable(binding.is_null_producing());
             Ok((col, is_nullable))
         } else if cr.fields.len() == 3 {
             let schema_str = extract_string(&cr.fields[0])
@@ -864,6 +810,13 @@ impl QueryScope {
                     format!("Table \"{}.{}\" not found in scope", schema_str, table_str)
                 })?;
 
+            if binding.ambiguous_columns.contains(&col_str.to_ascii_lowercase()) {
+                return Err(format!(
+                    "Column reference \"{}\" is ambiguous in join alias \"{}\"",
+                    col_str, binding.exposed_name
+                ));
+            }
+
             if let Some(table_meta) = catalog.get_table(&binding.base_table) {
                 if let Some(tbl_schema) = &table_meta.schema {
                     if !tbl_schema.eq_ignore_ascii_case(&schema_str) {
@@ -887,7 +840,7 @@ impl QueryScope {
                 )
             })?;
 
-            let is_nullable = col.is_nullable || binding.is_null_padded;
+            let is_nullable = col.effective_nullable(binding.is_null_producing());
             Ok((col, is_nullable))
         } else {
             Err("Unsupported column reference format".to_string())
@@ -895,12 +848,6 @@ impl QueryScope {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct ParamInfo {
-    suggested_name: Option<String>,
-    inferred_type: Option<String>,
-    is_optional: bool,
-}
 
 /// Converts a string (e.g. "get_user_with_posts.sql" or "get_user") to PascalCase ("GetUserWithPosts").
 pub fn to_pascal_case(s: &str) -> String {
@@ -954,7 +901,7 @@ pub fn extract_query_name(sql: &str, fallback_filename: Option<&str>) -> String 
     }
 }
 
-fn extract_string(node: &pg_query::protobuf::Node) -> Option<String> {
+pub(crate) fn extract_string(node: &pg_query::protobuf::Node) -> Option<String> {
     if let Some(NodeEnum::String(s)) = &node.node {
         Some(s.sval.clone())
     } else {
@@ -1022,7 +969,7 @@ fn extract_static_string_array(node: &pg_query::protobuf::Node) -> Option<Vec<St
     }
 }
 
-fn extract_func_name(funcnames: &[pg_query::protobuf::Node]) -> String {
+pub(crate) fn extract_func_name(funcnames: &[pg_query::protobuf::Node]) -> String {
     let mut names = Vec::new();
     for f in funcnames {
         if let Some(s) = extract_string(f) {
@@ -1036,14 +983,14 @@ fn extract_func_name(funcnames: &[pg_query::protobuf::Node]) -> String {
         .to_ascii_lowercase()
 }
 
-/// Analyzes an application SQL query file against the catalog.
-pub fn analyze_query(
+/// Analyzes a pre-parsed PostgreSQL query AST against the catalog.
+pub fn analyze_parsed_query(
+    parsed: &pg_query::ParseResult,
     sql: &str,
     catalog: &Catalog,
     fallback_filename: Option<&str>,
 ) -> Result<AnalyzedQuery, String> {
     let query_name = extract_query_name(sql, fallback_filename);
-    let parsed = pg_query::parse(sql).map_err(|e| format!("Query parse error: {}", e))?;
 
     // Find the query statement
     let mut root_stmt: Option<&pg_query::protobuf::Node> = None;
@@ -1077,39 +1024,7 @@ pub fn analyze_query(
         _ => unreachable!(),
     };
 
-    // Sort parameters deterministically by index (1..=N)
-    let mut param_indices: Vec<i32> = param_map.keys().copied().collect();
-    param_indices.sort();
-
-    let mut params = Vec::new();
-    let mut used_names: HashMap<String, usize> = HashMap::new();
-
-    for idx in param_indices {
-        let info = param_map.get(&idx).unwrap();
-        let base_name = info
-            .suggested_name
-            .clone()
-            .unwrap_or_else(|| format!("param{}", idx));
-
-        // Deduplicate parameter names if multiple parameters share the same column name
-        let count = used_names.entry(base_name.clone()).or_insert(0);
-        *count += 1;
-        let final_name = if *count > 1 {
-            format!("{}{}", base_name, count)
-        } else {
-            base_name
-        };
-
-        params.push(QueryParam {
-            index: idx as usize,
-            name: final_name,
-            ts_type: info
-                .inferred_type
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string()),
-            is_optional: info.is_optional,
-        });
-    }
+    let params = crate::params::deduce_query_params(root, catalog, &QueryScope::default())?;
 
     Ok(AnalyzedQuery {
         name: query_name,
@@ -1117,6 +1032,16 @@ pub fn analyze_query(
         params,
         fields,
     })
+}
+
+/// Analyzes an application SQL query file against the catalog.
+pub fn analyze_query(
+    sql: &str,
+    catalog: &Catalog,
+    fallback_filename: Option<&str>,
+) -> Result<AnalyzedQuery, String> {
+    let parsed = pg_query::parse(sql).map_err(|e| format!("Query parse error: {}", e))?;
+    analyze_parsed_query(&parsed, sql, catalog, fallback_filename)
 }
 
 pub fn process_with_clause(
@@ -1128,7 +1053,7 @@ pub fn process_with_clause(
     process_with_clause_with_params(with_clause, scope, catalog, &mut param_map)
 }
 
-fn process_with_clause_with_params(
+pub(crate) fn process_with_clause_with_params(
     with_clause: &pg_query::protobuf::WithClause,
     scope: &mut ScopeContext,
     catalog: &Catalog,
@@ -1195,15 +1120,18 @@ fn process_with_clause_with_params(
                 let mut stub_cols = HashMap::new();
                 let mut stub_order = Vec::new();
                 for col in &anchor_cols {
-                    stub_cols.insert(col.name.to_ascii_lowercase(), col.clone());
+                    stub_cols.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
                     stub_order.push(col.name.clone());
                 }
                 let stub_binding = TableBinding {
                     base_table: cte_name.clone(),
                     exposed_name: cte.ctename.clone(),
                     has_explicit_alias: false,
+                    is_null_producing: false,
                     is_null_padded: false,
                     columns: stub_cols,
+                    column_order: stub_order.clone(),
+                    ambiguous_columns: HashSet::new(),
                 };
 
                 let mut rec_scope = scope.clone();
@@ -1237,14 +1165,16 @@ fn process_with_clause_with_params(
                     let unified_pg = unify_cte_types(&anchor_pg, &rec_pg)?;
                     let is_nullable = anchor_col.is_nullable || rec_col.is_nullable;
                     let ts_type = unified_pg.to_ts(catalog);
-                    let col_meta = ColumnMetadata {
+                    let col_binding = ColumnBinding {
                         name: anchor_col.name.clone(),
                         pg_type: unified_pg.to_pg_str(),
                         ts_type,
+                        ddl_nullable: is_nullable,
                         is_nullable,
                         has_default: false,
+                        is_primary_key: false,
                     };
-                    final_columns.insert(anchor_col.name.to_ascii_lowercase(), col_meta);
+                    final_columns.insert(anchor_col.name.to_ascii_lowercase(), col_binding);
                     final_order.push(anchor_col.name.clone());
                 }
 
@@ -1252,8 +1182,11 @@ fn process_with_clause_with_params(
                     base_table: cte_name.clone(),
                     exposed_name: cte.ctename.clone(),
                     has_explicit_alias: false,
+                    is_null_producing: false,
                     is_null_padded: false,
                     columns: final_columns,
+                    column_order: final_order.clone(),
+                    ambiguous_columns: HashSet::new(),
                 };
                 scope.register_cte(resolved_binding)?;
                 scope.cte_column_orders.insert(cte_name, final_order);
@@ -1281,7 +1214,7 @@ fn process_with_clause_with_params(
                 let mut final_columns = HashMap::new();
                 let mut final_order = Vec::new();
                 for col in proj_cols {
-                    final_columns.insert(col.name.to_ascii_lowercase(), col.clone());
+                    final_columns.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(&col));
                     final_order.push(col.name);
                 }
 
@@ -1289,8 +1222,11 @@ fn process_with_clause_with_params(
                     base_table: cte_name.clone(),
                     exposed_name: cte.ctename.clone(),
                     has_explicit_alias: false,
+                    is_null_producing: false,
                     is_null_padded: false,
                     columns: final_columns,
+                    column_order: final_order.clone(),
+                    ambiguous_columns: HashSet::new(),
                 };
                 scope.register_cte(resolved_binding)?;
                 scope.cte_column_orders.insert(cte_name, final_order);
@@ -1428,6 +1364,7 @@ fn infer_select_projected_columns(
                 ts_type,
                 is_nullable,
                 has_default: false,
+                is_primary_key: false,
             });
         }
 
@@ -1498,9 +1435,13 @@ fn infer_select_projected_columns(
         }
     }
 
-    // 3. Resolve parameters from WHERE clause (and limit / offset if present)
+    // 3. Resolve parameters from WHERE and HAVING clauses (and limit / offset if present)
     if let Some(where_node) = &select.where_clause {
         resolve_params_in_expr(where_node, catalog, &query_scope, param_map)?;
+    }
+
+    if let Some(having_node) = &select.having_clause {
+        resolve_params_in_expr(having_node, catalog, &query_scope, param_map)?;
     }
 
     if let Some(limit_node) = &select.limit_count {
@@ -1564,90 +1505,6 @@ fn analyze_select_stmt(
     Ok(fields)
 }
 
-fn collect_param_refs(node: &pg_query::protobuf::Node, out: &mut Vec<i32>) {
-    match &node.node {
-        Some(NodeEnum::ParamRef(p)) => {
-            out.push(p.number);
-        }
-        Some(NodeEnum::AExpr(ae)) => {
-            if let Some(l) = &ae.lexpr {
-                collect_param_refs(l, out);
-            }
-            if let Some(r) = &ae.rexpr {
-                collect_param_refs(r, out);
-            }
-        }
-        Some(NodeEnum::TypeCast(tc)) => {
-            if let Some(arg) = &tc.arg {
-                collect_param_refs(arg, out);
-            }
-        }
-        Some(NodeEnum::FuncCall(fc)) => {
-            for arg in &fc.args {
-                collect_param_refs(arg, out);
-            }
-        }
-        Some(NodeEnum::CoalesceExpr(ce)) => {
-            for arg in &ce.args {
-                collect_param_refs(arg, out);
-            }
-        }
-        Some(NodeEnum::CaseExpr(ce)) => {
-            for arg in &ce.args {
-                collect_param_refs(arg, out);
-            }
-            if let Some(def) = &ce.defresult {
-                collect_param_refs(def, out);
-            }
-        }
-        Some(NodeEnum::CaseWhen(cw)) => {
-            if let Some(expr) = &cw.expr {
-                collect_param_refs(expr, out);
-            }
-            if let Some(res) = &cw.result {
-                collect_param_refs(res, out);
-            }
-        }
-        Some(NodeEnum::BoolExpr(be)) => {
-            for arg in &be.args {
-                collect_param_refs(arg, out);
-            }
-        }
-        Some(NodeEnum::NullTest(nt)) => {
-            if let Some(arg) = &nt.arg {
-                collect_param_refs(arg, out);
-            }
-        }
-        Some(NodeEnum::BooleanTest(bt)) => {
-            if let Some(arg) = &bt.arg {
-                collect_param_refs(arg, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn bind_untyped_params_in_node(
-    node: &pg_query::protobuf::Node,
-    target_col: &ColumnMeta,
-    param_map: &mut HashMap<i32, ParamInfo>,
-) {
-    let mut param_nums = Vec::new();
-    collect_param_refs(node, &mut param_nums);
-    for num in param_nums {
-        let entry = param_map.entry(num).or_default();
-        if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
-            entry.inferred_type = Some(target_col.ts_type.clone());
-        }
-        if entry.suggested_name.is_none() {
-            entry.suggested_name = Some(target_col.name.clone());
-        }
-        if target_col.is_nullable {
-            entry.is_optional = true;
-        }
-    }
-}
-
 fn analyze_insert_stmt(
     insert: &pg_query::protobuf::InsertStmt,
     catalog: &Catalog,
@@ -1675,16 +1532,21 @@ fn analyze_insert_stmt(
     };
 
     let mut columns = HashMap::new();
+    let mut col_order = Vec::new();
     for col in &table_meta.columns {
-        columns.insert(col.name.to_ascii_lowercase(), col.clone());
+        columns.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
+        col_order.push(col.name.clone());
     }
 
     let binding = TableBinding {
         base_table: table_name.clone(),
         exposed_name,
         has_explicit_alias,
+        is_null_producing: false,
         is_null_padded: false,
         columns,
+        column_order: col_order,
+        ambiguous_columns: HashSet::new(),
     };
 
     scope.add_binding(binding)?;
@@ -1754,15 +1616,20 @@ fn analyze_insert_stmt(
         let conflict_scope = if is_update {
             let mut cs = scope.clone();
             let mut excluded_cols = HashMap::new();
+            let mut excluded_order = Vec::new();
             for col in &table_meta.columns {
-                excluded_cols.insert(col.name.to_ascii_lowercase(), col.clone());
+                excluded_cols.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
+                excluded_order.push(col.name.clone());
             }
             let excluded_binding = TableBinding {
                 base_table: "excluded".to_string(),
                 exposed_name: "excluded".to_string(),
                 has_explicit_alias: false,
+                is_null_producing: false,
                 is_null_padded: false,
                 columns: excluded_cols,
+                column_order: excluded_order,
+                ambiguous_columns: HashSet::new(),
             };
             cs.add_binding(excluded_binding)?;
             cs
@@ -1851,16 +1718,21 @@ fn analyze_update_stmt(
     };
 
     let mut columns = HashMap::new();
+    let mut col_order = Vec::new();
     for col in &table_meta.columns {
-        columns.insert(col.name.to_ascii_lowercase(), col.clone());
+        columns.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
+        col_order.push(col.name.clone());
     }
 
     let binding = TableBinding {
         base_table: table_name.clone(),
         exposed_name,
         has_explicit_alias,
+        is_null_producing: false,
         is_null_padded: false,
         columns,
+        column_order: col_order,
+        ambiguous_columns: HashSet::new(),
     };
 
     scope.add_binding(binding)?;
@@ -1948,16 +1820,21 @@ fn analyze_delete_stmt(
     };
 
     let mut columns = HashMap::new();
+    let mut col_order = Vec::new();
     for col in &table_meta.columns {
-        columns.insert(col.name.to_ascii_lowercase(), col.clone());
+        columns.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
+        col_order.push(col.name.clone());
     }
 
     let binding = TableBinding {
         base_table: table_name,
         exposed_name,
         has_explicit_alias,
+        is_null_producing: false,
         is_null_padded: false,
         columns,
+        column_order: col_order,
+        ambiguous_columns: HashSet::new(),
     };
 
     scope.add_binding(binding)?;
@@ -1991,7 +1868,18 @@ fn get_ordered_columns<'a>(
     binding: &'a TableBinding,
     catalog: &'a Catalog,
     scope: Option<&'a QueryScope>,
-) -> Vec<&'a ColumnMeta> {
+) -> Vec<&'a ColumnBinding> {
+    if !binding.column_order.is_empty() {
+        let mut cols = Vec::new();
+        for col_name in &binding.column_order {
+            if let Some(col) = binding.get_column(col_name) {
+                cols.push(col);
+            }
+        }
+        if !cols.is_empty() {
+            return cols;
+        }
+    }
     if let Some(scope) = scope
         && let Some(order) = scope
             .cte_column_orders
@@ -2034,7 +1922,7 @@ fn get_ordered_columns<'a>(
             return cols;
         }
     }
-    let mut cols: Vec<&ColumnMeta> = binding.columns.values().collect();
+    let mut cols: Vec<&ColumnBinding> = binding.columns.values().collect();
     cols.sort_by(|a, b| a.name.cmp(&b.name));
     cols
 }
@@ -2113,8 +2001,11 @@ fn resolve_range_var(
             base_table: table_name.clone(),
             exposed_name: exposed_name.clone(),
             has_explicit_alias,
+            is_null_producing: false,
             is_null_padded: false,
             columns,
+            column_order: final_order.clone(),
+            ambiguous_columns: HashSet::new(),
         };
 
         let mut scope = QueryScope::with_ctes_from(active_scope);
@@ -2163,22 +2054,15 @@ fn resolve_range_var(
             } else {
                 col.name.clone()
             };
-            let mut aliased_col = col.clone();
+            let mut aliased_col = ColumnBinding::from_column_metadata(col);
             aliased_col.name = col_name.clone();
-            columns.insert(col_name.to_ascii_lowercase(), aliased_col.clone());
-            ordered_columns.push(aliased_col);
+            columns.insert(col_name.to_ascii_lowercase(), aliased_col);
+            ordered_columns.push(col_name);
         }
-        catalog.tables.insert(
-            exposed_name.to_ascii_lowercase(),
-            TableMetadata {
-                name: exposed_name.clone(),
-                schema: None,
-                columns: ordered_columns,
-            },
-        );
     } else {
         for col in &table_meta.columns {
-            columns.insert(col.name.to_ascii_lowercase(), col.clone());
+            columns.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
+            ordered_columns.push(col.name.clone());
         }
     }
 
@@ -2186,11 +2070,17 @@ fn resolve_range_var(
         base_table: table_name,
         exposed_name: exposed_name.clone(),
         has_explicit_alias,
+        is_null_producing: false,
         is_null_padded: false,
         columns,
+        column_order: ordered_columns.clone(),
+        ambiguous_columns: HashSet::new(),
     };
 
     let mut scope = QueryScope::with_ctes_from(active_scope);
+    scope
+        .cte_column_orders
+        .insert(exposed_name.to_ascii_lowercase(), ordered_columns);
     scope.add_binding(binding)?;
     Ok(scope)
 }
@@ -2258,36 +2148,43 @@ fn resolve_join_expr(
     if let Some(alias) = &je.alias {
         let alias_name = alias.aliasname.clone();
         let mut unified_columns = HashMap::new();
+        let mut ambiguous_columns = HashSet::new();
         let mut ordered_columns = Vec::new();
 
         for name in &result_scope.binding_order {
             if let Some(b) = result_scope.bindings.get(&name.to_ascii_lowercase()) {
                 let ordered = get_ordered_columns(b, catalog, Some(&result_scope));
                 for col in ordered {
-                    unified_columns.insert(col.name.to_ascii_lowercase(), col.clone());
-                    ordered_columns.push(col.clone());
+                    let key = col.name.to_ascii_lowercase();
+                    if unified_columns.contains_key(&key) {
+                        ambiguous_columns.insert(key.clone());
+                    } else {
+                        let eff_null = col.effective_nullable(b.is_null_producing());
+                        let mut u_col = col.clone();
+                        u_col.ddl_nullable = eff_null;
+                        u_col.is_nullable = eff_null;
+                        unified_columns.insert(key.clone(), u_col);
+                    }
+                    ordered_columns.push(col.name.clone());
                 }
             }
         }
-
-        catalog.tables.insert(
-            alias_name.to_ascii_lowercase(),
-            TableMetadata {
-                name: alias_name.clone(),
-                schema: None,
-                columns: ordered_columns,
-            },
-        );
 
         let unified_binding = TableBinding {
             base_table: alias_name.clone(),
             exposed_name: alias_name.clone(),
             has_explicit_alias: true,
+            is_null_producing: false,
             is_null_padded: false,
             columns: unified_columns,
+            column_order: ordered_columns.clone(),
+            ambiguous_columns,
         };
 
         let mut unified_scope = QueryScope::with_ctes_from(active_scope);
+        unified_scope
+            .cte_column_orders
+            .insert(alias_name.to_ascii_lowercase(), ordered_columns);
         unified_scope.add_binding(unified_binding)?;
         return Ok(unified_scope);
     }
@@ -2319,7 +2216,6 @@ fn resolve_range_subselect(
     let alias_name = alias.aliasname.clone();
 
     let mut columns = HashMap::new();
-    let mut ordered_columns = Vec::new();
     let mut col_names = Vec::new();
 
     for (i, col) in cols.iter().enumerate() {
@@ -2329,29 +2225,22 @@ fn resolve_range_subselect(
             col.name.clone()
         };
 
-        let mut col_meta = col.clone();
-        col_meta.name = col_name.clone();
+        let mut col_binding = ColumnBinding::from_column_metadata(col);
+        col_binding.name = col_name.clone();
 
-        columns.insert(col_name.to_ascii_lowercase(), col_meta.clone());
-        ordered_columns.push(col_meta);
+        columns.insert(col_name.to_ascii_lowercase(), col_binding);
         col_names.push(col_name);
     }
-
-    catalog.tables.insert(
-        alias_name.to_ascii_lowercase(),
-        TableMetadata {
-            name: alias_name.clone(),
-            schema: None,
-            columns: ordered_columns,
-        },
-    );
 
     let binding = TableBinding {
         base_table: alias_name.clone(),
         exposed_name: alias_name.clone(),
         has_explicit_alias: true,
+        is_null_producing: false,
         is_null_padded: false,
         columns,
+        column_order: col_names.clone(),
+        ambiguous_columns: HashSet::new(),
     };
 
     let mut scope = QueryScope::with_ctes_from(active_scope);
@@ -2425,23 +2314,28 @@ fn resolve_range_function(
             ("unnest".to_string(), "unnest".to_string(), false)
         };
 
-        let col_meta = ColumnMetadata {
+        let col_binding = ColumnBinding {
             name: col_name.clone(),
             pg_type: elem_pg.to_pg_str(),
             ts_type: elem_ts,
+            ddl_nullable: arg_inferred.is_nullable,
             is_nullable: arg_inferred.is_nullable,
             has_default: false,
+            is_primary_key: false,
         };
 
         let mut columns = HashMap::new();
-        columns.insert(col_name.to_ascii_lowercase(), col_meta);
+        columns.insert(col_name.to_ascii_lowercase(), col_binding);
 
         let binding = TableBinding {
             base_table: exposed_table_name.clone(),
             exposed_name: exposed_table_name.clone(),
             has_explicit_alias,
+            is_null_producing: false,
             is_null_padded: false,
             columns,
+            column_order: vec![col_name.clone()],
+            ambiguous_columns: HashSet::new(),
         };
 
         let mut scope = QueryScope::with_ctes_from(active_scope);
@@ -2455,7 +2349,7 @@ fn resolve_range_function(
     }
 }
 
-fn infer_expr(
+pub(crate) fn infer_expr(
     node: &pg_query::protobuf::Node,
     catalog: &Catalog,
     scope: &QueryScope,
@@ -3144,14 +3038,15 @@ fn resolve_target_columns(
                     if let Some(binding) = scope.bindings.get(&name.to_ascii_lowercase()) {
                         let ordered_cols = get_ordered_columns(binding, catalog, Some(scope));
                         for col in ordered_cols {
-                            let is_null = col.is_nullable || binding.is_null_padded;
-                            let ts_type = col.ts_type.replace(" | null", "").trim().to_string();
+                            let is_null = col.effective_nullable(binding.is_null_producing());
+                            let ts_type = strip_root_null(&col.ts_type);
                             columns.push(ColumnMetadata {
                                 name: col.name.clone(),
                                 pg_type: col.pg_type.clone(),
                                 ts_type,
                                 is_nullable: is_null,
                                 has_default: col.has_default,
+                                is_primary_key: col.is_primary_key,
                             });
                         }
                     }
@@ -3185,14 +3080,15 @@ fn resolve_target_columns(
 
                 let ordered_cols = get_ordered_columns(binding, catalog, Some(scope));
                 for col in ordered_cols {
-                    let is_null = col.is_nullable || binding.is_null_padded;
-                    let ts_type = col.ts_type.replace(" | null", "").trim().to_string();
+                    let is_null = col.effective_nullable(binding.is_null_producing());
+                    let ts_type = strip_root_null(&col.ts_type);
                     columns.push(ColumnMetadata {
                         name: col.name.clone(),
                         pg_type: col.pg_type.clone(),
                         ts_type,
                         is_nullable: is_null,
                         has_default: col.has_default,
+                        is_primary_key: col.is_primary_key,
                     });
                 }
                 return Ok(());
@@ -3213,6 +3109,7 @@ fn resolve_target_columns(
                 ts_type,
                 is_nullable: inferred.is_nullable,
                 has_default: false,
+                is_primary_key: false,
             });
             Ok(())
         }
@@ -3238,6 +3135,7 @@ fn resolve_target_columns(
                 ts_type,
                 is_nullable: inferred.is_nullable,
                 has_default: false,
+                is_primary_key: false,
             });
             Ok(())
         }
@@ -3263,652 +3161,6 @@ fn resolve_target(
             ts_type,
         });
     }
-    Ok(())
-}
-
-/// Helper to inspect an expression for ParamRef and ColumnRef combinations.
-fn extract_param_info(node: &pg_query::protobuf::Node) -> Option<(i32, Option<String>)> {
-    match &node.node {
-        Some(NodeEnum::ParamRef(p)) => Some((p.number, None)),
-        Some(NodeEnum::TypeCast(tc)) => {
-            if let Some(arg) = &tc.arg
-                && let Some(NodeEnum::ParamRef(p)) = &arg.node
-            {
-                let cast_type = tc.type_name.as_ref().map(extract_type_name);
-                return Some((p.number, cast_type));
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-fn extract_column_info(node: &pg_query::protobuf::Node) -> Option<(Option<String>, String)> {
-    match &node.node {
-        Some(NodeEnum::ColumnRef(cr)) => {
-            if cr.fields.len() == 2 {
-                let alias = extract_string(&cr.fields[0]);
-                let col = extract_string(&cr.fields[1]);
-                if let Some(c) = col {
-                    return Some((alias, c));
-                }
-            } else if cr.fields.len() == 1
-                && let Some(c) = extract_string(&cr.fields[0])
-            {
-                return Some((None, c));
-            }
-            None
-        }
-        Some(NodeEnum::TypeCast(tc)) => {
-            if let Some(arg) = &tc.arg {
-                extract_column_info(arg)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-struct OptionalFilterMatch {
-    param_num: i32,
-    cast_opt: Option<String>,
-    alias_opt: Option<String>,
-    col_name: String,
-}
-
-fn match_null_test_param(node: &pg_query::protobuf::Node) -> Option<(i32, Option<String>)> {
-    if let Some(NodeEnum::NullTest(nt)) = &node.node
-        && nt.nulltesttype == NullTestType::IsNull as i32
-        && let Some(arg) = &nt.arg
-    {
-        return extract_param_info(arg);
-    }
-    None
-}
-
-fn match_equality_col_param(
-    node: &pg_query::protobuf::Node,
-) -> Option<(i32, Option<String>, Option<String>, String)> {
-    if let Some(NodeEnum::AExpr(ae)) = &node.node
-        && ae.kind == AExprKind::AexprOp as i32
-        && ae.name.first().and_then(extract_string).as_deref() == Some("=")
-    {
-        let param_opt_l = ae.lexpr.as_ref().and_then(|n| extract_param_info(n));
-        let col_opt_l = ae.lexpr.as_ref().and_then(|n| extract_column_info(n));
-
-        let param_opt_r = ae.rexpr.as_ref().and_then(|n| extract_param_info(n));
-        let col_opt_r = ae.rexpr.as_ref().and_then(|n| extract_column_info(n));
-
-        if let (Some((param_num, cast_opt)), Some((alias_opt, col_name))) = (param_opt_r, col_opt_l)
-        {
-            return Some((param_num, cast_opt, alias_opt, col_name));
-        } else if let (Some((param_num, cast_opt)), Some((alias_opt, col_name))) =
-            (param_opt_l, col_opt_r)
-        {
-            return Some((param_num, cast_opt, alias_opt, col_name));
-        }
-    }
-    None
-}
-
-fn match_optional_filter(be: &pg_query::protobuf::BoolExpr) -> Option<OptionalFilterMatch> {
-    if be.boolop != BoolExprType::OrExpr as i32 || be.args.len() != 2 {
-        return None;
-    }
-
-    let arm0 = &be.args[0];
-    let arm1 = &be.args[1];
-
-    // Case 1: arm0 is NullTest($N), arm1 is col = $N
-    if let Some((p_null, cast_null)) = match_null_test_param(arm0)
-        && let Some((p_eq, cast_eq, alias_opt, col_name)) = match_equality_col_param(arm1)
-        && p_null == p_eq
-    {
-        let cast_opt = cast_null.or(cast_eq);
-        return Some(OptionalFilterMatch {
-            param_num: p_null,
-            cast_opt,
-            alias_opt,
-            col_name,
-        });
-    }
-
-    // Case 2: arm0 is col = $N, arm1 is NullTest($N)
-    if let Some((p_eq, cast_eq, alias_opt, col_name)) = match_equality_col_param(arm0)
-        && let Some((p_null, cast_null)) = match_null_test_param(arm1)
-        && p_null == p_eq
-    {
-        let cast_opt = cast_null.or(cast_eq);
-        return Some(OptionalFilterMatch {
-            param_num: p_null,
-            cast_opt,
-            alias_opt,
-            col_name,
-        });
-    }
-
-    None
-}
-
-fn resolve_scalar_array_comparison(
-    lhs: &pg_query::protobuf::Node,
-    rhs: &pg_query::protobuf::Node,
-    catalog: &Catalog,
-    scope: &QueryScope,
-    param_map: &mut HashMap<i32, ParamInfo>,
-) -> Result<(), String> {
-    let param_opt_l = extract_param_info(lhs);
-    let param_opt_r = extract_param_info(rhs);
-
-    if let Some((param_num, cast_opt)) = param_opt_r {
-        let mut resolved_type = cast_opt.map(|c| catalog.resolve_type(&c));
-        let mut col_name_opt = None;
-
-        if resolved_type.is_none() {
-            if let Ok(lhs_inf) = infer_expr(lhs, catalog, scope)
-                && lhs_inf.pg_type != PgType::Unknown
-            {
-                resolved_type = Some(lhs_inf.pg_type.to_array().to_ts(catalog));
-            }
-            if let Some((_, col_name)) = extract_column_info(lhs) {
-                col_name_opt = Some(col_name);
-            }
-        }
-
-        let entry = param_map.entry(param_num).or_default();
-        if let Some(col_name) = col_name_opt
-            && entry.suggested_name.is_none()
-        {
-            entry.suggested_name = Some(col_name);
-        }
-        if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
-            entry.inferred_type = resolved_type;
-        }
-
-        resolve_params_in_expr(lhs, catalog, scope, param_map)?;
-    } else if let Some((param_num, cast_opt)) = param_opt_l {
-        let mut resolved_type = cast_opt.map(|c| catalog.resolve_type(&c));
-        let mut col_name_opt = None;
-
-        if resolved_type.is_none() {
-            if let Ok(rhs_inf) = infer_expr(rhs, catalog, scope)
-                && let Some(elem) = rhs_inf.pg_type.element_type()
-            {
-                resolved_type = Some(elem.to_ts(catalog));
-            }
-            if let Some((_, col_name)) = extract_column_info(rhs) {
-                col_name_opt = Some(col_name);
-            }
-        }
-
-        let entry = param_map.entry(param_num).or_default();
-        if let Some(col_name) = col_name_opt
-            && entry.suggested_name.is_none()
-        {
-            entry.suggested_name = Some(col_name);
-        }
-        if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
-            entry.inferred_type = resolved_type;
-        }
-
-        resolve_params_in_expr(rhs, catalog, scope, param_map)?;
-    } else {
-        resolve_params_in_expr(lhs, catalog, scope, param_map)?;
-        resolve_params_in_expr(rhs, catalog, scope, param_map)?;
-    }
-
-    Ok(())
-}
-
-fn resolve_array_op_params(
-    lexpr: &pg_query::protobuf::Node,
-    rexpr: &pg_query::protobuf::Node,
-    catalog: &Catalog,
-    scope: &QueryScope,
-    param_map: &mut HashMap<i32, ParamInfo>,
-) -> Result<(), String> {
-    let param_opt_l = extract_param_info(lexpr);
-    let param_opt_r = extract_param_info(rexpr);
-
-    if let Some((param_num, cast_opt)) = param_opt_r {
-        let mut resolved_type = cast_opt.map(|c| catalog.resolve_type(&c));
-        let mut col_name_opt = None;
-
-        if resolved_type.is_none() {
-            if let Ok(lhs_inf) = infer_expr(lexpr, catalog, scope)
-                && lhs_inf.pg_type != PgType::Unknown
-            {
-                resolved_type = Some(lhs_inf.pg_type.to_ts(catalog));
-            }
-            if let Some((_, col_name)) = extract_column_info(lexpr) {
-                col_name_opt = Some(col_name);
-            }
-        }
-
-        let entry = param_map.entry(param_num).or_default();
-        if let Some(col_name) = col_name_opt
-            && entry.suggested_name.is_none()
-        {
-            entry.suggested_name = Some(col_name);
-        }
-        if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
-            entry.inferred_type = resolved_type;
-        }
-
-        resolve_params_in_expr(lexpr, catalog, scope, param_map)?;
-    } else if let Some((param_num, cast_opt)) = param_opt_l {
-        let mut resolved_type = cast_opt.map(|c| catalog.resolve_type(&c));
-        let mut col_name_opt = None;
-
-        if resolved_type.is_none() {
-            if let Ok(rhs_inf) = infer_expr(rexpr, catalog, scope)
-                && rhs_inf.pg_type != PgType::Unknown
-            {
-                resolved_type = Some(rhs_inf.pg_type.to_ts(catalog));
-            }
-            if let Some((_, col_name)) = extract_column_info(rexpr) {
-                col_name_opt = Some(col_name);
-            }
-        }
-
-        let entry = param_map.entry(param_num).or_default();
-        if let Some(col_name) = col_name_opt
-            && entry.suggested_name.is_none()
-        {
-            entry.suggested_name = Some(col_name);
-        }
-        if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
-            entry.inferred_type = resolved_type;
-        }
-
-        resolve_params_in_expr(rexpr, catalog, scope, param_map)?;
-    } else {
-        resolve_params_in_expr(lexpr, catalog, scope, param_map)?;
-        resolve_params_in_expr(rexpr, catalog, scope, param_map)?;
-    }
-
-    Ok(())
-}
-
-fn resolve_params_in_expr(
-    expr: &pg_query::protobuf::Node,
-    catalog: &Catalog,
-    scope: &QueryScope,
-    param_map: &mut HashMap<i32, ParamInfo>,
-) -> Result<(), String> {
-    match &expr.node {
-        Some(NodeEnum::BoolExpr(be)) => {
-            if let Some(m) = match_optional_filter(be) {
-                record_param(
-                    m.param_num,
-                    m.cast_opt,
-                    m.alias_opt,
-                    &m.col_name,
-                    catalog,
-                    scope,
-                    param_map,
-                    true,
-                )?;
-                return Ok(());
-            }
-
-            for arg in &be.args {
-                resolve_params_in_expr(arg, catalog, scope, param_map)?;
-            }
-        }
-        Some(NodeEnum::ScalarArrayOpExpr(saoe)) => {
-            if saoe.args.len() == 2 {
-                resolve_scalar_array_comparison(
-                    &saoe.args[0],
-                    &saoe.args[1],
-                    catalog,
-                    scope,
-                    param_map,
-                )?;
-            } else {
-                for arg in &saoe.args {
-                    resolve_params_in_expr(arg, catalog, scope, param_map)?;
-                }
-            }
-        }
-        Some(NodeEnum::AExpr(ae)) => {
-            if ae.kind == AExprKind::AexprOpAny as i32 || ae.kind == AExprKind::AexprOpAll as i32 {
-                if let (Some(lexpr), Some(rexpr)) = (&ae.lexpr, &ae.rexpr) {
-                    resolve_scalar_array_comparison(lexpr, rexpr, catalog, scope, param_map)?;
-                }
-                return Ok(());
-            }
-
-            if ae.kind == AExprKind::AexprOp as i32 {
-                let op = ae.name.first().and_then(extract_string).unwrap_or_default();
-                if matches!(op.as_str(), "&&" | "@>" | "<@") {
-                    if let (Some(lexpr), Some(rexpr)) = (&ae.lexpr, &ae.rexpr) {
-                        resolve_array_op_params(lexpr, rexpr, catalog, scope, param_map)?;
-                    }
-                    return Ok(());
-                }
-
-                let param_opt_l = ae.lexpr.as_ref().and_then(|n| extract_param_info(n));
-                let col_opt_l = ae.lexpr.as_ref().and_then(|n| extract_column_info(n));
-
-                let param_opt_r = ae.rexpr.as_ref().and_then(|n| extract_param_info(n));
-                let col_opt_r = ae.rexpr.as_ref().and_then(|n| extract_column_info(n));
-
-                if let (Some((param_num, cast_opt)), Some((alias_opt, col_name))) =
-                    (&param_opt_r, &col_opt_l)
-                {
-                    record_param(
-                        *param_num,
-                        cast_opt.clone(),
-                        alias_opt.clone(),
-                        col_name,
-                        catalog,
-                        scope,
-                        param_map,
-                        false,
-                    )?;
-                } else if let (Some((param_num, cast_opt)), Some((alias_opt, col_name))) =
-                    (&param_opt_l, &col_opt_r)
-                {
-                    record_param(
-                        *param_num,
-                        cast_opt.clone(),
-                        alias_opt.clone(),
-                        col_name,
-                        catalog,
-                        scope,
-                        param_map,
-                        false,
-                    )?;
-                } else if let Some((param_num, cast_opt)) = param_opt_r
-                    && let Some(lexpr) = &ae.lexpr
-                    && let Ok(l_inf) = infer_expr(lexpr, catalog, scope)
-                    && l_inf.pg_type != PgType::Unknown
-                    && let Some(ext_op) =
-                        catalog.resolve_operator(&op, &l_inf.pg_type, &PgType::Unknown)
-                {
-                    let ts_type = cast_opt
-                        .map(|c| catalog.resolve_type(&c))
-                        .unwrap_or_else(|| {
-                            if matches!(ext_op.right, PgType::Vector(_) | PgType::HalfVec(_)) {
-                                l_inf.pg_type.to_ts(catalog)
-                            } else {
-                                ext_op.right.to_ts(catalog)
-                            }
-                        });
-                    let entry = param_map.entry(param_num).or_default();
-                    if entry.inferred_type.is_none()
-                        || entry.inferred_type.as_deref() == Some("unknown")
-                    {
-                        entry.inferred_type = Some(ts_type);
-                    }
-                } else if let Some((param_num, cast_opt)) = param_opt_l
-                    && let Some(rexpr) = &ae.rexpr
-                    && let Ok(r_inf) = infer_expr(rexpr, catalog, scope)
-                    && r_inf.pg_type != PgType::Unknown
-                    && let Some(ext_op) =
-                        catalog.resolve_operator(&op, &PgType::Unknown, &r_inf.pg_type)
-                {
-                    let ts_type = cast_opt
-                        .map(|c| catalog.resolve_type(&c))
-                        .unwrap_or_else(|| {
-                            if matches!(ext_op.left, PgType::Vector(_) | PgType::HalfVec(_)) {
-                                r_inf.pg_type.to_ts(catalog)
-                            } else {
-                                ext_op.left.to_ts(catalog)
-                            }
-                        });
-                    let entry = param_map.entry(param_num).or_default();
-                    if entry.inferred_type.is_none()
-                        || entry.inferred_type.as_deref() == Some("unknown")
-                    {
-                        entry.inferred_type = Some(ts_type);
-                    }
-                } else {
-                    // Recurse both branches
-                    if let Some(lexpr) = &ae.lexpr {
-                        resolve_params_in_expr(lexpr, catalog, scope, param_map)?;
-                    }
-                    if let Some(rexpr) = &ae.rexpr {
-                        resolve_params_in_expr(rexpr, catalog, scope, param_map)?;
-                    }
-                }
-            } else {
-                if let Some(lexpr) = &ae.lexpr {
-                    resolve_params_in_expr(lexpr, catalog, scope, param_map)?;
-                }
-                if let Some(rexpr) = &ae.rexpr {
-                    resolve_params_in_expr(rexpr, catalog, scope, param_map)?;
-                }
-            }
-        }
-        Some(NodeEnum::TypeCast(tc)) => {
-            if let Some(arg) = &tc.arg {
-                if let Some(NodeEnum::ParamRef(p)) = &arg.node {
-                    let ts_type = tc
-                        .type_name
-                        .as_ref()
-                        .map(extract_type_name)
-                        .map(|t| catalog.resolve_type(&t));
-                    let entry = param_map.entry(p.number).or_default();
-                    if entry.inferred_type.is_none()
-                        || entry.inferred_type.as_deref() == Some("unknown")
-                    {
-                        entry.inferred_type = ts_type;
-                    }
-                } else {
-                    resolve_params_in_expr(arg, catalog, scope, param_map)?;
-                }
-            }
-        }
-        Some(NodeEnum::ParamRef(p)) => {
-            param_map.entry(p.number).or_default();
-        }
-        Some(NodeEnum::NullTest(nt)) => {
-            if let Some(arg) = &nt.arg {
-                resolve_params_in_expr(arg, catalog, scope, param_map)?;
-            }
-        }
-        Some(NodeEnum::BooleanTest(bt)) => {
-            if let Some(arg) = &bt.arg {
-                resolve_params_in_expr(arg, catalog, scope, param_map)?;
-            }
-        }
-        Some(NodeEnum::CaseExpr(ce)) => {
-            for arg in &ce.args {
-                resolve_params_in_expr(arg, catalog, scope, param_map)?;
-            }
-            if let Some(def) = &ce.defresult {
-                resolve_params_in_expr(def, catalog, scope, param_map)?;
-            }
-        }
-        Some(NodeEnum::CaseWhen(cw)) => {
-            if let Some(expr) = &cw.expr {
-                resolve_params_in_expr(expr, catalog, scope, param_map)?;
-            }
-            if let Some(res) = &cw.result {
-                resolve_params_in_expr(res, catalog, scope, param_map)?;
-            }
-        }
-        Some(NodeEnum::CoalesceExpr(ce)) => {
-            for arg in &ce.args {
-                resolve_params_in_expr(arg, catalog, scope, param_map)?;
-            }
-        }
-        Some(NodeEnum::FuncCall(fc)) => {
-            let func_name = extract_func_name(&fc.funcname);
-            let arg_types: Vec<PgType> = fc
-                .args
-                .iter()
-                .map(|arg| {
-                    infer_expr(arg, catalog, scope)
-                        .map(|inf| inf.pg_type)
-                        .unwrap_or(PgType::Unknown)
-                })
-                .collect();
-
-            let fn_def = catalog.resolve_function_with_args(&func_name, &arg_types);
-
-            for (i, arg) in fc.args.iter().enumerate() {
-                if let Some((param_num, cast_opt)) = extract_param_info(arg) {
-                    let expected_type = fn_def.and_then(|f| {
-                        if i < f.params.len() {
-                            Some(&f.params[i])
-                        } else if f.variadic && !f.params.is_empty() {
-                            f.params.last()
-                        } else {
-                            None
-                        }
-                    });
-
-                    let resolved = cast_opt
-                        .map(|c| catalog.resolve_type(&c))
-                        .or_else(|| expected_type.map(|t| t.to_ts(catalog)));
-
-                    let entry = param_map.entry(param_num).or_default();
-                    if (entry.inferred_type.is_none()
-                        || entry.inferred_type.as_deref() == Some("unknown"))
-                        && resolved.is_some()
-                    {
-                        entry.inferred_type = resolved;
-                    }
-                } else {
-                    resolve_params_in_expr(arg, catalog, scope, param_map)?;
-                }
-            }
-        }
-        Some(NodeEnum::SubLink(sl)) => {
-            if let Some(testexpr) = &sl.testexpr {
-                resolve_params_in_expr(testexpr, catalog, scope, param_map)?;
-            }
-            if let Some(sub_node) = &sl.subselect
-                && let Some(NodeEnum::SelectStmt(sub_select)) = &sub_node.node
-            {
-                let mut sub_scope = scope.clone();
-                if let Some(wc) = &sub_select.with_clause {
-                    let _ = process_with_clause_with_params(wc, &mut sub_scope, catalog, param_map);
-                }
-                let mut sub_catalog = catalog.clone();
-                for from_item in &sub_select.from_clause {
-                    if let Ok(item_scope) =
-                        resolve_from_clause_node(from_item, &mut sub_catalog, &sub_scope, param_map)
-                    {
-                        let _ = sub_scope.merge(item_scope);
-                    }
-                }
-                for target in &sub_select.target_list {
-                    if let Some(NodeEnum::ResTarget(rt)) = &target.node
-                        && let Some(val) = &rt.val
-                    {
-                        resolve_params_in_expr(val, &sub_catalog, &sub_scope, param_map)?;
-                    }
-                }
-                if let Some(where_node) = &sub_select.where_clause {
-                    resolve_params_in_expr(where_node, &sub_catalog, &sub_scope, param_map)?;
-                }
-            }
-        }
-        Some(NodeEnum::ResTarget(rt)) => {
-            if let Some(val) = &rt.val {
-                resolve_params_in_expr(val, catalog, scope, param_map)?;
-            }
-        }
-        Some(NodeEnum::AArrayExpr(aae)) => {
-            let mut unified_elem = PgType::Unknown;
-            for elem in &aae.elements {
-                if extract_param_info(elem).is_none()
-                    && let Ok(inf) = infer_expr(elem, catalog, scope)
-                {
-                    unified_elem = unify_types(&unified_elem, &inf.pg_type).unwrap_or(unified_elem);
-                }
-            }
-            for elem in &aae.elements {
-                if let Some((param_num, cast_opt)) = extract_param_info(elem) {
-                    let resolved_type = cast_opt.map(|c| catalog.resolve_type(&c)).or_else(|| {
-                        if unified_elem != PgType::Unknown {
-                            Some(unified_elem.to_ts(catalog))
-                        } else {
-                            None
-                        }
-                    });
-                    let entry = param_map.entry(param_num).or_default();
-                    if entry.inferred_type.is_none()
-                        || entry.inferred_type.as_deref() == Some("unknown")
-                    {
-                        entry.inferred_type = resolved_type;
-                    }
-                } else {
-                    resolve_params_in_expr(elem, catalog, scope, param_map)?;
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_param(
-    param_num: i32,
-    cast_opt: Option<String>,
-    alias_opt: Option<String>,
-    col_name: &str,
-    catalog: &Catalog,
-    scope: &QueryScope,
-    param_map: &mut HashMap<i32, ParamInfo>,
-    is_optional: bool,
-) -> Result<(), String> {
-    let mut resolved_type: Option<String> = cast_opt.map(|c| catalog.resolve_type(&c));
-
-    // Lookup column to verify and get type if not explicitly cast
-    let col_meta = if let Some(alias) = alias_opt {
-        for binding in scope.bindings.values() {
-            if binding.has_explicit_alias
-                && binding.base_table.eq_ignore_ascii_case(&alias)
-                && !binding.exposed_name.eq_ignore_ascii_case(&alias)
-            {
-                return Err(format!(
-                    "Cannot reference base table \"{}\" because it is aliased as \"{}\"",
-                    alias, binding.exposed_name
-                ));
-            }
-        }
-        let binding = scope
-            .bindings
-            .get(&alias.to_ascii_lowercase())
-            .ok_or_else(|| format!("Unknown table alias \"{}\" in parameter comparison", alias))?;
-        binding.get_column(col_name)
-    } else {
-        let mut found = None;
-        for name in &scope.binding_order {
-            if let Some(binding) = scope.bindings.get(&name.to_ascii_lowercase())
-                && let Some(c) = binding.get_column(col_name)
-            {
-                found = Some(c);
-                break;
-            }
-        }
-        found
-    };
-
-    if let Some(col) = col_meta
-        && resolved_type.is_none()
-    {
-        resolved_type = Some(catalog.resolve_type(&col.pg_type));
-    }
-
-    let entry = param_map.entry(param_num).or_default();
-    if is_optional {
-        entry.is_optional = true;
-    }
-    if entry.suggested_name.is_none() {
-        entry.suggested_name = Some(col_name.to_string());
-    }
-    if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
-        entry.inferred_type = resolved_type;
-    }
-
     Ok(())
 }
 
@@ -4701,12 +3953,14 @@ RIGHT JOIN posts p ON p.user_id = u.id;
         let mut columns = HashMap::new();
         columns.insert(
             "id".to_string(),
-            ColumnMetadata {
+            ColumnBinding {
                 name: "id".to_string(),
                 pg_type: "uuid".to_string(),
                 ts_type: "string".to_string(),
+                ddl_nullable: false,
                 is_nullable: false,
                 has_default: false,
+                is_primary_key: false,
             },
         );
 
@@ -4714,20 +3968,27 @@ RIGHT JOIN posts p ON p.user_id = u.id;
             base_table: "users".to_string(),
             exposed_name: "u".to_string(),
             has_explicit_alias: true,
+            is_null_producing: false,
             is_null_padded: false,
             columns,
+            column_order: vec!["id".to_string()],
+            ambiguous_columns: HashSet::new(),
         };
 
         let mut scope = QueryScope::default();
         scope.add_binding(binding).unwrap();
 
-        assert!(!scope.bindings["u"].is_null_padded);
-        assert!(!scope.bindings["u"].columns["id"].is_nullable);
+        assert!(!scope.bindings["u"].is_null_producing());
+        assert!(!scope.bindings["u"].columns["id"].ddl_nullable);
+        assert!(!scope.bindings["u"].columns["id"].effective_nullable(scope.bindings["u"].is_null_producing()));
 
         scope.force_all_nullable();
 
-        assert!(scope.bindings["u"].is_null_padded);
-        assert!(scope.bindings["u"].columns["id"].is_nullable);
+        assert!(scope.bindings["u"].is_null_producing());
+        // Original DDL nullability is preserved and NOT mutated!
+        assert!(!scope.bindings["u"].columns["id"].ddl_nullable, "DDL nullability must remain false");
+        // Effective nullability evaluates to true due to null-producing binding!
+        assert!(scope.bindings["u"].columns["id"].effective_nullable(scope.bindings["u"].is_null_producing()));
     }
 
     #[test]

@@ -5,3 +5,5 @@ npm/platforms/*/bin/sqltype*
 dist/
 artifacts/
 release-assets/
+.agents/
+*.bak

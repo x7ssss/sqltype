@@ -1,10 +1,6 @@
-use crate::analyzer::{AnalyzedQuery, PgType};
-use crate::catalog::{Catalog, DriverTarget};
+use crate::analyzer::AnalyzedQuery;
+use crate::catalog::DriverTarget;
 
-/// Renders a PgType into its corresponding TypeScript representation.
-pub fn render_pg_type_to_ts(pg_type: &PgType, catalog: &Catalog) -> String {
-    pg_type.to_ts(catalog)
-}
 
 /// Converts PascalCase or general string to camelCase.
 pub fn to_camel_case(s: &str) -> String {
