@@ -1,9 +1,8 @@
 {
-  "name": "sqltype",
-  "version": "0.3.0",
-  "private": true,
+  "name": "@x7ssss/sqltype",
+  "version": "1.0.0",
   "description": "High-performance PostgreSQL-to-TypeScript compiler and language server",
-  "author": "x7ssss",
+  "author": "x7ssss <babadookmariqn@gmail.com>",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -12,5 +11,27 @@
   "bugs": {
     "url": "https://github.com/x7ssss/sqltype/issues"
   },
-  "homepage": "https://github.com/x7ssss/sqltype#readme"
+  "homepage": "https://github.com/x7ssss/sqltype#readme",
+  "bin": {
+    "sqltype": "./bin/sqltype.js"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "sql",
+    "typescript",
+    "compiler",
+    "postgres",
+    "postgresql",
+    "codegen",
+    "type-safe",
+    "zero-runtime"
+  ],
+  "scripts": {
+    "build:rust": "cargo build --release",
+    "prepare": "node -e \"\""
+  }
 }

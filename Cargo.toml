@@ -3,8 +3,10 @@ name = "sqltype"
 version = "0.3.0"
 edition = "2024"
 authors = ["x7ssss <babadookmariqn@gmail.com>"]
+description = "High-performance PostgreSQL-to-TypeScript compiler and language server"
 repository = "https://github.com/x7ssss/sqltype"
 license = "MIT"
+keywords = ["sql", "typescript", "compiler", "postgres", "postgresql"]
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive", "env"] }
