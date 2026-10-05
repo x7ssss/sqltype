@@ -1,19 +1,12 @@
 {
   "name": "@x7ssss/sqltype",
-  "version": "1.0.0",
-  "description": "High-performance PostgreSQL-to-TypeScript compiler and language server",
-  "author": "x7ssss <babadookmariqn@gmail.com>",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/x7ssss/sqltype.git"
-  },
-  "bugs": {
-    "url": "https://github.com/x7ssss/sqltype/issues"
-  },
-  "homepage": "https://github.com/x7ssss/sqltype#readme",
+  "version": "1.0.1",
+  "description": "Ultra-fast PostgreSQL SQL-to-TypeScript compiler CLI and Language Server written in Rust",
   "bin": {
     "sqltype": "./bin/sqltype.js"
+  },
+  "scripts": {
+    "build:rust": "cargo build --release"
   },
   "files": [
     "bin",
@@ -21,17 +14,18 @@
     "LICENSE"
   ],
   "keywords": [
-    "sql",
-    "typescript",
-    "compiler",
-    "postgres",
     "postgresql",
+    "postgres",
+    "typescript",
+    "sql",
+    "lsp",
     "codegen",
-    "type-safe",
-    "zero-runtime"
+    "types"
   ],
-  "scripts": {
-    "build:rust": "cargo build --release",
-    "prepare": "node -e \"\""
+  "author": "x7ssss",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/x7ssss/sqltype.git"
   }
 }
