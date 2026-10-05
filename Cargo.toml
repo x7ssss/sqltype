@@ -1,7 +1,7 @@
 [package]
 name = "sqltype"
-version = "0.3.0"
-edition = "2024"
+version = "1.0.3"
+edition = "2026"
 authors = ["x7ssss <babadookmariqn@gmail.com>"]
 description = "High-performance PostgreSQL-to-TypeScript compiler and language server"
 repository = "https://github.com/x7ssss/sqltype"

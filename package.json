@@ -1,9 +1,9 @@
 {
   "name": "@x7ssss/sqltype",
-  "version": "1.0.1",
+  "version": "1.0.3",
   "description": "Ultra-fast PostgreSQL SQL-to-TypeScript compiler CLI and Language Server written in Rust",
   "bin": {
-    "sqltype": "./bin/sqltype.js"
+    "sqltype": "bin/sqltype.js"
   },
   "scripts": {
     "build:rust": "cargo build --release"
@@ -13,6 +13,13 @@
     "README.md",
     "LICENSE"
   ],
+  "optionalDependencies": {
+    "@x7ssss/sqltype-win32-x64": "1.0.1",
+    "@x7ssss/sqltype-linux-x64": "1.0.1",
+    "@x7ssss/sqltype-linux-arm64": "1.0.1",
+    "@x7ssss/sqltype-darwin-x64": "1.0.1",
+    "@x7ssss/sqltype-darwin-arm64": "1.0.1"
+  },
   "keywords": [
     "postgresql",
     "postgres",
