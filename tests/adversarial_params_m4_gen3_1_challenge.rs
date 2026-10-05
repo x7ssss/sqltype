@@ -85,7 +85,9 @@ fn setup_challenge_catalog() -> Catalog {
             val INT NOT NULL
         );
     "#;
-    catalog.apply_sql(ddl).expect("Challenge catalog DDL setup failed");
+    catalog
+        .apply_sql(ddl)
+        .expect("Challenge catalog DDL setup failed");
     catalog
 }
 
@@ -99,7 +101,8 @@ fn test_nested_binary_operations_and_boolean_trees() {
 
     // 1a. Explicitly requested pattern: WHERE (a = $1 AND b = $2) OR c = $3
     let sql_nested = "SELECT * FROM users WHERE (name = $1 AND role_id = $2) OR email = $3;";
-    let analyzed = analyze_query(sql_nested, &catalog, None).expect("Nested binary op query should analyze");
+    let analyzed =
+        analyze_query(sql_nested, &catalog, None).expect("Nested binary op query should analyze");
     assert_eq!(analyzed.params.len(), 3);
     assert_eq!(analyzed.params[0].index, 1);
     assert_eq!(analyzed.params[0].name, "name");
@@ -117,7 +120,8 @@ fn test_nested_binary_operations_and_boolean_trees() {
         WHERE (((name = $1 AND age >= $2) OR (status = $3 AND active = $4))
                AND (email = $5 OR (created_at <= $6 AND score > $7)));
     "#;
-    let a_deep = analyze_query(sql_deep, &catalog, None).expect("Deep boolean tree query should analyze");
+    let a_deep =
+        analyze_query(sql_deep, &catalog, None).expect("Deep boolean tree query should analyze");
     assert_eq!(a_deep.params.len(), 7);
     assert_eq!(a_deep.params[0].name, "name");
     assert_eq!(a_deep.params[0].ts_type, "string");
@@ -320,7 +324,8 @@ fn test_array_semantics_discrimination() {
 
     // 2b. Scalar element param: $1 = ANY(arr_col) -> $1 is T (element of arr_col)
     let sql_scalar_any = "SELECT * FROM posts WHERE $1 = ANY(tags);";
-    let a_elem = analyze_query(sql_scalar_any, &catalog, None).expect("$1 = ANY(arr) should analyze");
+    let a_elem =
+        analyze_query(sql_scalar_any, &catalog, None).expect("$1 = ANY(arr) should analyze");
     assert_eq!(a_elem.params.len(), 1);
     assert_eq!(a_elem.params[0].name, "tags");
     assert_eq!(a_elem.params[0].ts_type, "string");
@@ -328,7 +333,8 @@ fn test_array_semantics_discrimination() {
     // 2c. Combined query with BOTH in the same statement:
     // WHERE id = ANY($1) AND $2 = ANY(tags)
     let sql_combined = "SELECT * FROM users WHERE id = ANY($1) AND $2 = ANY(tags);";
-    let a_comb = analyze_query(sql_combined, &catalog, None).expect("Combined array query should analyze");
+    let a_comb =
+        analyze_query(sql_combined, &catalog, None).expect("Combined array query should analyze");
     assert_eq!(a_comb.params.len(), 2);
     assert_eq!(a_comb.params[0].index, 1);
     assert_eq!(a_comb.params[0].name, "id");
@@ -380,7 +386,8 @@ fn test_dynamic_optional_filters_exhaustive_matrix() {
 
     // 3c. Inverted equality inside predicate: ($1 IS NULL OR $1 = email)
     let sql3 = "SELECT * FROM users WHERE ($1 IS NULL OR $1 = email);";
-    let a3 = analyze_query(sql3, &catalog, None).expect("Inverted predicate equality should analyze");
+    let a3 =
+        analyze_query(sql3, &catalog, None).expect("Inverted predicate equality should analyze");
     assert_eq!(a3.params.len(), 1);
     assert_eq!(a3.params[0].name, "email");
     assert_eq!(a3.params[0].ts_type, "string");
@@ -388,7 +395,8 @@ fn test_dynamic_optional_filters_exhaustive_matrix() {
 
     // 3d. Inverted ordering AND inverted predicate: ($1 = email OR $1 IS NULL)
     let sql4 = "SELECT * FROM users WHERE ($1 = email OR $1 IS NULL);";
-    let a4 = analyze_query(sql4, &catalog, None).expect("Both inverted optional filter should analyze");
+    let a4 =
+        analyze_query(sql4, &catalog, None).expect("Both inverted optional filter should analyze");
     assert_eq!(a4.params.len(), 1);
     assert_eq!(a4.params[0].name, "email");
     assert_eq!(a4.params[0].ts_type, "string");
@@ -458,7 +466,8 @@ fn test_dynamic_optional_filters_exhaustive_matrix() {
 
     // 3k. Optional symmetrical function: ($1 IS NULL OR lower(email) = lower($1)) and inverted
     let sql13 = "SELECT * FROM users WHERE ($1 IS NULL OR lower(email) = lower($1));";
-    let a13 = analyze_query(sql13, &catalog, None).expect("Optional symmetrical function should analyze");
+    let a13 =
+        analyze_query(sql13, &catalog, None).expect("Optional symmetrical function should analyze");
     assert_eq!(a13.params.len(), 1);
     assert_eq!(a13.params[0].name, "email");
     assert_eq!(a13.params[0].ts_type, "string");
@@ -471,7 +480,8 @@ fn test_dynamic_optional_filters_exhaustive_matrix() {
           AND ($2 IS NULL OR name LIKE $2)
           AND ($3 IS NULL OR id = ANY($3));
     "#;
-    let a_multi = analyze_query(sql_multi, &catalog, None).expect("Multiple optional filters should analyze");
+    let a_multi =
+        analyze_query(sql_multi, &catalog, None).expect("Multiple optional filters should analyze");
     assert_eq!(a_multi.params.len(), 3);
     assert_eq!(a_multi.params[0].name, "email");
     assert!(a_multi.params[0].is_optional);
@@ -501,7 +511,8 @@ fn test_collision_avoidance_stress_with_existing_identifiers() {
           AND id = $4
           AND id = $5;
     "#;
-    let analyzed = analyze_query(sql, &catalog, None).expect("Collision stress query should analyze");
+    let analyzed =
+        analyze_query(sql, &catalog, None).expect("Collision stress query should analyze");
     assert_eq!(analyzed.params.len(), 5);
     assert_eq!(analyzed.params[0].name, "id");
     assert_eq!(analyzed.params[1].name, "id2");

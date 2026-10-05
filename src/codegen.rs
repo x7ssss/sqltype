@@ -1,7 +1,6 @@
 use crate::analyzer::AnalyzedQuery;
 use crate::catalog::DriverTarget;
 
-
 /// Converts PascalCase or general string to camelCase.
 pub fn to_camel_case(s: &str) -> String {
     let mut chars = s.chars();

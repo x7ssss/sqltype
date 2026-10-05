@@ -7,13 +7,11 @@
 pub mod operators;
 pub mod patterns;
 
-use crate::analyzer::{
-    PgType, QueryScope, extract_string, infer_expr,
-};
+use crate::analyzer::{PgType, QueryScope, extract_string, infer_expr};
 use crate::catalog::{Catalog, ColumnMetadata};
 use crate::nullability::{ColumnBinding, TableBinding};
-use pg_query::protobuf::{Node, SelectStmt};
 use pg_query::NodeEnum;
+use pg_query::protobuf::{Node, SelectStmt};
 use std::collections::{HashMap, HashSet};
 
 /// Represents a prepared statement parameter deduced from query expressions.
@@ -574,12 +572,7 @@ fn walk_select_stmt(
 
     // 1. Process CTEs in with_clause
     if let Some(wc) = &select.with_clause {
-        crate::analyzer::process_with_clause_with_params(
-            wc,
-            &mut query_scope,
-            catalog,
-            param_map,
-        )?;
+        crate::analyzer::process_with_clause_with_params(wc, &mut query_scope, catalog, param_map)?;
     }
 
     // 2. Build scope from from_clause if not already populated
@@ -754,7 +747,10 @@ fn walk_insert_stmt(
     let mut columns = HashMap::new();
     let mut col_order = Vec::new();
     for col in &table_meta.columns {
-        columns.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
+        columns.insert(
+            col.name.to_ascii_lowercase(),
+            ColumnBinding::from_column_metadata(col),
+        );
         col_order.push(col.name.clone());
     }
 
@@ -813,7 +809,12 @@ fn walk_insert_stmt(
                                     is_optional,
                                 )?;
                             } else {
-                                resolve_params_in_expr(val_node, catalog, &insert_scope, param_map)?;
+                                resolve_params_in_expr(
+                                    val_node,
+                                    catalog,
+                                    &insert_scope,
+                                    param_map,
+                                )?;
                                 if let Some(target_col) = col_meta {
                                     bind_untyped_params_in_node(val_node, target_col, param_map);
                                 }
@@ -834,7 +835,10 @@ fn walk_insert_stmt(
             let mut excluded_cols = HashMap::new();
             let mut excluded_order = Vec::new();
             for col in &table_meta.columns {
-                excluded_cols.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
+                excluded_cols.insert(
+                    col.name.to_ascii_lowercase(),
+                    ColumnBinding::from_column_metadata(col),
+                );
                 excluded_order.push(col.name.clone());
             }
             let excluded_binding = TableBinding {
@@ -863,7 +867,10 @@ fn walk_insert_stmt(
             if let Some(NodeEnum::ResTarget(rt)) = &target.node {
                 let col_name = &rt.name;
                 let target_col = table_meta.get_column(col_name).ok_or_else(|| {
-                    format!("Column \"{}\" does not exist on table \"{}\"", col_name, table_name)
+                    format!(
+                        "Column \"{}\" does not exist on table \"{}\"",
+                        col_name, table_name
+                    )
                 })?;
                 let is_optional = target_col.is_nullable;
                 if let Some(val_node) = &rt.val {
@@ -936,7 +943,10 @@ fn walk_update_stmt(
     let mut columns = HashMap::new();
     let mut col_order = Vec::new();
     for col in &table_meta.columns {
-        columns.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
+        columns.insert(
+            col.name.to_ascii_lowercase(),
+            ColumnBinding::from_column_metadata(col),
+        );
         col_order.push(col.name.clone());
     }
 
@@ -969,7 +979,10 @@ fn walk_update_stmt(
         if let Some(NodeEnum::ResTarget(rt)) = &target.node {
             let col_name = &rt.name;
             let target_col = table_meta.get_column(col_name).ok_or_else(|| {
-                format!("Column \"{}\" does not exist on table \"{}\"", col_name, table_name)
+                format!(
+                    "Column \"{}\" does not exist on table \"{}\"",
+                    col_name, table_name
+                )
             })?;
             let is_optional = target_col.is_nullable;
             if let Some(val_node) = &rt.val {
@@ -1042,7 +1055,10 @@ fn walk_delete_stmt(
     let mut columns = HashMap::new();
     let mut col_order = Vec::new();
     for col in &table_meta.columns {
-        columns.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
+        columns.insert(
+            col.name.to_ascii_lowercase(),
+            ColumnBinding::from_column_metadata(col),
+        );
         col_order.push(col.name.clone());
     }
 

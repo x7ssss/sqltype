@@ -10,8 +10,8 @@ use sqltype::analyzer::analyze_query;
 use sqltype::catalog::{Catalog, CompositeTypeAttribute, CompositeTypeMetadata};
 use sqltype::codegen::generate_file_ts;
 use sqltype::nullability::{
-    JoinKind, JoinTreeNode, format_nullable, has_root_null,
-    propagate_join_nullability, strip_root_null,
+    JoinKind, JoinTreeNode, format_nullable, has_root_null, propagate_join_nullability,
+    strip_root_null,
 };
 
 #[test]
@@ -39,7 +39,8 @@ fn test_deeply_nested_outer_joins_mandated_scenario() {
         ON b.id = d.id;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, None).expect("Nested outer join query must analyze successfully");
+    let analyzed = analyze_query(sql, &catalog, None)
+        .expect("Nested outer join query must analyze successfully");
     assert_eq!(analyzed.fields.len(), 5);
 
     // Analysis:
@@ -54,19 +55,34 @@ fn test_deeply_nested_outer_joins_mandated_scenario() {
     //     - Both d and e inherit null-producing (true)
     // Consequently: ALL 5 tables are null-producing in this tree!
     assert_eq!(analyzed.fields[0].name, "val_a");
-    assert_eq!(analyzed.fields[0].ts_type, "string | null", "val_a must be nullable (left of RIGHT JOIN)");
+    assert_eq!(
+        analyzed.fields[0].ts_type, "string | null",
+        "val_a must be nullable (left of RIGHT JOIN)"
+    );
 
     assert_eq!(analyzed.fields[1].name, "val_b");
-    assert_eq!(analyzed.fields[1].ts_type, "string | null", "val_b must be nullable (FULL JOIN)");
+    assert_eq!(
+        analyzed.fields[1].ts_type, "string | null",
+        "val_b must be nullable (FULL JOIN)"
+    );
 
     assert_eq!(analyzed.fields[2].name, "val_c");
-    assert_eq!(analyzed.fields[2].ts_type, "string | null", "val_c must be nullable (FULL JOIN)");
+    assert_eq!(
+        analyzed.fields[2].ts_type, "string | null",
+        "val_c must be nullable (FULL JOIN)"
+    );
 
     assert_eq!(analyzed.fields[3].name, "val_d");
-    assert_eq!(analyzed.fields[3].ts_type, "string | null", "val_d must be nullable (right of outer LEFT JOIN)");
+    assert_eq!(
+        analyzed.fields[3].ts_type, "string | null",
+        "val_d must be nullable (right of outer LEFT JOIN)"
+    );
 
     assert_eq!(analyzed.fields[4].name, "val_e");
-    assert_eq!(analyzed.fields[4].ts_type, "string | null", "val_e must be nullable (right of outer LEFT JOIN)");
+    assert_eq!(
+        analyzed.fields[4].ts_type, "string | null",
+        "val_e must be nullable (right of outer LEFT JOIN)"
+    );
 
     // Codegen verification
     let ts = generate_file_ts(&[analyzed]);
@@ -187,9 +203,13 @@ fn test_deeply_nested_outer_joins_contrast_preserved_branch() {
         ON a.id = d.id;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, None).expect("Contrast query must analyze successfully");
+    let analyzed =
+        analyze_query(sql, &catalog, None).expect("Contrast query must analyze successfully");
     assert_eq!(analyzed.fields[0].name, "val_a");
-    assert_eq!(analyzed.fields[0].ts_type, "string", "val_a must remain non-null (preserved branch)");
+    assert_eq!(
+        analyzed.fields[0].ts_type, "string",
+        "val_a must remain non-null (preserved branch)"
+    );
 
     assert_eq!(analyzed.fields[1].name, "val_b");
     assert_eq!(analyzed.fields[1].ts_type, "string | null");
@@ -246,7 +266,10 @@ fn test_deeply_nested_outer_joins_mixed_right_heavy_propagation() {
     assert_eq!(analyzed.fields[2].ts_type, "string | null");
 
     assert_eq!(analyzed.fields[3].name, "val_d");
-    assert_eq!(analyzed.fields[3].ts_type, "string", "val_d must be preserved NOT NULL");
+    assert_eq!(
+        analyzed.fields[3].ts_type, "string",
+        "val_d must be preserved NOT NULL"
+    );
 
     assert_eq!(analyzed.fields[4].name, "val_e");
     assert_eq!(analyzed.fields[4].ts_type, "string | null");
@@ -305,11 +328,18 @@ fn test_self_join_asymmetric_nullability_and_catalog_invariance() {
         FROM users u2
         LEFT JOIN users u1 ON u2.id = u1.id;
     "#;
-    let analyzed_trans = analyze_query(sql_transposed, &catalog, None).expect("Transposed self-join must succeed");
+    let analyzed_trans =
+        analyze_query(sql_transposed, &catalog, None).expect("Transposed self-join must succeed");
     assert_eq!(analyzed_trans.fields[0].name, "u1_col");
-    assert_eq!(analyzed_trans.fields[0].ts_type, "string | null", "u1 is now right side of LEFT JOIN, must be nullable");
+    assert_eq!(
+        analyzed_trans.fields[0].ts_type, "string | null",
+        "u1 is now right side of LEFT JOIN, must be nullable"
+    );
     assert_eq!(analyzed_trans.fields[1].name, "u2_col");
-    assert_eq!(analyzed_trans.fields[1].ts_type, "string", "u2 is now left side of LEFT JOIN, must be non-null");
+    assert_eq!(
+        analyzed_trans.fields[1].ts_type, "string",
+        "u2 is now left side of LEFT JOIN, must be non-null"
+    );
 
     // 4-Way Self-Join: (u1 LEFT JOIN u2) LEFT JOIN (u3 LEFT JOIN u4)
     let sql_4way = r#"
@@ -322,21 +352,55 @@ fn test_self_join_asymmetric_nullability_and_catalog_invariance() {
         LEFT JOIN (users u3 LEFT JOIN users u4 ON u3.id = u4.id)
         ON u1.id = u3.id;
     "#;
-    let analyzed_4way = analyze_query(sql_4way, &catalog, None).expect("4-way self-join must succeed");
-    assert_eq!(analyzed_4way.fields[0].ts_type, "string", "u1 must remain non-null");
-    assert_eq!(analyzed_4way.fields[1].ts_type, "string | null", "u2 must be nullable");
-    assert_eq!(analyzed_4way.fields[2].ts_type, "string | null", "u3 must be nullable");
-    assert_eq!(analyzed_4way.fields[3].ts_type, "string | null", "u4 must be nullable");
+    let analyzed_4way =
+        analyze_query(sql_4way, &catalog, None).expect("4-way self-join must succeed");
+    assert_eq!(
+        analyzed_4way.fields[0].ts_type, "string",
+        "u1 must remain non-null"
+    );
+    assert_eq!(
+        analyzed_4way.fields[1].ts_type, "string | null",
+        "u2 must be nullable"
+    );
+    assert_eq!(
+        analyzed_4way.fields[2].ts_type, "string | null",
+        "u3 must be nullable"
+    );
+    assert_eq!(
+        analyzed_4way.fields[3].ts_type, "string | null",
+        "u4 must be nullable"
+    );
 
     // Catalog Invariance Check: underlying 'users' table MUST NOT be mutated!
     let users_tbl = catalog.get_table("users").expect("users table must exist");
-    assert!(!users_tbl.get_column("col").unwrap().is_nullable, "users.col DDL nullability must remain false");
-    assert!(!users_tbl.get_column("email").unwrap().is_nullable, "users.email DDL nullability must remain false");
-    assert!(!users_tbl.get_column("id").unwrap().is_nullable, "users.id DDL nullability must remain false");
-    assert!(catalog.get_table("u1").is_none(), "Alias u1 must not leak into catalog");
-    assert!(catalog.get_table("u2").is_none(), "Alias u2 must not leak into catalog");
-    assert!(catalog.get_table("u3").is_none(), "Alias u3 must not leak into catalog");
-    assert!(catalog.get_table("u4").is_none(), "Alias u4 must not leak into catalog");
+    assert!(
+        !users_tbl.get_column("col").unwrap().is_nullable,
+        "users.col DDL nullability must remain false"
+    );
+    assert!(
+        !users_tbl.get_column("email").unwrap().is_nullable,
+        "users.email DDL nullability must remain false"
+    );
+    assert!(
+        !users_tbl.get_column("id").unwrap().is_nullable,
+        "users.id DDL nullability must remain false"
+    );
+    assert!(
+        catalog.get_table("u1").is_none(),
+        "Alias u1 must not leak into catalog"
+    );
+    assert!(
+        catalog.get_table("u2").is_none(),
+        "Alias u2 must not leak into catalog"
+    );
+    assert!(
+        catalog.get_table("u3").is_none(),
+        "Alias u3 must not leak into catalog"
+    );
+    assert!(
+        catalog.get_table("u4").is_none(),
+        "Alias u4 must not leak into catalog"
+    );
 }
 
 #[test]
@@ -364,15 +428,29 @@ fn test_composite_types_inner_nullable_under_outer_joins() {
 
     // Standalone unit invariants for depth-0 union formatting
     let inner_nullable = "{ bio: string | null; addr: { street: string; zip: string | null } }";
-    assert!(!has_root_null(inner_nullable), "Depth-1 null must not be classified as root null");
+    assert!(
+        !has_root_null(inner_nullable),
+        "Depth-1 null must not be classified as root null"
+    );
     let wrapped = format_nullable(inner_nullable);
     assert_eq!(
         wrapped,
         "{ bio: string | null; addr: { street: string; zip: string | null } } | null"
     );
-    assert!(has_root_null(&wrapped), "Depth-0 null must be classified as root null");
-    assert_eq!(format_nullable(&wrapped), wrapped, "format_nullable must be idempotent");
-    assert_eq!(strip_root_null(&wrapped), inner_nullable, "strip_root_null must preserve inner nulls");
+    assert!(
+        has_root_null(&wrapped),
+        "Depth-0 null must be classified as root null"
+    );
+    assert_eq!(
+        format_nullable(&wrapped),
+        wrapped,
+        "format_nullable must be idempotent"
+    );
+    assert_eq!(
+        strip_root_null(&wrapped),
+        inner_nullable,
+        "strip_root_null must preserve inner nulls"
+    );
 
     // Inject an inner nullable field into `user_profile_t`
     // (bio is `string | null` and address_t zip is `string | null`)
@@ -460,7 +538,9 @@ fn test_composite_types_inner_nullable_under_outer_joins() {
     // Codegen verification
     let ts_code = generate_file_ts(&[analyzed_outer]);
     assert!(
-        ts_code.contains("contact: { bio: string | null; addr: { street: string; zip: string | null } } | null;"),
+        ts_code.contains(
+            "contact: { bio: string | null; addr: { street: string; zip: string | null } } | null;"
+        ),
         "Generated TypeScript must have exact composite type with inner nulls and outer null:\n{}",
         ts_code
     );
@@ -525,7 +605,8 @@ fn test_ambiguous_column_references_in_aliased_join() {
 
     // 5. Distinct columns j.col1 and j.col2 -> MUST SUCCEED
     let sql_distinct = "SELECT j.col1, j.col2 FROM (t1 JOIN t2 ON t1.id = t2.id) AS j;";
-    let res_distinct = analyze_query(sql_distinct, &catalog, None).expect("Distinct columns must succeed");
+    let res_distinct =
+        analyze_query(sql_distinct, &catalog, None).expect("Distinct columns must succeed");
     assert_eq!(res_distinct.fields.len(), 2);
     assert_eq!(res_distinct.fields[0].name, "col1");
     assert_eq!(res_distinct.fields[0].ts_type, "string");
@@ -534,13 +615,16 @@ fn test_ambiguous_column_references_in_aliased_join() {
 
     // 6. Unqualified reference to distinct column `col1` -> MUST SUCCEED
     let sql_unqual_valid = "SELECT col1 FROM (t1 JOIN t2 ON t1.id = t2.id) AS j;";
-    let res_unqual = analyze_query(sql_unqual_valid, &catalog, None).expect("Unqualified distinct col1 must succeed");
+    let res_unqual = analyze_query(sql_unqual_valid, &catalog, None)
+        .expect("Unqualified distinct col1 must succeed");
     assert_eq!(res_unqual.fields[0].name, "col1");
     assert_eq!(res_unqual.fields[0].ts_type, "string");
 
     // 7. Aliased join inside outer join:
     // `other o LEFT JOIN (t1 JOIN t2 ON t1.id = t2.id) AS j ON o.id = 1`
-    catalog.apply_sql("CREATE TABLE other (id INT PRIMARY KEY, name TEXT NOT NULL);").unwrap();
+    catalog
+        .apply_sql("CREATE TABLE other (id INT PRIMARY KEY, name TEXT NOT NULL);")
+        .unwrap();
     let sql_outer_aliased = r#"
         SELECT
             o.name,
@@ -550,7 +634,8 @@ fn test_ambiguous_column_references_in_aliased_join() {
         LEFT JOIN (t1 JOIN t2 ON t1.id = t2.id) AS j
         ON o.id = 1;
     "#;
-    let res_outer_aliased = analyze_query(sql_outer_aliased, &catalog, None).expect("Outer aliased join must succeed");
+    let res_outer_aliased =
+        analyze_query(sql_outer_aliased, &catalog, None).expect("Outer aliased join must succeed");
     assert_eq!(res_outer_aliased.fields[0].ts_type, "string");
     assert_eq!(res_outer_aliased.fields[1].ts_type, "string | null");
     assert_eq!(res_outer_aliased.fields[2].ts_type, "string | null");

@@ -61,17 +61,36 @@ fn test_adv_ts_scanner_multibyte_unicode_and_emojis() {
     "#;
 
     let queries = scan_ts_queries(ts_source);
-    assert_eq!(queries.len(), 1, "Should find 1 query with unicode characters");
+    assert_eq!(
+        queries.len(),
+        1,
+        "Should find 1 query with unicode characters"
+    );
     let q = &queries[0];
 
     assert_eq!(q.name.as_deref(), Some("ComplexUnicodeQuery"));
-    assert!(q.sql.contains("'🦀' AS crab"), "Emoji literal must be preserved verbatim");
-    assert!(q.sql.contains("'你好世界' AS cjk"), "CJK literal must be preserved verbatim");
-    assert!(q.sql.contains("'München' AS accent"), "Accented literal must be preserved verbatim");
+    assert!(
+        q.sql.contains("'🦀' AS crab"),
+        "Emoji literal must be preserved verbatim"
+    );
+    assert!(
+        q.sql.contains("'你好世界' AS cjk"),
+        "CJK literal must be preserved verbatim"
+    );
+    assert!(
+        q.sql.contains("'München' AS accent"),
+        "Accented literal must be preserved verbatim"
+    );
 
     // Check parameter replacement: $1 and $2
-    assert!(q.sql.contains("WHERE bio LIKE $1"), "First interpolation must be mapped to $1");
-    assert!(q.sql.contains("AND username = $2"), "Second interpolation must be mapped to $2");
+    assert!(
+        q.sql.contains("WHERE bio LIKE $1"),
+        "First interpolation must be mapped to $1"
+    );
+    assert!(
+        q.sql.contains("AND username = $2"),
+        "Second interpolation must be mapped to $2"
+    );
 
     assert_eq!(q.source_map.interpolations.len(), 2);
     assert_eq!(q.source_map.interpolations[0].index, 1);
@@ -100,7 +119,11 @@ fn test_adv_ts_scanner_mixed_quotes_and_escaped_backticks() {
     let q = &queries[0];
 
     // Escaped backticks in template should become single backticks in SQL content
-    assert!(q.sql.contains("`backtick`"), "Escaped backticks should be preserved in content: {}", q.sql);
+    assert!(
+        q.sql.contains("`backtick`"),
+        "Escaped backticks should be preserved in content: {}",
+        q.sql
+    );
     assert!(q.sql.contains("$1"));
     assert!(q.sql.contains("$2"));
 
@@ -109,7 +132,10 @@ fn test_adv_ts_scanner_mixed_quotes_and_escaped_backticks() {
     let host_offset = q.source_map.sql_to_host_offset(backtick_pos_in_sql);
     assert!(host_offset < ts_source.len());
     let host_slice = &ts_source[host_offset..host_offset + 2];
-    assert_eq!(host_slice, "\\`", "Mapped offset must point to the escaped backtick in host");
+    assert_eq!(
+        host_slice, "\\`",
+        "Mapped offset must point to the escaped backtick in host"
+    );
 }
 
 #[test]
@@ -138,8 +164,16 @@ fn test_adv_ts_scanner_complex_nested_interpolations() {
         q.source_map.interpolations[0].expr,
         "{ a: { b: 1, c: { d: [1, 2, 3] } } }.a.c.d[0]"
     );
-    assert!(q.source_map.interpolations[1].expr.contains("((x: string) => ({ name: x }))"));
-    assert!(q.source_map.interpolations[2].expr.contains("[100, 200, 300].map(n => ({ val: n * 2 }))[1].val"));
+    assert!(
+        q.source_map.interpolations[1]
+            .expr
+            .contains("((x: string) => ({ name: x }))")
+    );
+    assert!(
+        q.source_map.interpolations[2]
+            .expr
+            .contains("[100, 200, 300].map(n => ({ val: n * 2 }))[1].val")
+    );
 
     // Verify SQL parameter replacements
     assert!(q.sql.contains("WHERE id = $1"));
@@ -170,7 +204,10 @@ const q = sql`SELECT id FROM users WHERE id = ${superLongInterpolatedExpressionW
     // 1. Map $1 back to host
     let p1_host_range = map.sql_to_host_range(p1_sql..p1_sql + 2);
     let p1_host_text = &ts_source[p1_host_range];
-    assert!(p1_host_text.starts_with("${superLongInterpolatedExpressionWithLotsOfWordsAndNumbers123456789}"));
+    assert!(
+        p1_host_text
+            .starts_with("${superLongInterpolatedExpressionWithLotsOfWordsAndNumbers123456789}")
+    );
 
     // 2. Map $2 back to host
     let p2_host_range = map.sql_to_host_range(p2_sql..p2_sql + 2);
@@ -180,25 +217,38 @@ const q = sql`SELECT id FROM users WHERE id = ${superLongInterpolatedExpressionW
     // 3. Map $3 back to host
     let p3_host_range = map.sql_to_host_range(p3_sql..p3_sql + 2);
     let p3_host_text = &ts_source[p3_host_range];
-    assert!(p3_host_text.starts_with("${anotherExtremelyLongIdentifierThatDivergesDrasticallyInCharacterCount}"));
+    assert!(
+        p3_host_text.starts_with(
+            "${anotherExtremelyLongIdentifierThatDivergesDrasticallyInCharacterCount}"
+        )
+    );
 
     // 4. Map SQL keyword after $1 (" AND active = ")
     let and_active_sql = q.sql.find("AND active = ").unwrap();
     let and_active_host = map.sql_to_host_offset(and_active_sql);
-    assert_eq!(&ts_source[and_active_host..and_active_host + 13], "AND active = ");
+    assert_eq!(
+        &ts_source[and_active_host..and_active_host + 13],
+        "AND active = "
+    );
 
     // 5. Reverse host_to_sql_offset
     let host_active = ts_source.find("AND active = ").unwrap();
-    let sql_active = map.host_to_sql_offset(host_active).expect("Reverse offset must exist");
+    let sql_active = map
+        .host_to_sql_offset(host_active)
+        .expect("Reverse offset must exist");
     assert_eq!(&q.sql[sql_active..sql_active + 13], "AND active = ");
 
     // 6. Param lookup by offset
     let inside_p1 = ts_source.find("superLong").unwrap();
-    let found_p1 = map.find_interpolated_param(inside_p1).expect("Should find param 1");
+    let found_p1 = map
+        .find_interpolated_param(inside_p1)
+        .expect("Should find param 1");
     assert_eq!(found_p1.index, 1);
 
     let inside_p2 = ts_source.find("${x}").unwrap() + 2;
-    let found_p2 = map.find_interpolated_param(inside_p2).expect("Should find param 2");
+    let found_p2 = map
+        .find_interpolated_param(inside_p2)
+        .expect("Should find param 2");
     assert_eq!(found_p2.index, 2);
 }
 
@@ -222,8 +272,14 @@ fn test_adv_lsp_document_single_char_keystroke_bursts() {
     for (byte_idx, ch) in typing_sequence.char_indices() {
         let insert_event = TextDocumentContentChangeEvent {
             range: Some(Range {
-                start: Position { line: 0, character: cur_col },
-                end: Position { line: 0, character: cur_col },
+                start: Position {
+                    line: 0,
+                    character: cur_col,
+                },
+                end: Position {
+                    line: 0,
+                    character: cur_col,
+                },
             }),
             range_length: None,
             text: ch.to_string(),
@@ -238,7 +294,10 @@ fn test_adv_lsp_document_single_char_keystroke_bursts() {
 
         cur_col += 1;
         assert_eq!(doc.queries().len(), 1);
-        assert_eq!(doc.queries()[0].sql, &typing_sequence[..byte_idx + ch.len_utf8()]);
+        assert_eq!(
+            doc.queries()[0].sql,
+            &typing_sequence[..byte_idx + ch.len_utf8()]
+        );
     }
 
     assert_eq!(doc.text(), "const q = sql`SELECT 1;`;");
@@ -248,8 +307,14 @@ fn test_adv_lsp_document_single_char_keystroke_bursts() {
     for (byte_idx, _) in typing_sequence.char_indices().rev() {
         let delete_event = TextDocumentContentChangeEvent {
             range: Some(Range {
-                start: Position { line: 0, character: cur_col - 1 },
-                end: Position { line: 0, character: cur_col },
+                start: Position {
+                    line: 0,
+                    character: cur_col - 1,
+                },
+                end: Position {
+                    line: 0,
+                    character: cur_col,
+                },
             }),
             range_length: None,
             text: String::new(),
@@ -300,27 +365,45 @@ export function cleanup() {
     // 1. Single-character edits in import header (line 0, col 0): insert comment '// '
     let edit_import = TextDocumentContentChangeEvent {
         range: Some(Range {
-            start: Position { line: 0, character: 0 },
-            end: Position { line: 0, character: 0 },
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 0,
+                character: 0,
+            },
         }),
         range_length: None,
         text: "// ".to_string(),
     };
     let has_sql = doc.apply_content_changes(vec![edit_import]);
-    assert!(!has_sql, "Edit at line 0 (imports) must strictly return has_sql_change = false");
+    assert!(
+        !has_sql,
+        "Edit at line 0 (imports) must strictly return has_sql_change = false"
+    );
 
     // 2. Burst of edits in AppConfig interface (line 4)
     for ch in "  debug: boolean;\n".chars() {
         let edit_type = TextDocumentContentChangeEvent {
             range: Some(Range {
-                start: Position { line: 4, character: 4 },
-                end: Position { line: 4, character: 4 },
+                start: Position {
+                    line: 4,
+                    character: 4,
+                },
+                end: Position {
+                    line: 4,
+                    character: 4,
+                },
             }),
             range_length: None,
             text: ch.to_string(),
         };
         let has_sql = doc.apply_content_changes(vec![edit_type]);
-        assert!(!has_sql, "Edit inside interface must strictly return has_sql_change = false");
+        assert!(
+            !has_sql,
+            "Edit inside interface must strictly return has_sql_change = false"
+        );
     }
 
     // 3. Rapid typing inside cleanup() function BELOW the template (around line 18)
@@ -335,11 +418,18 @@ export function cleanup() {
         text: "/* logging */ ".to_string(),
     };
     let has_sql = doc.apply_content_changes(vec![edit_fn]);
-    assert!(!has_sql, "Edit below template must strictly return has_sql_change = false");
+    assert!(
+        !has_sql,
+        "Edit below template must strictly return has_sql_change = false"
+    );
 
     // Verify query was not damaged or altered
     assert_eq!(doc.queries().len(), 1);
-    assert!(doc.queries()[0].sql.contains("SELECT id, username, email FROM users"));
+    assert!(
+        doc.queries()[0]
+            .sql
+            .contains("SELECT id, username, email FROM users")
+    );
 
     // 4. Now perform an edit INSIDE the template: change 'users' to 'customers'
     let users_offset = doc.text().find("users").unwrap();
@@ -355,7 +445,10 @@ export function cleanup() {
         text: "customers".to_string(),
     };
     let has_sql = doc.apply_content_changes(vec![edit_inside]);
-    assert!(has_sql, "Edit inside template must return has_sql_change = true");
+    assert!(
+        has_sql,
+        "Edit inside template must return has_sql_change = true"
+    );
     assert!(doc.queries()[0].sql.contains("FROM customers"));
 }
 
@@ -384,15 +477,25 @@ export const q = sql`
     let end_pos = doc.byte_to_position(select_start + "    SELECT 1;".len());
 
     let paste_event = TextDocumentContentChangeEvent {
-        range: Some(Range { start: start_pos, end: end_pos }),
+        range: Some(Range {
+            start: start_pos,
+            end: end_pos,
+        }),
         range_length: None,
         text: complex_sql.to_string(),
     };
 
     let has_sql = doc.apply_content_changes(vec![paste_event]);
-    assert!(has_sql, "Multiline paste inside SQL template must return has_sql_change = true");
+    assert!(
+        has_sql,
+        "Multiline paste inside SQL template must return has_sql_change = true"
+    );
     assert!(doc.queries()[0].sql.contains("WITH active_orders AS"));
-    assert!(doc.queries()[0].sql.contains("JOIN active_orders o ON o.user_id = u.id"));
+    assert!(
+        doc.queries()[0]
+            .sql
+            .contains("JOIN active_orders o ON o.user_id = u.id")
+    );
 
     // Selection deletion: select CTE and replace with empty string
     let with_offset = doc.text().find("WITH active_orders AS").unwrap();
@@ -401,13 +504,19 @@ export const q = sql`
     let del_end = doc.byte_to_position(select_u_offset);
 
     let delete_selection_event = TextDocumentContentChangeEvent {
-        range: Some(Range { start: del_start, end: del_end }),
+        range: Some(Range {
+            start: del_start,
+            end: del_end,
+        }),
         range_length: None,
         text: String::new(),
     };
 
     let has_sql = doc.apply_content_changes(vec![delete_selection_event]);
-    assert!(has_sql, "Block deletion inside SQL template must return has_sql_change = true");
+    assert!(
+        has_sql,
+        "Block deletion inside SQL template must return has_sql_change = true"
+    );
     assert!(!doc.queries()[0].sql.contains("WITH active_orders AS"));
     assert!(doc.queries()[0].sql.contains("SELECT u.id"));
 }
@@ -422,9 +531,18 @@ fn test_adv_lsp_document_utf16_surrogate_pairs_and_boundary_conversions() {
     // 'const crab = \'' has 14 ASCII characters (14 UTF-16 code units, 14 bytes)
     // '🦀' has 1 Unicode char, 2 UTF-16 code units (surrogate pair), 4 bytes
     // ';' has 1 UTF-16 code unit
-    let pos_before_crab = Position { line: 0, character: 14 };
-    let pos_after_crab = Position { line: 0, character: 16 };
-    let pos_end_line0 = Position { line: 0, character: 18 };
+    let pos_before_crab = Position {
+        line: 0,
+        character: 14,
+    };
+    let pos_after_crab = Position {
+        line: 0,
+        character: 16,
+    };
+    let pos_end_line0 = Position {
+        line: 0,
+        character: 18,
+    };
 
     assert_eq!(doc.position_to_byte_offset(pos_before_crab), 14);
     assert_eq!(doc.position_to_byte_offset(pos_after_crab), 18); // 14 + 4 bytes
@@ -444,16 +562,29 @@ fn test_adv_lsp_document_utf16_surrogate_pairs_and_boundary_conversions() {
     // Line 2: "const mixed = 'A🦀B';"
     // Before '🦀': character 16
     // After '🦀': character 18
-    let pos_line2_before = Position { line: 2, character: 16 };
-    let pos_line2_after = Position { line: 2, character: 18 };
+    let pos_line2_before = Position {
+        line: 2,
+        character: 16,
+    };
+    let pos_line2_after = Position {
+        line: 2,
+        character: 18,
+    };
     let offset_before = doc.position_to_byte_offset(pos_line2_before);
     let offset_after = doc.position_to_byte_offset(pos_line2_after);
-    assert_eq!(offset_after - offset_before, 4, "Crab emoji must span exactly 4 UTF-8 bytes");
+    assert_eq!(
+        offset_after - offset_before,
+        4,
+        "Crab emoji must span exactly 4 UTF-8 bytes"
+    );
 
     // Test editing: insert '!' immediately after crab emoji in Line 2
     let mut doc_edit = doc.clone();
     let insert_after_crab = TextDocumentContentChangeEvent {
-        range: Some(Range { start: pos_line2_after, end: pos_line2_after }),
+        range: Some(Range {
+            start: pos_line2_after,
+            end: pos_line2_after,
+        }),
         range_length: None,
         text: "!".to_string(),
     };
@@ -467,7 +598,10 @@ fn test_adv_lsp_document_utf16_surrogate_pairs_and_boundary_conversions() {
     // Test deleting emoji: delete character 16..18
     let mut doc_del = doc.clone();
     let delete_crab = TextDocumentContentChangeEvent {
-        range: Some(Range { start: pos_line2_before, end: pos_line2_after }),
+        range: Some(Range {
+            start: pos_line2_before,
+            end: pos_line2_after,
+        }),
         range_length: None,
         text: String::new(),
     };
@@ -499,7 +633,11 @@ export const brokenQuery = sql`
     let doc = Document::new("file:///unicode_err.ts".to_string(), 1, ts);
     let diags = validate_document(&doc, &catalog);
 
-    assert_eq!(diags.len(), 1, "Must emit exactly 1 syntax error diagnostic");
+    assert_eq!(
+        diags.len(),
+        1,
+        "Must emit exactly 1 syntax error diagnostic"
+    );
     let diag = &diags[0];
 
     assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
@@ -511,7 +649,10 @@ export const brokenQuery = sql`
         "Diagnostic must map to line 5, got {}",
         diag.range.start.line
     );
-    assert_ne!(diag.range.start.line, 0, "Must not map to line 0 (comments/imports)");
+    assert_ne!(
+        diag.range.start.line, 0,
+        "Must not map to line 0 (comments/imports)"
+    );
 
     // Token highlighted must be ";" (unexpected token in PostgreSQL parser)
     let line_str = doc.rope.line(5).to_string();
@@ -539,7 +680,8 @@ export const testQuery = sql`
     let diag = &diags[0];
 
     assert!(
-        diag.message.contains("Table \"non_existent_table\" does not exist in schema catalog"),
+        diag.message
+            .contains("Table \"non_existent_table\" does not exist in schema catalog"),
         "Expected missing table diagnostic: {}",
         diag.message
     );
@@ -571,11 +713,7 @@ export const complexHoverQuery = sql`
 
     // Warm up
     let users_offset = doc.text().find("users u").unwrap();
-    let _ = resolve_document_hover(
-        &doc,
-        doc.byte_to_position(users_offset),
-        &catalog,
-    );
+    let _ = resolve_document_hover(&doc, doc.byte_to_position(users_offset), &catalog);
 
     // Hover targets computed dynamically from actual token byte offsets:
     // 1. users table
@@ -615,7 +753,11 @@ export const complexHoverQuery = sql`
         if i % positions.len() == 4 {
             assert!(hover.is_none(), "Hover outside template must be None");
         } else {
-            assert!(hover.is_some(), "Hover inside template at {:?} must resolve", pos);
+            assert!(
+                hover.is_some(),
+                "Hover inside template at {:?} must resolve",
+                pos
+            );
         }
 
         latencies.push(elapsed);
@@ -643,7 +785,10 @@ fn test_adv_lsp_clear_diagnostics_on_close() {
     let cleared = clear_document_diagnostics(&uri);
 
     assert_eq!(cleared.uri, uri);
-    assert!(cleared.diagnostics.is_empty(), "Published diagnostics must be empty to clear editor squigglies");
+    assert!(
+        cleared.diagnostics.is_empty(),
+        "Published diagnostics must be empty to clear editor squigglies"
+    );
 }
 
 #[test]
@@ -672,12 +817,18 @@ export const queryB = sql`
     let mid_end = doc.byte_to_position(mid_offset + 3);
 
     let edit_mid = TextDocumentContentChangeEvent {
-        range: Some(Range { start: mid_start, end: mid_end }),
+        range: Some(Range {
+            start: mid_start,
+            end: mid_end,
+        }),
         range_length: None,
         text: "456".to_string(),
     };
     let has_sql = doc.apply_content_changes(vec![edit_mid]);
-    assert!(!has_sql, "Edit between query blocks must strictly return has_sql_change = false");
+    assert!(
+        !has_sql,
+        "Edit between query blocks must strictly return has_sql_change = false"
+    );
     assert_eq!(doc.queries().len(), 2);
 
     // Edit 2: Edit queryB (change status to order_status)
@@ -686,14 +837,23 @@ export const queryB = sql`
     let status_end = doc.byte_to_position(status_offset + 6);
 
     let edit_qb = TextDocumentContentChangeEvent {
-        range: Some(Range { start: status_start, end: status_end }),
+        range: Some(Range {
+            start: status_start,
+            end: status_end,
+        }),
         range_length: None,
         text: "order_status".to_string(),
     };
     let has_sql = doc.apply_content_changes(vec![edit_qb]);
-    assert!(has_sql, "Edit inside queryB must return has_sql_change = true");
+    assert!(
+        has_sql,
+        "Edit inside queryB must return has_sql_change = true"
+    );
     assert!(doc.queries()[1].sql.contains("order_status = $1"));
-    assert_eq!(doc.queries()[0].sql.trim(), "SELECT id FROM users WHERE id = $1;");
+    assert_eq!(
+        doc.queries()[0].sql.trim(),
+        "SELECT id FROM users WHERE id = $1;"
+    );
 }
 
 #[test]
@@ -701,7 +861,11 @@ fn test_adv_ts_scanner_unterminated_and_empty_interpolations() {
     // 1. Unterminated template literal
     let unterminated = "export const unclosed = sql`SELECT id FROM users";
     let queries = scan_ts_queries(unterminated);
-    assert_eq!(queries.len(), 1, "Should cleanly extract unclosed template without panicking");
+    assert_eq!(
+        queries.len(),
+        1,
+        "Should cleanly extract unclosed template without panicking"
+    );
     assert_eq!(queries[0].sql, "SELECT id FROM users");
 
     // 2. Empty interpolation `${}`
@@ -734,14 +898,18 @@ export const q = sql`
 
 #[test]
 fn test_adv_lsp_document_crlf_windows_line_endings_position_fidelity() {
-    let crlf_text = "const a = 1;\r\nconst b = 2;\r\nconst q = sql`\r\n  SELECT id\r\n  FROM users;\r\n`;\r\n";
+    let crlf_text =
+        "const a = 1;\r\nconst b = 2;\r\nconst q = sql`\r\n  SELECT id\r\n  FROM users;\r\n`;\r\n";
     let mut doc = Document::new("file:///crlf.ts".to_string(), 1, crlf_text);
 
     assert_eq!(doc.queries().len(), 1);
     assert!(doc.queries()[0].sql.contains("SELECT id"));
 
     // Verify position conversions for CRLF lines
-    let line1_pos = Position { line: 1, character: 6 }; // 'b' in const b
+    let line1_pos = Position {
+        line: 1,
+        character: 6,
+    }; // 'b' in const b
     let byte_offset = doc.position_to_byte_offset(line1_pos);
     let pos_roundtrip = doc.byte_to_position(byte_offset);
     assert_eq!(pos_roundtrip, line1_pos);
@@ -749,14 +917,23 @@ fn test_adv_lsp_document_crlf_windows_line_endings_position_fidelity() {
     // Edit outside CRLF template (line 0)
     let edit_crlf_outside = TextDocumentContentChangeEvent {
         range: Some(Range {
-            start: Position { line: 0, character: 10 },
-            end: Position { line: 0, character: 11 },
+            start: Position {
+                line: 0,
+                character: 10,
+            },
+            end: Position {
+                line: 0,
+                character: 11,
+            },
         }),
         range_length: None,
         text: "99".to_string(),
     };
     let has_sql = doc.apply_content_changes(vec![edit_crlf_outside]);
-    assert!(!has_sql, "Edit on CRLF outside template must return has_sql_change = false");
+    assert!(
+        !has_sql,
+        "Edit on CRLF outside template must return has_sql_change = false"
+    );
     assert!(doc.text().contains("const a = 99;"));
 
     // Edit inside CRLF template (change 'users' to 'members')
@@ -765,12 +942,18 @@ fn test_adv_lsp_document_crlf_windows_line_endings_position_fidelity() {
     let users_end = doc.byte_to_position(users_offset + 5);
 
     let edit_crlf_inside = TextDocumentContentChangeEvent {
-        range: Some(Range { start: users_start, end: users_end }),
+        range: Some(Range {
+            start: users_start,
+            end: users_end,
+        }),
         range_length: None,
         text: "members".to_string(),
     };
     let has_sql_inside = doc.apply_content_changes(vec![edit_crlf_inside]);
-    assert!(has_sql_inside, "Edit on CRLF inside template must return has_sql_change = true");
+    assert!(
+        has_sql_inside,
+        "Edit on CRLF inside template must return has_sql_change = true"
+    );
     assert!(doc.queries()[0].sql.contains("FROM members;"));
 }
 
@@ -796,8 +979,14 @@ export function getCounter() {
         let ch = ((b'a' + (i % 26) as u8) as char).to_string();
         let edit = TextDocumentContentChangeEvent {
             range: Some(Range {
-                start: Position { line: 3, character: 4 + i as u32 },
-                end: Position { line: 3, character: 4 + i as u32 },
+                start: Position {
+                    line: 3,
+                    character: 4 + i as u32,
+                },
+                end: Position {
+                    line: 3,
+                    character: 4 + i as u32,
+                },
             }),
             range_length: None,
             text: ch,
@@ -821,7 +1010,10 @@ export function getCounter() {
         let ch = ((b'0' + (i % 10) as u8) as char).to_string();
         let pos = doc.byte_to_position(select_offset);
         let edit = TextDocumentContentChangeEvent {
-            range: Some(Range { start: pos, end: pos }),
+            range: Some(Range {
+                start: pos,
+                end: pos,
+            }),
             range_length: None,
             text: ch,
         };
@@ -833,5 +1025,9 @@ export function getCounter() {
         );
     }
     assert_eq!(doc.queries().len(), 1);
-    assert!(doc.queries()[0].sql.contains("FROM users WHERE active = true;"));
+    assert!(
+        doc.queries()[0]
+            .sql
+            .contains("FROM users WHERE active = true;")
+    );
 }

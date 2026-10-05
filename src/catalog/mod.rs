@@ -714,7 +714,10 @@ impl Catalog {
                             if constr.contype == ConstrType::ConstrPrimary as i32 {
                                 is_not_null = true;
                                 is_pk = true;
-                                if !table_pk_cols.iter().any(|k| k.eq_ignore_ascii_case(&col_name)) {
+                                if !table_pk_cols
+                                    .iter()
+                                    .any(|k| k.eq_ignore_ascii_case(&col_name))
+                                {
                                     table_pk_cols.push(col_name.clone());
                                 }
                             } else if constr.contype == ConstrType::ConstrNotnull as i32 {
@@ -739,7 +742,9 @@ impl Catalog {
                 {
                     for key in &constr.keys {
                         if let Some(NodeEnum::String(s)) = &key.node
-                            && !table_pk_cols.iter().any(|k| k.eq_ignore_ascii_case(&s.sval))
+                            && !table_pk_cols
+                                .iter()
+                                .any(|k| k.eq_ignore_ascii_case(&s.sval))
                         {
                             table_pk_cols.push(s.sval.clone());
                         }
@@ -768,13 +773,15 @@ impl Catalog {
         };
 
         if let Some(s) = &schema {
-            self.tables.insert(format!("{}.{}", s, table_name), table_meta.clone());
+            self.tables
+                .insert(format!("{}.{}", s, table_name), table_meta.clone());
             if s == "public" {
                 self.tables.insert(table_name, table_meta);
             }
         } else {
             self.tables.insert(table_name.clone(), table_meta.clone());
-            self.tables.insert(format!("public.{}", table_name), table_meta);
+            self.tables
+                .insert(format!("public.{}", table_name), table_meta);
         }
 
         Ok(())
@@ -866,7 +873,11 @@ impl Catalog {
                                 if constr.contype == ConstrType::ConstrPrimary as i32 {
                                     is_not_null = true;
                                     is_pk = true;
-                                    if !table.primary_keys.iter().any(|k| k.eq_ignore_ascii_case(&col_name)) {
+                                    if !table
+                                        .primary_keys
+                                        .iter()
+                                        .any(|k| k.eq_ignore_ascii_case(&col_name))
+                                    {
                                         table.primary_keys.push(col_name.clone());
                                     }
                                 } else if constr.contype == ConstrType::ConstrNotnull as i32 {
@@ -952,13 +963,17 @@ impl Catalog {
                     for key in &constr.keys {
                         if let Some(NodeEnum::String(s)) = &key.node {
                             let pk_col = &s.sval;
-                            if !table.primary_keys.iter().any(|k| k.eq_ignore_ascii_case(pk_col)) {
+                            if !table
+                                .primary_keys
+                                .iter()
+                                .any(|k| k.eq_ignore_ascii_case(pk_col))
+                            {
                                 table.primary_keys.push(pk_col.clone());
                             }
                             if let Some(existing_col) = table
-                                    .columns
-                                    .iter_mut()
-                                    .find(|c| c.name.eq_ignore_ascii_case(pk_col))
+                                .columns
+                                .iter_mut()
+                                .find(|c| c.name.eq_ignore_ascii_case(pk_col))
                             {
                                 existing_col.is_primary_key = true;
                                 existing_col.is_nullable = false;
@@ -1001,7 +1016,10 @@ impl Catalog {
             }
             if schema_part == "public"
                 && let Some(t) = self.tables.get(table_part)
-                && t.schema.as_deref().unwrap_or("public").eq_ignore_ascii_case("public")
+                && t.schema
+                    .as_deref()
+                    .unwrap_or("public")
+                    .eq_ignore_ascii_case("public")
             {
                 return Some(t);
             }
@@ -1017,7 +1035,10 @@ impl Catalog {
             }
             for t in self.tables.values() {
                 if t.name.eq_ignore_ascii_case(&lower)
-                    && t.schema.as_deref().unwrap_or("public").eq_ignore_ascii_case("public")
+                    && t.schema
+                        .as_deref()
+                        .unwrap_or("public")
+                        .eq_ignore_ascii_case("public")
                 {
                     return Some(t);
                 }
@@ -1042,8 +1063,6 @@ mod tests {
     use super::*;
 
     #[test]
-
-
 
     fn test_create_table_parsing() {
         let sql = "
@@ -1320,10 +1339,7 @@ mod tests {
         assert!(loc_col.is_nullable);
 
         let waypoints_col = table.get_column("waypoints").unwrap();
-        assert_eq!(
-            waypoints_col.ts_type,
-            "Array<{ lat: number; lng: number }>"
-        );
+        assert_eq!(waypoints_col.ts_type, "Array<{ lat: number; lng: number }>");
         assert!(waypoints_col.is_nullable);
     }
 
@@ -1456,7 +1472,9 @@ mod tests {
             .apply_sql("CREATE TABLE tag_mapping (tag_id INT NOT NULL, post_id INT NOT NULL);")
             .unwrap();
         catalog
-            .apply_sql("ALTER TABLE tag_mapping ADD CONSTRAINT pk_tag_map PRIMARY KEY (tag_id, post_id);")
+            .apply_sql(
+                "ALTER TABLE tag_mapping ADD CONSTRAINT pk_tag_map PRIMARY KEY (tag_id, post_id);",
+            )
             .unwrap();
         let tag_map = catalog.get_table("tag_mapping").unwrap();
         assert_eq!(tag_map.primary_keys, vec!["tag_id", "post_id"]);
@@ -1512,11 +1530,19 @@ mod tests {
         assert!(s2.get_column("col_one").is_none());
 
         assert_eq!(
-            catalog.get_table_qualified(Some("schema1"), "t").unwrap().columns[1].name,
+            catalog
+                .get_table_qualified(Some("schema1"), "t")
+                .unwrap()
+                .columns[1]
+                .name,
             "col_one"
         );
         assert_eq!(
-            catalog.get_table_qualified(Some("schema2"), "t").unwrap().columns[1].name,
+            catalog
+                .get_table_qualified(Some("schema2"), "t")
+                .unwrap()
+                .columns[1]
+                .name,
             "col_two"
         );
         assert!(catalog.get_table_qualified(Some("schema3"), "t").is_none());
@@ -1576,4 +1602,3 @@ mod tests {
         assert!(table.get_column("balance").is_none());
     }
 }
-

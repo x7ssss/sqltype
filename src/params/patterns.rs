@@ -15,8 +15,8 @@
 use crate::analyzer::{QueryScope, extract_func_name, extract_string};
 use crate::catalog::Catalog;
 use crate::params::{extract_column_info, extract_param_info};
-use pg_query::protobuf::{AExpr, AExprKind, BoolExpr, BoolExprType, Node, NullTestType};
 use pg_query::NodeEnum;
+use pg_query::protobuf::{AExpr, AExprKind, BoolExpr, BoolExprType, Node, NullTestType};
 
 /// Describes a successful match of an optional dynamic filter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +90,13 @@ fn inspect_predicate_for_param(
             if ae.kind == AExprKind::AexprOp as i32 {
                 let op = ae.name.first().and_then(extract_string).unwrap_or_default();
                 if op == "=" {
-                    return match_binary_equality_or_sym_func(ae, target_param, null_cast, catalog, scope);
+                    return match_binary_equality_or_sym_func(
+                        ae,
+                        target_param,
+                        null_cast,
+                        catalog,
+                        scope,
+                    );
                 } else if matches!(op.as_str(), "~~" | "~~*" | "!~~" | "!~~*") {
                     return match_pattern_op(ae, target_param);
                 }
@@ -120,7 +126,12 @@ fn inspect_predicate_for_param(
                 {
                     let (alias_opt, col_name) = extract_column_info(lhs).unzip();
                     let col_name_str = col_name?;
-                    let elem_ts = resolve_col_type(alias_opt.flatten().as_deref(), &col_name_str, catalog, scope)?;
+                    let elem_ts = resolve_col_type(
+                        alias_opt.flatten().as_deref(),
+                        &col_name_str,
+                        catalog,
+                        scope,
+                    )?;
                     return Some((Some(col_name_str), Some(format!("Array<{}>", elem_ts))));
                 }
             }
@@ -141,7 +152,9 @@ fn match_binary_equality_or_sym_func(
     let rexpr = ae.rexpr.as_ref()?;
 
     // Check symmetrical function: lower(col) = lower($N) or lower($N) = lower(col)
-    if let (Some(NodeEnum::FuncCall(fc_l)), Some(NodeEnum::FuncCall(fc_r))) = (&lexpr.node, &rexpr.node) {
+    if let (Some(NodeEnum::FuncCall(fc_l)), Some(NodeEnum::FuncCall(fc_r))) =
+        (&lexpr.node, &rexpr.node)
+    {
         let fn_l = extract_func_name(&fc_l.funcname);
         let fn_r = extract_func_name(&fc_r.funcname);
         if fn_l.eq_ignore_ascii_case(&fn_r) && fc_l.args.len() == 1 && fc_r.args.len() == 1 {
@@ -189,10 +202,7 @@ fn match_binary_equality_or_sym_func(
     None
 }
 
-fn match_pattern_op(
-    ae: &AExpr,
-    target_param: i32,
-) -> Option<(Option<String>, Option<String>)> {
+fn match_pattern_op(ae: &AExpr, target_param: i32) -> Option<(Option<String>, Option<String>)> {
     let lexpr = ae.lexpr.as_ref()?;
     let rexpr = ae.rexpr.as_ref()?;
 

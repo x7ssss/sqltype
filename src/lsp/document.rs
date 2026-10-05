@@ -486,15 +486,24 @@ export function compute() {
 
         let insert_query = TextDocumentContentChangeEvent {
             range: Some(Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 0 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 0,
+                },
             }),
             range_length: None,
             text: "export const q = sql`SELECT id FROM users`;\n".to_string(),
         };
 
         let changed = doc.apply_content_changes(vec![insert_query]);
-        assert!(changed, "Inserting first query into empty document must trigger has_sql_change = true");
+        assert!(
+            changed,
+            "Inserting first query into empty document must trigger has_sql_change = true"
+        );
         assert_eq!(doc.queries().len(), 1);
         assert_eq!(doc.queries()[0].sql, "SELECT id FROM users");
     }
@@ -507,36 +516,55 @@ export function compute() {
 
         let append_edit = TextDocumentContentChangeEvent {
             range: Some(Range {
-                start: Position { line: 1, character: 0 },
-                end: Position { line: 1, character: 0 },
+                start: Position {
+                    line: 1,
+                    character: 0,
+                },
+                end: Position {
+                    line: 1,
+                    character: 0,
+                },
             }),
             range_length: None,
             text: "export const q2 = sql`SELECT name FROM products`;\n".to_string(),
         };
 
         let changed = doc.apply_content_changes(vec![append_edit]);
-        assert!(changed, "Appending a second query must trigger has_sql_change = true");
+        assert!(
+            changed,
+            "Appending a second query must trigger has_sql_change = true"
+        );
         assert_eq!(doc.queries().len(), 2);
     }
 
     #[test]
     fn test_apply_content_changes_outside_edit_bypasses() {
-        let initial_ts = "import { sql } from 'bun';\n// comment\nexport const q = sql`SELECT id FROM users`;\n";
+        let initial_ts =
+            "import { sql } from 'bun';\n// comment\nexport const q = sql`SELECT id FROM users`;\n";
         let mut doc = Document::new("file:///test.ts".to_string(), 1, initial_ts);
         assert_eq!(doc.queries().len(), 1);
 
         // Edit comment line
         let edit_comment = TextDocumentContentChangeEvent {
             range: Some(Range {
-                start: Position { line: 1, character: 10 },
-                end: Position { line: 1, character: 10 },
+                start: Position {
+                    line: 1,
+                    character: 10,
+                },
+                end: Position {
+                    line: 1,
+                    character: 10,
+                },
             }),
             range_length: None,
             text: " extra info".to_string(),
         };
 
         let changed = doc.apply_content_changes(vec![edit_comment]);
-        assert!(!changed, "Editing comment outside SQL query must return has_sql_change = false");
+        assert!(
+            !changed,
+            "Editing comment outside SQL query must return has_sql_change = false"
+        );
         assert_eq!(doc.queries().len(), 1);
     }
 }

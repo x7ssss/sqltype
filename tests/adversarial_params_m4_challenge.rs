@@ -13,10 +13,10 @@
 //! 10. Unsupported statement rejection returns clean error
 //! 11. Optional filter with inverted arm ordering and multiple conjuncts
 
+use sqltype::QueryScope;
 use sqltype::analyzer::analyze_query;
 use sqltype::catalog::Catalog;
 use sqltype::params::{deduce_query_params, deduce_query_params_lossy};
-use sqltype::QueryScope;
 
 fn setup_stress_catalog() -> Catalog {
     let mut catalog = Catalog::default();
@@ -44,7 +44,9 @@ fn setup_stress_catalog() -> Catalog {
             joined_at TIMESTAMPTZ NOT NULL
         );
     "#;
-    catalog.apply_sql(ddl).expect("Failed to setup stress catalog");
+    catalog
+        .apply_sql(ddl)
+        .expect("Failed to setup stress catalog");
     catalog
 }
 
@@ -204,5 +206,8 @@ fn test_unsupported_statement_rejection_and_lossy_helper() {
     assert!(res.is_err(), "Non-DML statement must return Err");
 
     let lossy = deduce_query_params_lossy(actual, &catalog, &QueryScope::default());
-    assert!(lossy.is_empty(), "Lossy helper must return empty vec on Err");
+    assert!(
+        lossy.is_empty(),
+        "Lossy helper must return empty vec on Err"
+    );
 }

@@ -91,13 +91,22 @@ fn test_nested_outer_join_mixed_nullability() {
 
     let analyzed = analyze_query(sql, &catalog, None).expect("Query analysis should succeed");
     assert_eq!(analyzed.fields[0].name, "order_num");
-    assert_eq!(analyzed.fields[0].ts_type, "string", "orders is left side of LEFT JOIN, must be NOT NULL");
+    assert_eq!(
+        analyzed.fields[0].ts_type, "string",
+        "orders is left side of LEFT JOIN, must be NOT NULL"
+    );
 
     assert_eq!(analyzed.fields[1].name, "item_name");
-    assert_eq!(analyzed.fields[1].ts_type, "string | null", "items is inside right side of LEFT JOIN, must be nullable");
+    assert_eq!(
+        analyzed.fields[1].ts_type, "string | null",
+        "items is inside right side of LEFT JOIN, must be nullable"
+    );
 
     assert_eq!(analyzed.fields[2].name, "discount_code");
-    assert_eq!(analyzed.fields[2].ts_type, "string | null", "discounts is inside right side of LEFT JOIN, must be nullable");
+    assert_eq!(
+        analyzed.fields[2].ts_type, "string | null",
+        "discounts is inside right side of LEFT JOIN, must be nullable"
+    );
 }
 
 #[test]
@@ -137,11 +146,21 @@ fn test_self_join_nullability_and_ddl_preservation() {
     assert_eq!(analyzed.fields[3].ts_type, "string | null");
 
     // Verify DDL preservation: Underlying employees table columns must NOT be mutated destructively!
-    let emp_table = catalog.get_table("employees").expect("Table must exist in catalog");
-    let name_col = emp_table.get_column("name").expect("name column must exist");
-    assert!(!name_col.is_nullable, "DDL nullability of employees.name must remain false in catalog");
+    let emp_table = catalog
+        .get_table("employees")
+        .expect("Table must exist in catalog");
+    let name_col = emp_table
+        .get_column("name")
+        .expect("name column must exist");
+    assert!(
+        !name_col.is_nullable,
+        "DDL nullability of employees.name must remain false in catalog"
+    );
     let id_col = emp_table.get_column("id").expect("id column must exist");
-    assert!(!id_col.is_nullable, "DDL nullability of employees.id must remain false in catalog");
+    assert!(
+        !id_col.is_nullable,
+        "DDL nullability of employees.id must remain false in catalog"
+    );
 }
 
 #[test]
@@ -203,7 +222,8 @@ fn test_aliased_join_scope_isolation_and_no_catalog_pollution() {
         ON s.order_id = j.order_id;
     "#;
 
-    let analyzed2 = analyze_query(query2, &catalog, None).expect("Left join with aliased join must succeed");
+    let analyzed2 =
+        analyze_query(query2, &catalog, None).expect("Left join with aliased join must succeed");
     assert_eq!(analyzed2.fields[0].name, "ship_id");
     assert_eq!(analyzed2.fields[0].ts_type, "number");
     assert_eq!(analyzed2.fields[1].name, "email");
@@ -231,7 +251,10 @@ fn test_aliased_join_ambiguous_column_detection() {
     "#;
 
     let result = analyze_query(sql, &catalog, None);
-    assert!(result.is_err(), "Referencing duplicate column on aliased join must return error");
+    assert!(
+        result.is_err(),
+        "Referencing duplicate column on aliased join must return error"
+    );
     let err = result.unwrap_err();
     assert!(
         err.contains("ambiguous"),
@@ -277,7 +300,8 @@ fn test_composite_type_nullability_projection_under_outer_joins() {
         LEFT JOIN profiles p ON u.id = p.user_id;
     "#;
 
-    let analyzed_outer = analyze_query(sql_outer, &catalog, None).expect("Outer join query must succeed");
+    let analyzed_outer =
+        analyze_query(sql_outer, &catalog, None).expect("Outer join query must succeed");
     assert_eq!(analyzed_outer.fields[0].name, "id");
     assert_eq!(analyzed_outer.fields[0].ts_type, "number");
 
@@ -287,8 +311,7 @@ fn test_composite_type_nullability_projection_under_outer_joins() {
     // Composite type columns under outer join must wrap the outer object with `| null`!
     assert_eq!(analyzed_outer.fields[2].name, "home");
     assert_eq!(
-        analyzed_outer.fields[2].ts_type,
-        "{ street: string; zip: string } | null",
+        analyzed_outer.fields[2].ts_type, "{ street: string; zip: string } | null",
         "Outer join must wrap composite type with | null without substring false-positives"
     );
 
@@ -316,13 +339,13 @@ fn test_composite_type_nullability_projection_under_outer_joins() {
         INNER JOIN profiles p ON u.id = p.user_id;
     "#;
 
-    let analyzed_inner = analyze_query(sql_inner, &catalog, None).expect("Inner join query must succeed");
+    let analyzed_inner =
+        analyze_query(sql_inner, &catalog, None).expect("Inner join query must succeed");
     // Under inner join, home is NOT null-producing and home was defined NOT NULL in DDL!
     // So the outer object must NOT have `| null` appended!
     assert_eq!(analyzed_inner.fields[1].name, "home");
     assert_eq!(
-        analyzed_inner.fields[1].ts_type,
-        "{ street: string; zip: string }",
+        analyzed_inner.fields[1].ts_type, "{ street: string; zip: string }",
         "Inner join on NOT NULL composite column must NOT have outer | null"
     );
 
@@ -341,7 +364,9 @@ fn test_composite_type_nullability_projection_under_outer_joins() {
         ts_code
     );
     assert!(
-        ts_code.contains("employer: { corp_name: string; hq: { street: string; zip: string } } | null;"),
+        ts_code.contains(
+            "employer: { corp_name: string; hq: { street: string; zip: string } } | null;"
+        ),
         "TypeScript codegen must contain exact nested composite outer nullable type:\n{}",
         ts_code
     );
@@ -477,4 +502,3 @@ fn test_propagate_join_nullability_api() {
         assert!(!scope.bindings["u"].columns["name"].ddl_nullable);
     }
 }
-

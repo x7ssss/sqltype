@@ -46,7 +46,9 @@ fn setup_challenger_catalog() -> Catalog {
             created_at TIMESTAMPTZ NOT NULL
         );
     "#;
-    catalog.apply_sql(ddl).expect("Failed to setup challenger test catalog");
+    catalog
+        .apply_sql(ddl)
+        .expect("Failed to setup challenger test catalog");
     catalog
 }
 
@@ -92,7 +94,11 @@ export async function handleUserRequest(req: Request) {
     let doc = Document::new("file:///src/handlers/users.ts".to_string(), 1, ts);
     let diags = validate_document(&doc, &catalog);
 
-    assert_eq!(diags.len(), 1, "Expected exactly 1 diagnostic for syntax error");
+    assert_eq!(
+        diags.len(),
+        1,
+        "Expected exactly 1 diagnostic for syntax error"
+    );
     let diag = &diags[0];
 
     assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
@@ -169,7 +175,10 @@ export const complexBrokenQuery = sql`
 
     // Confirm range is within line 8 and does not spill over
     assert_eq!(diag.range.end.line, 8);
-    assert!(diag.range.start.character >= 6, "Character offset must reflect indentation");
+    assert!(
+        diag.range.start.character >= 6,
+        "Character offset must reflect indentation"
+    );
 }
 
 #[test]
@@ -197,7 +206,8 @@ export const reportQuery = sql`
 
     assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
     assert!(
-        diag.message.contains("Table \"nonexistent_audit_logs\" does not exist in schema catalog"),
+        diag.message
+            .contains("Table \"nonexistent_audit_logs\" does not exist in schema catalog"),
         "Diagnostic message must indicate missing table 'nonexistent_audit_logs', got: {}",
         diag.message
     );
@@ -258,7 +268,11 @@ export const q4 = sql`
     // Queries 1 and 4 must have 0 diagnostics.
     // Query 2 has 1 syntax error.
     // Query 3 has 1 catalog error.
-    assert_eq!(diags.len(), 2, "Expected exactly 2 diagnostics for entire document");
+    assert_eq!(
+        diags.len(),
+        2,
+        "Expected exactly 2 diagnostics for entire document"
+    );
 
     let syntax_diag = diags
         .iter()
@@ -306,11 +320,18 @@ fn test_diagnostic_syntax_error_at_various_indentations() {
     ];
 
     for (sql_content, indent_spaces, expected_char, expected_token) in test_cases {
-        let ts = format!("import {{ sql }} from 'bun';\nexport const q = sql`\n{}\n`;\n", sql_content);
+        let ts = format!(
+            "import {{ sql }} from 'bun';\nexport const q = sql`\n{}\n`;\n",
+            sql_content
+        );
         let doc = Document::new("file:///test.ts".to_string(), 1, &ts);
         let diags = validate_document(&doc, &catalog);
 
-        assert!(!diags.is_empty(), "Expected syntax error for: {}", sql_content);
+        assert!(
+            !diags.is_empty(),
+            "Expected syntax error for: {}",
+            sql_content
+        );
         let diag = &diags[0];
         assert_eq!(diag.range.start.line, 2);
         assert_eq!(
@@ -365,25 +386,95 @@ export const version = "1.0.0";
     // Define representative test positions:
     let positions = vec![
         // 1. Outside SQL: line 0 import
-        (Position { line: 0, character: 10 }, "outside_import", false),
+        (
+            Position {
+                line: 0,
+                character: 10,
+            },
+            "outside_import",
+            false,
+        ),
         // 2. Outside SQL: line 4 function
-        (Position { line: 4, character: 12 }, "outside_fn", false),
+        (
+            Position {
+                line: 4,
+                character: 12,
+            },
+            "outside_fn",
+            false,
+        ),
         // 3. Table: orders (line 16, character 9)
-        (Position { line: 16, character: 10 }, "table_orders", true),
+        (
+            Position {
+                line: 16,
+                character: 10,
+            },
+            "table_orders",
+            true,
+        ),
         // 4. Table: users (line 17, character 9)
-        (Position { line: 17, character: 10 }, "table_users", true),
+        (
+            Position {
+                line: 17,
+                character: 10,
+            },
+            "table_users",
+            true,
+        ),
         // 5. Table: organizations (line 18, character 9)
-        (Position { line: 18, character: 10 }, "table_orgs", true),
+        (
+            Position {
+                line: 18,
+                character: 10,
+            },
+            "table_orgs",
+            true,
+        ),
         // 6. Column: o.amount (line 11, character 10)
-        (Position { line: 11, character: 11 }, "col_amount", true),
+        (
+            Position {
+                line: 11,
+                character: 11,
+            },
+            "col_amount",
+            true,
+        ),
         // 7. Column: u.email (line 13, character 10)
-        (Position { line: 13, character: 11 }, "col_email", true),
+        (
+            Position {
+                line: 13,
+                character: 11,
+            },
+            "col_email",
+            true,
+        ),
         // 8. Parameter: ${targetOrgId} (line 19, character 27)
-        (Position { line: 19, character: 28 }, "param_targetOrgId", true),
+        (
+            Position {
+                line: 19,
+                character: 28,
+            },
+            "param_targetOrgId",
+            true,
+        ),
         // 9. Parameter: ${minimumThreshold} (line 20, character 27)
-        (Position { line: 20, character: 28 }, "param_minThreshold", true),
+        (
+            Position {
+                line: 20,
+                character: 28,
+            },
+            "param_minThreshold",
+            true,
+        ),
         // 10. Outside SQL: line 26 EOF
-        (Position { line: 26, character: 5 }, "outside_eof", false),
+        (
+            Position {
+                line: 26,
+                character: 5,
+            },
+            "outside_eof",
+            false,
+        ),
     ];
 
     // Warm-up run (10 iterations)
@@ -485,7 +576,11 @@ export const query = sql`
 `;
 "#;
 
-    let doc = Arc::new(Document::new("file:///src/concurrent.ts".to_string(), 1, ts));
+    let doc = Arc::new(Document::new(
+        "file:///src/concurrent.ts".to_string(),
+        1,
+        ts,
+    ));
 
     let num_threads = 8;
     let requests_per_thread = 150; // Total 1,200 concurrent requests
@@ -498,11 +593,26 @@ export const query = sql`
 
         let handle = std::thread::spawn(move || {
             let target_positions = [
-                Position { line: 0, character: 5 },  // outside SQL
-                Position { line: 7, character: 10 }, // users table
-                Position { line: 8, character: 10 }, // orders table
-                Position { line: 5, character: 10 }, // email column
-                Position { line: 9, character: 26 }, // ${orgId} param
+                Position {
+                    line: 0,
+                    character: 5,
+                }, // outside SQL
+                Position {
+                    line: 7,
+                    character: 10,
+                }, // users table
+                Position {
+                    line: 8,
+                    character: 10,
+                }, // orders table
+                Position {
+                    line: 5,
+                    character: 10,
+                }, // email column
+                Position {
+                    line: 9,
+                    character: 26,
+                }, // ${orgId} param
             ];
 
             let mut thread_total = Duration::ZERO;
@@ -552,7 +662,6 @@ export const query = sql`
     }
 }
 
-
 #[test]
 fn test_utf8_multibyte_emoji_and_cjk_diagnostic_mapping() {
     let catalog = setup_challenger_catalog();
@@ -573,7 +682,10 @@ fn test_utf8_multibyte_emoji_and_cjk_diagnostic_mapping() {
 
     assert_eq!(diag.range.start.line, 3, "Syntax error must be on line 3");
     let token = extract_range_text(&doc, diag.range);
-    assert_eq!(token, ",", "Token must be exact comma even after multi-byte UTF-8 headers");
+    assert_eq!(
+        token, ",",
+        "Token must be exact comma even after multi-byte UTF-8 headers"
+    );
 }
 
 #[test]
@@ -630,7 +742,11 @@ export const sqlQuery = sql`
     let doc = Document::new("file:///untagged.ts".to_string(), 1, ts);
     let diags = validate_document(&doc, &catalog);
 
-    assert_eq!(diags.len(), 1, "Only the tagged sql literal should produce diagnostics");
+    assert_eq!(
+        diags.len(),
+        1,
+        "Only the tagged sql literal should produce diagnostics"
+    );
     let diag = &diags[0];
 
     assert_eq!(diag.range.start.line, 4);
@@ -661,15 +777,24 @@ export const query = sql`
     // Replace `,` with `id` at line 3, character 11..12
     let change = TextDocumentContentChangeEvent {
         range: Some(Range {
-            start: Position { line: 3, character: 11 },
-            end: Position { line: 3, character: 12 },
+            start: Position {
+                line: 3,
+                character: 11,
+            },
+            end: Position {
+                line: 3,
+                character: 12,
+            },
         }),
         range_length: None,
         text: "id".to_string(),
     };
 
     let has_sql_change = doc.apply_content_changes(vec![change]);
-    assert!(has_sql_change, "Change inside sql template must be detected");
+    assert!(
+        has_sql_change,
+        "Change inside sql template must be detected"
+    );
 
     // After fix: valid SQL query, 0 diagnostics!
     let diags2 = validate_document(&doc, &catalog);

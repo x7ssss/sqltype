@@ -508,8 +508,12 @@ pub fn propagate_join_nullability(
     from_clause: &[Node],
     catalog: &Catalog,
 ) -> crate::analyzer::QueryScope {
-    propagate_join_nullability_result(from_clause, catalog, &crate::analyzer::QueryScope::default())
-        .unwrap_or_default()
+    propagate_join_nullability_result(
+        from_clause,
+        catalog,
+        &crate::analyzer::QueryScope::default(),
+    )
+    .unwrap_or_default()
 }
 
 /// Propagates join tree nullability within an existing `active_scope` context.
@@ -543,26 +547,30 @@ fn build_scope_from_tree(
             let lower_name = rel_name.to_ascii_lowercase();
 
             // 1. CTE shadowing
-            if schema.is_none() && let Some(cte_binding) = scope.ctes.get(&lower_name) {
+            if schema.is_none()
+                && let Some(cte_binding) = scope.ctes.get(&lower_name)
+            {
                 let exposed_name = alias.clone().unwrap_or_else(|| rel_name.clone());
                 let has_explicit_alias = alias.is_some();
 
-                let orig_order: Vec<String> = if let Some(order) =
-                    scope.cte_column_orders.get(&lower_name)
-                {
-                    order.clone()
-                } else {
-                    let mut cols: Vec<String> = cte_binding.columns.keys().cloned().collect();
-                    cols.sort();
-                    cols
-                };
+                let orig_order: Vec<String> =
+                    if let Some(order) = scope.cte_column_orders.get(&lower_name) {
+                        order.clone()
+                    } else {
+                        let mut cols: Vec<String> = cte_binding.columns.keys().cloned().collect();
+                        cols.sort();
+                        cols
+                    };
 
                 let mut columns = HashMap::new();
                 let mut final_order = Vec::new();
 
                 if !colnames.is_empty() {
                     for (i, orig_col_name) in orig_order.iter().enumerate() {
-                        let col_name = colnames.get(i).cloned().unwrap_or_else(|| orig_col_name.clone());
+                        let col_name = colnames
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| orig_col_name.clone());
                         if let Some(col) = cte_binding.get_column(orig_col_name) {
                             let mut aliased_col = col.clone();
                             aliased_col.name = col_name.clone();
@@ -669,8 +677,7 @@ fn build_scope_from_tree(
                                 if unified_columns.contains_key(&key) {
                                     ambiguous_columns.insert(key.clone());
                                 } else {
-                                    let eff_null =
-                                        col.effective_nullable(b.is_null_producing);
+                                    let eff_null = col.effective_nullable(b.is_null_producing);
                                     let mut u_col = col.clone();
                                     u_col.ddl_nullable = eff_null;
                                     u_col.is_nullable = eff_null;
@@ -852,8 +859,14 @@ mod tests {
         root.propagate_nullability(false);
 
         let table_nulls = root.collect_table_nullabilities();
-        let e = table_nulls.iter().find(|t| t.1.as_deref() == Some("e")).unwrap();
-        let m = table_nulls.iter().find(|t| t.1.as_deref() == Some("m")).unwrap();
+        let e = table_nulls
+            .iter()
+            .find(|t| t.1.as_deref() == Some("e"))
+            .unwrap();
+        let m = table_nulls
+            .iter()
+            .find(|t| t.1.as_deref() == Some("m"))
+            .unwrap();
         assert!(!e.2, "Left side employee 'e' must not be null-producing");
         assert!(m.2, "Right side manager 'm' must be null-producing");
     }

@@ -86,7 +86,8 @@ fn format_column_hover(parts: &[String], catalog: &Catalog) -> String {
 pub fn resolve_hover(text: &str, pos: Position, catalog: &Catalog) -> Option<Hover> {
     let byte_offset = position_to_byte_offset(text, pos);
     let parsed = pg_query::parse(text).ok()?;
-    let analyzed_cell: std::cell::OnceCell<Option<crate::analyzer::AnalyzedQuery>> = std::cell::OnceCell::new();
+    let analyzed_cell: std::cell::OnceCell<Option<crate::analyzer::AnalyzedQuery>> =
+        std::cell::OnceCell::new();
     let get_analyzed = || -> Option<&crate::analyzer::AnalyzedQuery> {
         analyzed_cell
             .get_or_init(|| analyze_parsed_query(&parsed, text, catalog, None).ok())
@@ -107,7 +108,8 @@ pub fn resolve_hover(text: &str, pos: Position, catalog: &Catalog) -> Option<Hov
                 let end = byte_offset_to_position(text, loc + param_str.len());
 
                 let md = if let Some(query) = get_analyzed() {
-                    if let Some(param) = query.params.iter().find(|p| p.index == pr.number as usize) {
+                    if let Some(param) = query.params.iter().find(|p| p.index == pr.number as usize)
+                    {
                         format!(
                             "### Parameter `${}`\n- **Field**: `{}`\n- **TypeScript Type**: `{}`\n- **Optional**: `{}`",
                             pr.number, param.name, param.ts_type, param.is_optional
@@ -166,11 +168,11 @@ pub fn resolve_hover(text: &str, pos: Position, catalog: &Catalog) -> Option<Hov
                         } else {
                             "non-null"
                         };
-                        let col_type = col.pg_type.strip_prefix("pg_catalog.").unwrap_or(&col.pg_type);
-                        cols.push(format!(
-                            "- `{}`: `{}` ({})",
-                            col.name, col_type, null_str
-                        ));
+                        let col_type = col
+                            .pg_type
+                            .strip_prefix("pg_catalog.")
+                            .unwrap_or(&col.pg_type);
+                        cols.push(format!("- `{}`: `{}` ({})", col.name, col_type, null_str));
                     }
                     format!(
                         "### Table `{}`\n**Columns**:\n{}",
@@ -303,7 +305,8 @@ pub fn resolve_document_hover(doc: &Document, pos: Position, catalog: &Catalog) 
     let sql_offset = query.host_to_sql_offset(host_offset)?;
     let parsed = pg_query::parse(&query.sql).ok()?;
 
-    let analyzed_cell: std::cell::OnceCell<Option<crate::analyzer::AnalyzedQuery>> = std::cell::OnceCell::new();
+    let analyzed_cell: std::cell::OnceCell<Option<crate::analyzer::AnalyzedQuery>> =
+        std::cell::OnceCell::new();
     let get_analyzed = || -> Option<&crate::analyzer::AnalyzedQuery> {
         analyzed_cell
             .get_or_init(|| analyze_parsed_query(&parsed, &query.sql, catalog, None).ok())
@@ -325,7 +328,8 @@ pub fn resolve_document_hover(doc: &Document, pos: Position, catalog: &Catalog) 
                 let end = doc.byte_to_position(host_span.end);
 
                 let md = if let Some(q_meta) = get_analyzed()
-                    && let Some(param) = q_meta.params.iter().find(|p| p.index == pr.number as usize)
+                    && let Some(param) =
+                        q_meta.params.iter().find(|p| p.index == pr.number as usize)
                 {
                     format!(
                         "### Parameter `${}`\n- **Field**: `{}`\n- **TypeScript Type**: `{}`\n- **Optional**: `{}`",
@@ -383,11 +387,11 @@ pub fn resolve_document_hover(doc: &Document, pos: Position, catalog: &Catalog) 
                         } else {
                             "non-null"
                         };
-                        let col_type = col.pg_type.strip_prefix("pg_catalog.").unwrap_or(&col.pg_type);
-                        cols.push(format!(
-                            "- `{}`: `{}` ({})",
-                            col.name, col_type, null_str
-                        ));
+                        let col_type = col
+                            .pg_type
+                            .strip_prefix("pg_catalog.")
+                            .unwrap_or(&col.pg_type);
+                        cols.push(format!("- `{}`: `{}` ({})", col.name, col_type, null_str));
                     }
                     format!(
                         "### Table `{}`\n**Columns**:\n{}",
@@ -575,7 +579,10 @@ export const getAccount = sql`
             &catalog,
         );
 
-        assert!(hover.is_some(), "Hover on ${{userId}} must return Some(Hover)");
+        assert!(
+            hover.is_some(),
+            "Hover on ${{userId}} must return Some(Hover)"
+        );
         let h = hover.unwrap();
 
         if let HoverContents::Markup(m) = h.contents {
@@ -592,7 +599,10 @@ export const getAccount = sql`
             panic!("Hover contents must be MarkupKind::Markdown");
         }
 
-        assert!(h.range.is_some(), "Hover must return precise host document Range");
+        assert!(
+            h.range.is_some(),
+            "Hover must return precise host document Range"
+        );
     }
 
     #[test]
@@ -628,7 +638,10 @@ export const getAccount = sql`
             &catalog,
         );
 
-        assert!(hover.is_some(), "Hover on accounts table must return Some(Hover)");
+        assert!(
+            hover.is_some(),
+            "Hover on accounts table must return Some(Hover)"
+        );
         let h = hover.unwrap();
 
         if let HoverContents::Markup(m) = h.contents {
@@ -703,13 +716,20 @@ export const getAccount = sql`
 
         // Hover on line 0 (import)
         let start = Instant::now();
-        let hover = resolve_document_hover(&doc, Position {
-            line: 0,
-            character: 2,
-        }, &catalog);
+        let hover = resolve_document_hover(
+            &doc,
+            Position {
+                line: 0,
+                character: 2,
+            },
+            &catalog,
+        );
         let elapsed = start.elapsed();
 
-        assert!(hover.is_none(), "Hover outside template literal must return None");
+        assert!(
+            hover.is_none(),
+            "Hover outside template literal must return None"
+        );
         assert!(
             elapsed < Duration::from_millis(1),
             "Bypass outside template literal must resolve in <1ms, took: {:?}",
@@ -835,7 +855,10 @@ export const getOrders = sql`
             },
             &catalog,
         );
-        assert!(hover_table.is_some(), "Hover on custom.orders must return Some");
+        assert!(
+            hover_table.is_some(),
+            "Hover on custom.orders must return Some"
+        );
         if let HoverContents::Markup(m) = hover_table.unwrap().contents {
             assert!(m.value.contains("### Table `custom.orders`"));
             assert!(m.value.contains("- `id`: `uuid`"));
@@ -851,7 +874,10 @@ export const getOrders = sql`
             },
             &catalog,
         );
-        assert!(hover_col.is_some(), "Hover on custom.orders.total must return Some");
+        assert!(
+            hover_col.is_some(),
+            "Hover on custom.orders.total must return Some"
+        );
         if let HoverContents::Markup(m) = hover_col.unwrap().contents {
             assert!(m.value.contains("### Column `custom.orders.total`"));
             assert!(m.value.contains("int4") || m.value.contains("number"));

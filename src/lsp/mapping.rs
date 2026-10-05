@@ -1,8 +1,6 @@
 use std::ops::Range;
 
-pub use crate::ts_scanner::{
-    ExtractedQuery, InterpolatedParam, SourceMap, SourceMappingSegment,
-};
+pub use crate::ts_scanner::{ExtractedQuery, InterpolatedParam, SourceMap, SourceMappingSegment};
 
 /// High-level wrapper around an extracted query with source mapping metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,10 +38,7 @@ impl MappedQuery {
 }
 
 /// Translates a SQL byte range to a host document range.
-pub fn sql_range_to_host_range(
-    query: &ExtractedQuery,
-    sql_range: Range<usize>,
-) -> Range<usize> {
+pub fn sql_range_to_host_range(query: &ExtractedQuery, sql_range: Range<usize>) -> Range<usize> {
     query.source_map.sql_to_host_range(sql_range)
 }
 

@@ -3,9 +3,7 @@ pub use crate::nullability::{
     ColumnBinding, JoinKind, TableBinding, format_nullable, project_ts_type, strip_root_null,
 };
 use pg_query::NodeEnum;
-use pg_query::protobuf::{
-    AExprKind, OnConflictAction, SetOperation, SubLinkType,
-};
+use pg_query::protobuf::{AExprKind, OnConflictAction, SetOperation, SubLinkType};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -561,9 +559,9 @@ pub fn unify_cte_types(anchor: &PgType, rec: &PgType) -> Result<PgType, String> 
 }
 
 pub use crate::params::{
-    QueryParam, ParamInfo, deduce_query_params, deduce_query_params_lossy,
-    finalize_params, resolve_params_in_expr, record_param, extract_param_info,
-    extract_column_info, bind_untyped_params_in_node, collect_param_refs,
+    ParamInfo, QueryParam, bind_untyped_params_in_node, collect_param_refs, deduce_query_params,
+    deduce_query_params_lossy, extract_column_info, extract_param_info, finalize_params,
+    record_param, resolve_params_in_expr,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -581,7 +579,6 @@ pub struct AnalyzedQuery {
 }
 
 pub type ColumnMeta = ColumnMetadata;
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetOpKind {
@@ -712,7 +709,10 @@ impl QueryScope {
                     .collect();
                 if non_excluded.len() == 1 {
                     let (binding, col) = non_excluded[0];
-                    if binding.ambiguous_columns.contains(&col_str.to_ascii_lowercase()) {
+                    if binding
+                        .ambiguous_columns
+                        .contains(&col_str.to_ascii_lowercase())
+                    {
                         return Err(format!(
                             "Column reference \"{}\" is ambiguous in join alias \"{}\"",
                             col_str, binding.exposed_name
@@ -734,7 +734,10 @@ impl QueryScope {
             }
 
             let (binding, col) = matched[0];
-            if binding.ambiguous_columns.contains(&col_str.to_ascii_lowercase()) {
+            if binding
+                .ambiguous_columns
+                .contains(&col_str.to_ascii_lowercase())
+            {
                 return Err(format!(
                     "Column reference \"{}\" is ambiguous in join alias \"{}\"",
                     col_str, binding.exposed_name
@@ -766,7 +769,10 @@ impl QueryScope {
                 .get(&target.to_ascii_lowercase())
                 .ok_or_else(|| format!("Unknown table alias \"{}\" in column reference", target))?;
 
-            if binding.ambiguous_columns.contains(&col_str.to_ascii_lowercase()) {
+            if binding
+                .ambiguous_columns
+                .contains(&col_str.to_ascii_lowercase())
+            {
                 return Err(format!(
                     "Column reference \"{}\" is ambiguous in join alias \"{}\"",
                     col_str, binding.exposed_name
@@ -810,7 +816,10 @@ impl QueryScope {
                     format!("Table \"{}.{}\" not found in scope", schema_str, table_str)
                 })?;
 
-            if binding.ambiguous_columns.contains(&col_str.to_ascii_lowercase()) {
+            if binding
+                .ambiguous_columns
+                .contains(&col_str.to_ascii_lowercase())
+            {
                 return Err(format!(
                     "Column reference \"{}\" is ambiguous in join alias \"{}\"",
                     col_str, binding.exposed_name
@@ -847,7 +856,6 @@ impl QueryScope {
         }
     }
 }
-
 
 /// Converts a string (e.g. "get_user_with_posts.sql" or "get_user") to PascalCase ("GetUserWithPosts").
 pub fn to_pascal_case(s: &str) -> String {
@@ -1120,7 +1128,10 @@ pub(crate) fn process_with_clause_with_params(
                 let mut stub_cols = HashMap::new();
                 let mut stub_order = Vec::new();
                 for col in &anchor_cols {
-                    stub_cols.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
+                    stub_cols.insert(
+                        col.name.to_ascii_lowercase(),
+                        ColumnBinding::from_column_metadata(col),
+                    );
                     stub_order.push(col.name.clone());
                 }
                 let stub_binding = TableBinding {
@@ -1214,7 +1225,10 @@ pub(crate) fn process_with_clause_with_params(
                 let mut final_columns = HashMap::new();
                 let mut final_order = Vec::new();
                 for col in proj_cols {
-                    final_columns.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(&col));
+                    final_columns.insert(
+                        col.name.to_ascii_lowercase(),
+                        ColumnBinding::from_column_metadata(&col),
+                    );
                     final_order.push(col.name);
                 }
 
@@ -1534,7 +1548,10 @@ fn analyze_insert_stmt(
     let mut columns = HashMap::new();
     let mut col_order = Vec::new();
     for col in &table_meta.columns {
-        columns.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
+        columns.insert(
+            col.name.to_ascii_lowercase(),
+            ColumnBinding::from_column_metadata(col),
+        );
         col_order.push(col.name.clone());
     }
 
@@ -1618,7 +1635,10 @@ fn analyze_insert_stmt(
             let mut excluded_cols = HashMap::new();
             let mut excluded_order = Vec::new();
             for col in &table_meta.columns {
-                excluded_cols.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
+                excluded_cols.insert(
+                    col.name.to_ascii_lowercase(),
+                    ColumnBinding::from_column_metadata(col),
+                );
                 excluded_order.push(col.name.clone());
             }
             let excluded_binding = TableBinding {
@@ -1720,7 +1740,10 @@ fn analyze_update_stmt(
     let mut columns = HashMap::new();
     let mut col_order = Vec::new();
     for col in &table_meta.columns {
-        columns.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
+        columns.insert(
+            col.name.to_ascii_lowercase(),
+            ColumnBinding::from_column_metadata(col),
+        );
         col_order.push(col.name.clone());
     }
 
@@ -1822,7 +1845,10 @@ fn analyze_delete_stmt(
     let mut columns = HashMap::new();
     let mut col_order = Vec::new();
     for col in &table_meta.columns {
-        columns.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
+        columns.insert(
+            col.name.to_ascii_lowercase(),
+            ColumnBinding::from_column_metadata(col),
+        );
         col_order.push(col.name.clone());
     }
 
@@ -2061,7 +2087,10 @@ fn resolve_range_var(
         }
     } else {
         for col in &table_meta.columns {
-            columns.insert(col.name.to_ascii_lowercase(), ColumnBinding::from_column_metadata(col));
+            columns.insert(
+                col.name.to_ascii_lowercase(),
+                ColumnBinding::from_column_metadata(col),
+            );
             ordered_columns.push(col.name.clone());
         }
     }
@@ -3980,15 +4009,24 @@ RIGHT JOIN posts p ON p.user_id = u.id;
 
         assert!(!scope.bindings["u"].is_null_producing());
         assert!(!scope.bindings["u"].columns["id"].ddl_nullable);
-        assert!(!scope.bindings["u"].columns["id"].effective_nullable(scope.bindings["u"].is_null_producing()));
+        assert!(
+            !scope.bindings["u"].columns["id"]
+                .effective_nullable(scope.bindings["u"].is_null_producing())
+        );
 
         scope.force_all_nullable();
 
         assert!(scope.bindings["u"].is_null_producing());
         // Original DDL nullability is preserved and NOT mutated!
-        assert!(!scope.bindings["u"].columns["id"].ddl_nullable, "DDL nullability must remain false");
+        assert!(
+            !scope.bindings["u"].columns["id"].ddl_nullable,
+            "DDL nullability must remain false"
+        );
         // Effective nullability evaluates to true due to null-producing binding!
-        assert!(scope.bindings["u"].columns["id"].effective_nullable(scope.bindings["u"].is_null_producing()));
+        assert!(
+            scope.bindings["u"].columns["id"]
+                .effective_nullable(scope.bindings["u"].is_null_producing())
+        );
     }
 
     #[test]

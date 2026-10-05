@@ -1,7 +1,5 @@
-use lsp_types::{
-    Diagnostic, DiagnosticSeverity, PublishDiagnosticsParams, Range, Uri,
-};
-use pg_query::{NodeRef};
+use lsp_types::{Diagnostic, DiagnosticSeverity, PublishDiagnosticsParams, Range, Uri};
+use pg_query::NodeRef;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, c_char, c_int};
 
@@ -140,7 +138,10 @@ pub fn validate_sql(text: &str, catalog: &Catalog) -> Vec<Diagnostic> {
                     range: Range { start, end },
                     severity: Some(DiagnosticSeverity::ERROR),
                     source: Some("sqltype".to_string()),
-                    message: format!("Table \"{}\" does not exist in schema catalog", display_name),
+                    message: format!(
+                        "Table \"{}\" does not exist in schema catalog",
+                        display_name
+                    ),
                     ..Default::default()
                 });
             }
@@ -162,7 +163,9 @@ pub fn validate_document(doc: &Document, catalog: &Catalog) -> Vec<Diagnostic> {
         // 1. Check syntax errors in extracted query
         if let Err(err) = parse_sql_raw(&query.sql) {
             let sql_start = if err.cursorpos > 0 {
-                (err.cursorpos as usize).saturating_sub(1).min(query.sql.len())
+                (err.cursorpos as usize)
+                    .saturating_sub(1)
+                    .min(query.sql.len())
             } else {
                 0
             };
@@ -228,7 +231,10 @@ pub fn validate_document(doc: &Document, catalog: &Catalog) -> Vec<Diagnostic> {
                         range: Range { start, end },
                         severity: Some(DiagnosticSeverity::ERROR),
                         source: Some("sqltype".to_string()),
-                        message: format!("Table \"{}\" does not exist in schema catalog", display_name),
+                        message: format!(
+                            "Table \"{}\" does not exist in schema catalog",
+                            display_name
+                        ),
                         ..Default::default()
                     });
                 }

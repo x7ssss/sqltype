@@ -53,7 +53,9 @@ fn setup_test_catalog() -> Catalog {
             created_at TIMESTAMPTZ NOT NULL
         );
     "#;
-    catalog.apply_sql(ddl).expect("Failed to setup test catalog");
+    catalog
+        .apply_sql(ddl)
+        .expect("Failed to setup test catalog");
     catalog
 }
 
@@ -270,7 +272,8 @@ fn test_optional_dynamic_filter_patterns() {
 
     // 2. Inverted arm order: (col = $1 OR $1 IS NULL)
     let sql2 = "SELECT * FROM users WHERE (email = $1 OR $1 IS NULL);";
-    let a2 = analyze_query(sql2, &catalog, None).expect("Inverted arm optional filter should analyze");
+    let a2 =
+        analyze_query(sql2, &catalog, None).expect("Inverted arm optional filter should analyze");
     assert_eq!(a2.params.len(), 1);
     assert_eq!(a2.params[0].name, "email");
     assert_eq!(a2.params[0].ts_type, "string");
@@ -286,7 +289,8 @@ fn test_optional_dynamic_filter_patterns() {
 
     // 4. Inverted equality in predicate: ($1 IS NULL OR $1 = name)
     let sql4 = "SELECT * FROM users WHERE ($1 IS NULL OR $1 = name);";
-    let a4 = analyze_query(sql4, &catalog, None).expect("Inverted equality predicate should analyze");
+    let a4 =
+        analyze_query(sql4, &catalog, None).expect("Inverted equality predicate should analyze");
     assert_eq!(a4.params.len(), 1);
     assert_eq!(a4.params[0].name, "name");
     assert_eq!(a4.params[0].ts_type, "string");
@@ -455,7 +459,8 @@ fn test_typescript_codegen_with_deduced_params() {
           AND u.role_id = $2
           AND u.id = ANY($3);
     "#;
-    let analyzed = analyze_query(sql, &catalog, Some("find_users.sql")).expect("Query should analyze");
+    let analyzed =
+        analyze_query(sql, &catalog, Some("find_users.sql")).expect("Query should analyze");
     assert_eq!(analyzed.params.len(), 3);
     assert_eq!(analyzed.params[0].name, "name");
     assert_eq!(analyzed.params[0].ts_type, "string");

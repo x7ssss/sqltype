@@ -19,10 +19,7 @@ fn test_stress_composite_types_nested_and_arrays() {
     catalog.apply_sql(sql).expect("Failed to apply DDL");
 
     // 1. Basic composite type resolution
-    assert_eq!(
-        catalog.resolve_type("point_2d"),
-        "{ x: number; y: number }"
-    );
+    assert_eq!(catalog.resolve_type("point_2d"), "{ x: number; y: number }");
     assert_eq!(
         catalog.resolve_type("point_2d[]"),
         "Array<{ x: number; y: number }>"
@@ -53,7 +50,9 @@ fn test_stress_composite_types_nested_and_arrays() {
     );
 
     // 4. Table column verification
-    let table = catalog.get_table("shapes").expect("shapes table must exist");
+    let table = catalog
+        .get_table("shapes")
+        .expect("shapes table must exist");
     let center = table.get_column("center").unwrap();
     assert_eq!(center.ts_type, "{ x: number; y: number }");
     assert!(!center.is_nullable);
@@ -116,7 +115,9 @@ fn test_stress_composite_query_analysis_and_codegen() {
         ts
     );
     assert!(
-        ts.contains("active_route: { name: string; waypoints: Array<{ lat: number; lng: number }> } | null;"),
+        ts.contains(
+            "active_route: { name: string; waypoints: Array<{ lat: number; lng: number }> } | null;"
+        ),
         "Generated TypeScript must contain active_route with exact interface | null:\n{}",
         ts
     );
@@ -162,7 +163,8 @@ fn test_stress_composite_types_property_escaping() {
     "#;
     catalog.apply_sql(sql).unwrap();
 
-    let expected = r#"{ "k-e-y": string; "123numeric": number; valid_ident: boolean; "with space": number }"#;
+    let expected =
+        r#"{ "k-e-y": string; "123numeric": number; valid_ident: boolean; "with space": number }"#;
     assert_eq!(catalog.resolve_type("special_props"), expected);
 }
 
@@ -369,7 +371,11 @@ fn test_stress_strict_schema_qualification() {
     // 2. Negative lookups
     assert!(catalog.get_table("pg_catalog.tickets").is_none());
     assert!(catalog.get_table("other.tickets").is_none());
-    assert!(catalog.get_table_qualified(Some("other"), "tickets").is_none());
+    assert!(
+        catalog
+            .get_table_qualified(Some("other"), "tickets")
+            .is_none()
+    );
 
     // 3. Schema-qualified type resolution
     assert_eq!(

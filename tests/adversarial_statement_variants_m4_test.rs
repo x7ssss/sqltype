@@ -60,7 +60,9 @@ fn setup_adv2_catalog() -> Catalog {
             created_at TIMESTAMPTZ NOT NULL
         );
     "#;
-    catalog.apply_sql(ddl).expect("Failed to setup test catalog");
+    catalog
+        .apply_sql(ddl)
+        .expect("Failed to setup test catalog");
     catalog
 }
 
@@ -157,7 +159,8 @@ fn test_adv_cte_column_alias_propagation_and_cross_boundary_params() {
         WHERE contact LIKE $4;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, None).expect("CTE alias propagation should analyze");
+    let analyzed =
+        analyze_query(sql, &catalog, None).expect("CTE alias propagation should analyze");
     assert_eq!(analyzed.params.len(), 4);
 
     assert_eq!(analyzed.params[0].index, 1);
@@ -197,7 +200,8 @@ fn test_adv_recursive_cte_with_params_in_anchor_and_recursive_term() {
         WHERE name = $4;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, None).expect("Recursive CTE with params should analyze");
+    let analyzed =
+        analyze_query(sql, &catalog, None).expect("Recursive CTE with params should analyze");
     assert_eq!(analyzed.params.len(), 4);
 
     assert_eq!(analyzed.params[0].index, 1);
@@ -271,7 +275,8 @@ fn test_adv_insert_on_conflict_do_update_and_returning_params() {
         RETURNING id, name, ($10::text) AS custom_label, (score > $11) AS is_high_score;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, None).expect("INSERT ON CONFLICT with RETURNING should analyze");
+    let analyzed = analyze_query(sql, &catalog, None)
+        .expect("INSERT ON CONFLICT with RETURNING should analyze");
     assert_eq!(analyzed.params.len(), 11);
 
     assert_eq!(analyzed.params[0].index, 1);
@@ -338,7 +343,8 @@ fn test_adv_insert_on_conflict_partial_index_and_do_update() {
         RETURNING id, email;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, None).expect("Partial index ON CONFLICT should analyze");
+    let analyzed =
+        analyze_query(sql, &catalog, None).expect("Partial index ON CONFLICT should analyze");
     assert_eq!(analyzed.params.len(), 6);
 
     assert_eq!(analyzed.params[0].name, "id");
@@ -365,7 +371,8 @@ fn test_adv_multi_row_insert_with_on_conflict() {
         RETURNING id, title, view_count, ($14::boolean) AS was_updated;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, None).expect("Multi-row INSERT ON CONFLICT should analyze");
+    let analyzed =
+        analyze_query(sql, &catalog, None).expect("Multi-row INSERT ON CONFLICT should analyze");
     assert_eq!(analyzed.params.len(), 14);
 
     assert_eq!(analyzed.params[0].name, "id");
@@ -408,7 +415,8 @@ fn test_adv_update_from_clause_and_complex_where_and_returning() {
         RETURNING u.id, u.name, o.name AS org_name, ($6::timestamptz) AS sync_time;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, None).expect("UPDATE with FROM and WHERE should analyze");
+    let analyzed =
+        analyze_query(sql, &catalog, None).expect("UPDATE with FROM and WHERE should analyze");
     assert_eq!(analyzed.params.len(), 6);
 
     assert_eq!(analyzed.params[0].index, 1);
@@ -451,7 +459,8 @@ fn test_adv_delete_using_clause_and_complex_where_and_returning() {
         RETURNING p.id, p.title, ($5::text) AS deletion_reason;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, None).expect("DELETE with USING and WHERE should analyze");
+    let analyzed =
+        analyze_query(sql, &catalog, None).expect("DELETE with USING and WHERE should analyze");
     assert_eq!(analyzed.params.len(), 5);
 
     assert_eq!(analyzed.params[0].index, 1);
@@ -484,7 +493,8 @@ fn test_adv_dml_with_dynamic_optional_filter_and_array_ops() {
         SET active = $1
         WHERE id = $2 AND ($3 IS NULL OR status = $3);
     "#;
-    let a_up = analyze_query(sql_up, &catalog, None).expect("UPDATE with optional filter should analyze");
+    let a_up =
+        analyze_query(sql_up, &catalog, None).expect("UPDATE with optional filter should analyze");
     assert_eq!(a_up.params.len(), 3);
     assert_eq!(a_up.params[0].name, "active");
     assert_eq!(a_up.params[1].name, "id");
@@ -496,7 +506,8 @@ fn test_adv_dml_with_dynamic_optional_filter_and_array_ops() {
         DELETE FROM posts
         WHERE author_id = $1 AND ($2 IS NULL OR id = ANY($2));
     "#;
-    let a_del = analyze_query(sql_del, &catalog, None).expect("DELETE with optional array filter should analyze");
+    let a_del = analyze_query(sql_del, &catalog, None)
+        .expect("DELETE with optional array filter should analyze");
     assert_eq!(a_del.params.len(), 2);
     assert_eq!(a_del.params[0].name, "author_id");
     assert_eq!(a_del.params[1].name, "id");
@@ -510,7 +521,8 @@ fn test_adv_dml_with_dynamic_optional_filter_and_array_ops() {
         WHERE tags && $2
         RETURNING id, tags;
     "#;
-    let a_arr = analyze_query(sql_arr, &catalog, None).expect("UPDATE array overlap should analyze");
+    let a_arr =
+        analyze_query(sql_arr, &catalog, None).expect("UPDATE array overlap should analyze");
     assert_eq!(a_arr.params.len(), 2);
     assert_eq!(a_arr.params[0].name, "tags");
     assert_eq!(a_arr.params[0].ts_type, "string[]"); // from column metadata posts.tags
@@ -541,12 +553,18 @@ fn test_adv_identical_column_comparisons_and_typescript_codegen_safety() {
           AND id = $9;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, Some("stress_collisions.sql")).expect("Collision stress query should analyze");
+    let analyzed = analyze_query(sql, &catalog, Some("stress_collisions.sql"))
+        .expect("Collision stress query should analyze");
     assert_eq!(analyzed.params.len(), 9);
 
     let names: Vec<String> = analyzed.params.iter().map(|p| p.name.clone()).collect();
     let unique_names: std::collections::HashSet<String> = names.iter().cloned().collect();
-    assert_eq!(names.len(), unique_names.len(), "Every parameter name MUST be distinct! Got: {:?}", names);
+    assert_eq!(
+        names.len(),
+        unique_names.len(),
+        "Every parameter name MUST be distinct! Got: {:?}",
+        names
+    );
 
     assert_eq!(analyzed.params[0].name, "id");
     assert_eq!(analyzed.params[1].name, "id2");
@@ -562,7 +580,11 @@ fn test_adv_identical_column_comparisons_and_typescript_codegen_safety() {
     let ts_code = generate_file_ts(&[analyzed]);
     assert!(ts_code.contains("export interface StressCollisionsParams {"));
     for name in &names {
-        assert!(ts_code.contains(&format!("{}: ", name)), "TypeScript interface missing property {}", name);
+        assert!(
+            ts_code.contains(&format!("{}: ", name)),
+            "TypeScript interface missing property {}",
+            name
+        );
     }
 }
 
@@ -583,12 +605,21 @@ fn test_adv_inverted_identical_column_order_stress() {
           AND id = $6;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, None).expect("Inverted order collision query should analyze");
+    let analyzed =
+        analyze_query(sql, &catalog, None).expect("Inverted order collision query should analyze");
     assert_eq!(analyzed.params.len(), 9);
 
     for (i, param) in analyzed.params.iter().enumerate() {
-        assert_eq!(param.index, i + 1, "Parameters must be sorted by numerical index 1..=9");
-        let expected_name = if i == 0 { "id".to_string() } else { format!("id{}", i + 1) };
+        assert_eq!(
+            param.index,
+            i + 1,
+            "Parameters must be sorted by numerical index 1..=9"
+        );
+        let expected_name = if i == 0 {
+            "id".to_string()
+        } else {
+            format!("id{}", i + 1)
+        };
         assert_eq!(param.name, expected_name);
         assert_eq!(param.ts_type, "string");
     }
@@ -615,7 +646,8 @@ fn test_adv_having_clause_with_aggregates_and_limit_offset() {
         OFFSET $6;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, None).expect("HAVING with aggregates should analyze");
+    let analyzed =
+        analyze_query(sql, &catalog, None).expect("HAVING with aggregates should analyze");
     assert_eq!(analyzed.params.len(), 6);
 
     assert_eq!(analyzed.params[0].index, 1);
@@ -651,7 +683,8 @@ fn test_adv_having_clause_with_optional_filter_and_between() {
         HAVING ($1 IS NULL OR org_id = $1)
         LIMIT $2;
     "#;
-    let a_opt = analyze_query(sql_opt, &catalog, None).expect("Optional filter on grouped column in HAVING should analyze");
+    let a_opt = analyze_query(sql_opt, &catalog, None)
+        .expect("Optional filter on grouped column in HAVING should analyze");
     assert_eq!(a_opt.params.len(), 2);
     assert_eq!(a_opt.params[0].index, 1);
     assert_eq!(a_opt.params[0].name, "org_id");
@@ -668,7 +701,8 @@ fn test_adv_having_clause_with_optional_filter_and_between() {
         GROUP BY org_id
         HAVING count(*) BETWEEN $1 AND $2;
     "#;
-    let a_between = analyze_query(sql_between, &catalog, None).expect("HAVING BETWEEN should analyze");
+    let a_between =
+        analyze_query(sql_between, &catalog, None).expect("HAVING BETWEEN should analyze");
     assert_eq!(a_between.params.len(), 2);
     assert_eq!(a_between.params[0].ts_type, "number");
     assert_eq!(a_between.params[1].ts_type, "number");
@@ -680,7 +714,8 @@ fn test_adv_having_clause_with_optional_filter_and_between() {
         GROUP BY org_id
         HAVING (count(*) > 10) = $1;
     "#;
-    let a_bool = analyze_query(sql_bool, &catalog, None).expect("HAVING boolean comparison should analyze");
+    let a_bool =
+        analyze_query(sql_bool, &catalog, None).expect("HAVING boolean comparison should analyze");
     assert_eq!(a_bool.params.len(), 1);
     assert_eq!(a_bool.params[0].ts_type, "boolean");
 
@@ -702,7 +737,8 @@ fn test_adv_having_clause_with_optional_filter_and_between() {
         GROUP BY org_id
         HAVING bool_and(active) = $1;
     "#;
-    let a_unreg = analyze_query(sql_unregistered, &catalog, None).expect("HAVING unregistered func should analyze");
+    let a_unreg = analyze_query(sql_unregistered, &catalog, None)
+        .expect("HAVING unregistered func should analyze");
     assert_eq!(a_unreg.params.len(), 1);
     assert_eq!(a_unreg.params[0].ts_type, "unknown");
 }
@@ -720,7 +756,8 @@ fn test_adv_set_operations_with_branch_and_global_limit_offset() {
         OFFSET $8;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, None).expect("UNION with branch and global limits should analyze");
+    let analyzed = analyze_query(sql, &catalog, None)
+        .expect("UNION with branch and global limits should analyze");
     assert_eq!(analyzed.params.len(), 8);
 
     assert_eq!(analyzed.params[0].index, 1);

@@ -2,9 +2,9 @@ use arc_swap::ArcSwap;
 use crossbeam_channel::unbounded;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, HoverParams,
-    HoverProviderCapability, InitializeResult, PublishDiagnosticsParams, ServerCapabilities,
-    ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    HoverParams, HoverProviderCapability, InitializeResult, PublishDiagnosticsParams,
+    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 use notify::{RecursiveMode, Watcher};
 use std::collections::HashMap;

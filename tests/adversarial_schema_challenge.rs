@@ -44,84 +44,142 @@ fn test_cross_schema_lookup_and_isolation() {
     ";
 
     let mut catalog = Catalog::default();
-    catalog.apply_sql(sql).expect("DDL script should parse successfully");
+    catalog
+        .apply_sql(sql)
+        .expect("DDL script should parse successfully");
 
     // === Test 1: Unqualified lookups ===
     // "users" must resolve to public.users (UUID id), NEVER to pg_catalog, auth, or audit
-    let unqualified_users = catalog.get_table("users").expect("users must exist in public");
+    let unqualified_users = catalog
+        .get_table("users")
+        .expect("users must exist in public");
     assert_eq!(unqualified_users.name, "users");
     assert_eq!(unqualified_users.columns[0].pg_type, "uuid");
     assert_eq!(unqualified_users.columns[0].ts_type, "string");
 
-    let qualified_none_users = catalog.get_table_qualified(None, "users").expect("users must exist with None schema");
+    let qualified_none_users = catalog
+        .get_table_qualified(None, "users")
+        .expect("users must exist with None schema");
     assert_eq!(qualified_none_users.columns[0].pg_type, "uuid");
 
     // === Test 2: Explicit public qualification ===
-    let public_users = catalog.get_table("public.users").expect("public.users must exist");
+    let public_users = catalog
+        .get_table("public.users")
+        .expect("public.users must exist");
     assert_eq!(public_users.columns[0].pg_type, "uuid");
 
-    let qual_public_users = catalog.get_table_qualified(Some("public"), "users").expect("qualified public.users must exist");
+    let qual_public_users = catalog
+        .get_table_qualified(Some("public"), "users")
+        .expect("qualified public.users must exist");
     assert_eq!(qual_public_users.columns[0].pg_type, "uuid");
 
     // === Test 3: Explicit pg_catalog qualification ===
-    let pg_users = catalog.get_table("pg_catalog.users").expect("pg_catalog.users must exist");
+    let pg_users = catalog
+        .get_table("pg_catalog.users")
+        .expect("pg_catalog.users must exist");
     assert_eq!(pg_users.schema.as_deref(), Some("pg_catalog"));
     assert_eq!(pg_users.columns[0].ts_type, "number");
     assert_eq!(pg_users.columns[1].name, "sys_name");
     assert_eq!(pg_users.columns[1].ts_type, "string");
 
-    let qual_pg_users = catalog.get_table_qualified(Some("pg_catalog"), "users").expect("qualified pg_catalog.users must exist");
+    let qual_pg_users = catalog
+        .get_table_qualified(Some("pg_catalog"), "users")
+        .expect("qualified pg_catalog.users must exist");
     assert_eq!(qual_pg_users.columns[0].ts_type, "number");
     assert_eq!(qual_pg_users.columns[1].name, "sys_name");
 
     // === Test 4: Explicit auth qualification ===
-    let auth_users = catalog.get_table("auth.users").expect("auth.users must exist");
+    let auth_users = catalog
+        .get_table("auth.users")
+        .expect("auth.users must exist");
     assert_eq!(auth_users.schema.as_deref(), Some("auth"));
     assert_eq!(auth_users.columns[0].ts_type, "string"); // bigint -> string for Postgres driver
     assert_eq!(auth_users.columns[1].name, "email");
     assert_eq!(auth_users.columns[1].ts_type, "string");
 
-    let qual_auth_users = catalog.get_table_qualified(Some("auth"), "users").expect("qualified auth.users must exist");
+    let qual_auth_users = catalog
+        .get_table_qualified(Some("auth"), "users")
+        .expect("qualified auth.users must exist");
     assert_eq!(qual_auth_users.columns[0].ts_type, "string");
 
     // === Test 5: Explicit audit qualification ===
-    let audit_users = catalog.get_table("audit.users").expect("audit.users must exist");
+    let audit_users = catalog
+        .get_table("audit.users")
+        .expect("audit.users must exist");
     assert_eq!(audit_users.schema.as_deref(), Some("audit"));
     assert_eq!(audit_users.columns[0].ts_type, "number"); // serial -> number
     assert_eq!(audit_users.columns[1].name, "log_entry");
     assert_eq!(audit_users.columns[1].ts_type, "string");
 
-    let qual_audit_users = catalog.get_table_qualified(Some("audit"), "users").expect("qualified audit.users must exist");
+    let qual_audit_users = catalog
+        .get_table_qualified(Some("audit"), "users")
+        .expect("qualified audit.users must exist");
     assert_eq!(qual_audit_users.columns[0].ts_type, "number");
 
     // === Test 6: Cross-schema non-matching lookups ===
     // Negative lookups: looking for non-existent schemas or cross-polluted lookups
     assert!(catalog.get_table("other.users").is_none());
-    assert!(catalog.get_table_qualified(Some("other"), "users").is_none());
-    assert!(catalog.get_table_qualified(Some("nonexistent"), "users").is_none());
+    assert!(
+        catalog
+            .get_table_qualified(Some("other"), "users")
+            .is_none()
+    );
+    assert!(
+        catalog
+            .get_table_qualified(Some("nonexistent"), "users")
+            .is_none()
+    );
 
     // === Test 7: Isolated schema tables unqualified lookup behavior ===
     // "tokens" only exists in "auth": unqualified "tokens" must NOT resolve to auth.tokens
-    assert!(catalog.get_table("tokens").is_none(), "Unqualified lookup must NOT leak into auth schema");
+    assert!(
+        catalog.get_table("tokens").is_none(),
+        "Unqualified lookup must NOT leak into auth schema"
+    );
     assert!(catalog.get_table_qualified(None, "tokens").is_none());
     assert!(catalog.get_table("public.tokens").is_none());
     assert!(catalog.get_table("pg_catalog.tokens").is_none());
     assert!(catalog.get_table("auth.tokens").is_some());
-    assert!(catalog.get_table_qualified(Some("auth"), "tokens").is_some());
+    assert!(
+        catalog
+            .get_table_qualified(Some("auth"), "tokens")
+            .is_some()
+    );
 
     // "sys_config" only exists in "pg_catalog": unqualified must NOT leak into pg_catalog
-    assert!(catalog.get_table("sys_config").is_none(), "Unqualified lookup must NOT leak into pg_catalog");
+    assert!(
+        catalog.get_table("sys_config").is_none(),
+        "Unqualified lookup must NOT leak into pg_catalog"
+    );
     assert!(catalog.get_table("public.sys_config").is_none());
     assert!(catalog.get_table("auth.sys_config").is_none());
     assert!(catalog.get_table("pg_catalog.sys_config").is_some());
-    assert!(catalog.get_table_qualified(Some("pg_catalog"), "sys_config").is_some());
+    assert!(
+        catalog
+            .get_table_qualified(Some("pg_catalog"), "sys_config")
+            .is_some()
+    );
 
     // === Test 8: Case insensitivity in schema and table lookup ===
     assert!(catalog.get_table("PG_CATALOG.USERS").is_some());
-    assert_eq!(catalog.get_table("PG_CATALOG.USERS").unwrap().columns[0].ts_type, "number");
-    assert!(catalog.get_table_qualified(Some("PG_CATALOG"), "USERS").is_some());
+    assert_eq!(
+        catalog.get_table("PG_CATALOG.USERS").unwrap().columns[0].ts_type,
+        "number"
+    );
+    assert!(
+        catalog
+            .get_table_qualified(Some("PG_CATALOG"), "USERS")
+            .is_some()
+    );
     assert!(catalog.get_table_qualified(Some("AuTh"), "UsErS").is_some());
-    assert_eq!(catalog.get_table_qualified(Some("AuTh"), "UsErS").unwrap().columns[0].ts_type, "string");
+    assert_eq!(
+        catalog
+            .get_table_qualified(Some("AuTh"), "UsErS")
+            .unwrap()
+            .columns[0]
+            .ts_type,
+        "string"
+    );
 }
 
 #[test]
@@ -224,20 +282,36 @@ fn test_primary_key_and_constraint_invariants() {
     // Verify domain constraint inheritance
     let dom_t = catalog.get_table("domain_invariants").unwrap();
     let st_req = dom_t.get_column("st_req").unwrap();
-    assert!(!st_req.is_nullable, "constrained domain must propagate NOT NULL");
-    assert!(st_req.has_default, "constrained domain must propagate DEFAULT");
+    assert!(
+        !st_req.is_nullable,
+        "constrained domain must propagate NOT NULL"
+    );
+    assert!(
+        st_req.has_default,
+        "constrained domain must propagate DEFAULT"
+    );
 
     let st_opt = dom_t.get_column("st_opt").unwrap();
-    assert!(st_opt.is_nullable, "unconstrained domain must remain nullable");
-    assert!(!st_opt.has_default, "unconstrained domain must not have default");
+    assert!(
+        st_opt.is_nullable,
+        "unconstrained domain must remain nullable"
+    );
+    assert!(
+        !st_opt.has_default,
+        "unconstrained domain must not have default"
+    );
 
     // === Test 6: Alter Table Add/Drop PK and Columns ===
-    catalog.apply_sql("CREATE TABLE alter_invariants (a INT, b INT, c TEXT);").unwrap();
+    catalog
+        .apply_sql("CREATE TABLE alter_invariants (a INT, b INT, c TEXT);")
+        .unwrap();
     let alt_init = catalog.get_table("alter_invariants").unwrap();
     assert!(alt_init.primary_keys.is_empty());
 
     // Add composite PK via ALTER TABLE
-    catalog.apply_sql("ALTER TABLE alter_invariants ADD CONSTRAINT pk_ab PRIMARY KEY (a, b);").unwrap();
+    catalog
+        .apply_sql("ALTER TABLE alter_invariants ADD CONSTRAINT pk_ab PRIMARY KEY (a, b);")
+        .unwrap();
     let alt_pk = catalog.get_table("alter_invariants").unwrap();
     assert_eq!(alt_pk.primary_keys, vec!["a", "b"]);
     assert!(alt_pk.get_column("a").unwrap().is_primary_key);
@@ -246,14 +320,22 @@ fn test_primary_key_and_constraint_invariants() {
     assert!(!alt_pk.get_column("b").unwrap().is_nullable);
 
     // Drop column that is part of PK
-    catalog.apply_sql("ALTER TABLE alter_invariants DROP COLUMN b;").unwrap();
+    catalog
+        .apply_sql("ALTER TABLE alter_invariants DROP COLUMN b;")
+        .unwrap();
     let alt_drop = catalog.get_table("alter_invariants").unwrap();
-    assert_eq!(alt_drop.primary_keys, vec!["a"], "Primary keys must remove dropped column");
+    assert_eq!(
+        alt_drop.primary_keys,
+        vec!["a"],
+        "Primary keys must remove dropped column"
+    );
     assert!(alt_drop.get_column("b").is_none());
     assert!(alt_drop.get_column("a").unwrap().is_primary_key);
 
     // Add new column with serial type via ALTER TABLE
-    catalog.apply_sql("ALTER TABLE alter_invariants ADD COLUMN seq_num SERIAL;").unwrap();
+    catalog
+        .apply_sql("ALTER TABLE alter_invariants ADD COLUMN seq_num SERIAL;")
+        .unwrap();
     let alt_add_serial = catalog.get_table("alter_invariants").unwrap();
     let seq_col = alt_add_serial.get_column("seq_num").unwrap();
     assert!(!seq_col.is_nullable);
@@ -295,16 +377,37 @@ fn test_strict_type_resolution_and_driver_matrix() {
 
     // 3. Enum resolution across schemas
     assert_eq!(cat_pg.resolve_type("custom_role"), "\"admin\" | \"viewer\"");
-    assert_eq!(cat_pg.resolve_type("public.custom_role"), "\"admin\" | \"viewer\"");
-    assert_eq!(cat_pg.resolve_type("audit.custom_role"), "\"auditor\" | \"secops\"");
+    assert_eq!(
+        cat_pg.resolve_type("public.custom_role"),
+        "\"admin\" | \"viewer\""
+    );
+    assert_eq!(
+        cat_pg.resolve_type("audit.custom_role"),
+        "\"auditor\" | \"secops\""
+    );
     assert_eq!(cat_pg.resolve_type("pg_catalog.custom_role"), "unknown"); // pg_catalog does not have custom_role!
 
     // 4. Composite type resolution across schemas
-    assert_eq!(cat_pg.resolve_type("geo_coord"), "{ lat: number; lng: number }");
-    assert_eq!(cat_pg.resolve_type("public.geo_coord"), "{ lat: number; lng: number }");
-    assert_eq!(cat_pg.resolve_type("custom_schema.geo_coord"), "{ x: number; y: number; z: number }");
-    assert_eq!(cat_pg.resolve_type("geo_coord[]"), "Array<{ lat: number; lng: number }>");
-    assert_eq!(cat_pg.resolve_type("custom_schema.geo_coord[]"), "Array<{ x: number; y: number; z: number }>");
+    assert_eq!(
+        cat_pg.resolve_type("geo_coord"),
+        "{ lat: number; lng: number }"
+    );
+    assert_eq!(
+        cat_pg.resolve_type("public.geo_coord"),
+        "{ lat: number; lng: number }"
+    );
+    assert_eq!(
+        cat_pg.resolve_type("custom_schema.geo_coord"),
+        "{ x: number; y: number; z: number }"
+    );
+    assert_eq!(
+        cat_pg.resolve_type("geo_coord[]"),
+        "Array<{ lat: number; lng: number }>"
+    );
+    assert_eq!(
+        cat_pg.resolve_type("custom_schema.geo_coord[]"),
+        "Array<{ x: number; y: number; z: number }>"
+    );
     assert_eq!(cat_pg.resolve_type("pg_catalog.geo_coord"), "unknown");
 
     // 5. Domain resolution across schemas
@@ -341,10 +444,7 @@ fn test_nested_composite_types() {
     );
 
     let points_col = shapes.get_column("points").unwrap();
-    assert_eq!(
-        points_col.ts_type,
-        "Array<{ x: number; y: number }>"
-    );
+    assert_eq!(points_col.ts_type, "Array<{ x: number; y: number }>");
 }
 
 #[test]
@@ -369,20 +469,29 @@ fn test_domain_transitive_inheritance_boundary() {
     let direct = catalog.get_table("direct_holder").unwrap();
     let direct_col = direct.get_column("code").unwrap();
     assert_eq!(direct_col.ts_type, "string");
-    assert!(!direct_col.is_nullable, "Direct domain column must inherit NOT NULL");
+    assert!(
+        !direct_col.is_nullable,
+        "Direct domain column must inherit NOT NULL"
+    );
 
     // 2. Transitive domain boundary:
     // code_level_2 resolves base ts_type to string and has DEFAULT
     let trans = catalog.get_table("transitive_holder").unwrap();
     let trans_col = trans.get_column("code").unwrap();
     assert_eq!(trans_col.ts_type, "string");
-    assert!(trans_col.has_default, "Transitive domain column preserves DEFAULT");
+    assert!(
+        trans_col.has_default,
+        "Transitive domain column preserves DEFAULT"
+    );
 
     // FINDING: handle_create_domain_stmt only checks AST constraints for the current domain;
     // it does not look up get_domain(base_type) to recursively inherit NOT NULL.
     // Therefore, code_level_2 is not flagged is_not_null unless explicitly specified.
     let d2 = catalog.get_domain("code_level_2").unwrap();
-    assert!(!d2.is_not_null, "Transitive domain constraint inheritance is non-recursive in M2");
+    assert!(
+        !d2.is_not_null,
+        "Transitive domain constraint inheritance is non-recursive in M2"
+    );
     assert!(trans_col.is_nullable);
 }
 
@@ -398,42 +507,55 @@ fn test_alter_table_comprehensive_lifecycle() {
     catalog.apply_sql(sql).unwrap();
 
     // 1. ADD COLUMN
-    catalog.apply_sql("ALTER TABLE lifecycle ADD COLUMN count INT;").unwrap();
+    catalog
+        .apply_sql("ALTER TABLE lifecycle ADD COLUMN count INT;")
+        .unwrap();
     let t = catalog.get_table("lifecycle").unwrap();
     assert_eq!(t.columns.len(), 3);
     assert!(t.get_column("count").unwrap().is_nullable);
 
     // 2. ALTER COLUMN TYPE
-    catalog.apply_sql("ALTER TABLE lifecycle ALTER COLUMN count TYPE numeric;").unwrap();
+    catalog
+        .apply_sql("ALTER TABLE lifecycle ALTER COLUMN count TYPE numeric;")
+        .unwrap();
     let t = catalog.get_table("lifecycle").unwrap();
     assert_eq!(t.get_column("count").unwrap().ts_type, "number");
 
     // 3. SET NOT NULL
-    catalog.apply_sql("ALTER TABLE lifecycle ALTER COLUMN count SET NOT NULL;").unwrap();
+    catalog
+        .apply_sql("ALTER TABLE lifecycle ALTER COLUMN count SET NOT NULL;")
+        .unwrap();
     let t = catalog.get_table("lifecycle").unwrap();
     assert!(!t.get_column("count").unwrap().is_nullable);
 
     // 4. DROP NOT NULL
-    catalog.apply_sql("ALTER TABLE lifecycle ALTER COLUMN count DROP NOT NULL;").unwrap();
+    catalog
+        .apply_sql("ALTER TABLE lifecycle ALTER COLUMN count DROP NOT NULL;")
+        .unwrap();
     let t = catalog.get_table("lifecycle").unwrap();
     assert!(t.get_column("count").unwrap().is_nullable);
 
     // 5. SET DEFAULT
-    catalog.apply_sql("ALTER TABLE lifecycle ALTER COLUMN count SET DEFAULT 0;").unwrap();
+    catalog
+        .apply_sql("ALTER TABLE lifecycle ALTER COLUMN count SET DEFAULT 0;")
+        .unwrap();
     let t = catalog.get_table("lifecycle").unwrap();
     assert!(t.get_column("count").unwrap().has_default);
 
     // 6. DROP COLUMN
-    catalog.apply_sql("ALTER TABLE lifecycle DROP COLUMN count;").unwrap();
+    catalog
+        .apply_sql("ALTER TABLE lifecycle DROP COLUMN count;")
+        .unwrap();
     let t = catalog.get_table("lifecycle").unwrap();
     assert_eq!(t.columns.len(), 2);
     assert!(t.get_column("count").is_none());
 
     // 7. ADD PRIMARY KEY
-    catalog.apply_sql("ALTER TABLE lifecycle ADD PRIMARY KEY (id);").unwrap();
+    catalog
+        .apply_sql("ALTER TABLE lifecycle ADD PRIMARY KEY (id);")
+        .unwrap();
     let t = catalog.get_table("lifecycle").unwrap();
     assert_eq!(t.primary_keys, vec!["id"]);
     assert!(t.get_column("id").unwrap().is_primary_key);
     assert!(!t.get_column("id").unwrap().is_nullable);
 }
-

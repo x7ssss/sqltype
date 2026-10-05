@@ -37,20 +37,33 @@ fn test_adversarial_deep_nested_mixed_joins() {
         INNER JOIN t_d ON t_c.id = t_d.id;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, None).expect("Query must parse and analyze cleanly");
+    let analyzed =
+        analyze_query(sql, &catalog, None).expect("Query must parse and analyze cleanly");
     assert_eq!(analyzed.fields.len(), 4);
 
     assert_eq!(analyzed.fields[0].name, "val_a");
-    assert_eq!(analyzed.fields[0].ts_type, "string | null", "val_a must be nullable because left subtree is nullified by RIGHT JOIN");
+    assert_eq!(
+        analyzed.fields[0].ts_type, "string | null",
+        "val_a must be nullable because left subtree is nullified by RIGHT JOIN"
+    );
 
     assert_eq!(analyzed.fields[1].name, "val_b");
-    assert_eq!(analyzed.fields[1].ts_type, "string | null", "val_b must be nullable from both LEFT JOIN and parent RIGHT JOIN");
+    assert_eq!(
+        analyzed.fields[1].ts_type, "string | null",
+        "val_b must be nullable from both LEFT JOIN and parent RIGHT JOIN"
+    );
 
     assert_eq!(analyzed.fields[2].name, "val_c");
-    assert_eq!(analyzed.fields[2].ts_type, "string", "val_c must remain NOT NULL as preserved side of RIGHT JOIN and INNER JOIN");
+    assert_eq!(
+        analyzed.fields[2].ts_type, "string",
+        "val_c must remain NOT NULL as preserved side of RIGHT JOIN and INNER JOIN"
+    );
 
     assert_eq!(analyzed.fields[3].name, "val_d");
-    assert_eq!(analyzed.fields[3].ts_type, "string", "val_d must remain NOT NULL as side of INNER JOIN");
+    assert_eq!(
+        analyzed.fields[3].ts_type, "string",
+        "val_d must remain NOT NULL as side of INNER JOIN"
+    );
 }
 
 #[test]
@@ -87,11 +100,26 @@ fn test_adversarial_three_way_self_join_and_catalog_invariance() {
 
     // Catalog invariance: verify underlying nodes table was not mutated!
     let nodes_tbl = catalog.get_table("nodes").expect("nodes table must exist");
-    assert!(!nodes_tbl.get_column("label").unwrap().is_nullable, "nodes.label DDL nullability must remain false");
-    assert!(!nodes_tbl.get_column("id").unwrap().is_nullable, "nodes.id DDL nullability must remain false");
-    assert!(catalog.get_table("n1").is_none(), "Alias n1 must not exist in catalog");
-    assert!(catalog.get_table("n2").is_none(), "Alias n2 must not exist in catalog");
-    assert!(catalog.get_table("n3").is_none(), "Alias n3 must not exist in catalog");
+    assert!(
+        !nodes_tbl.get_column("label").unwrap().is_nullable,
+        "nodes.label DDL nullability must remain false"
+    );
+    assert!(
+        !nodes_tbl.get_column("id").unwrap().is_nullable,
+        "nodes.id DDL nullability must remain false"
+    );
+    assert!(
+        catalog.get_table("n1").is_none(),
+        "Alias n1 must not exist in catalog"
+    );
+    assert!(
+        catalog.get_table("n2").is_none(),
+        "Alias n2 must not exist in catalog"
+    );
+    assert!(
+        catalog.get_table("n3").is_none(),
+        "Alias n3 must not exist in catalog"
+    );
 }
 
 #[test]
@@ -115,7 +143,10 @@ fn test_adversarial_scope_isolation_and_cross_query_leakage() {
     // Query 2: Attempting to reference `cp` in a query without defining it must FAIL!
     let q2 = "SELECT sku FROM cp;";
     let res2 = analyze_query(q2, &catalog, None);
-    assert!(res2.is_err(), "Referencing leaked alias cp across queries must return error");
+    assert!(
+        res2.is_err(),
+        "Referencing leaked alias cp across queries must return error"
+    );
     let err2 = res2.unwrap_err();
     assert!(
         err2.contains("does not exist"),
@@ -141,10 +172,7 @@ fn test_adversarial_format_nullable_complex_type_stress() {
 
     // 2. String literal containing pipe characters inside quotes
     let quoted_pipe = "'value|with|pipe'";
-    assert_eq!(
-        format_nullable(quoted_pipe),
-        "'value|with|pipe' | null"
-    );
+    assert_eq!(format_nullable(quoted_pipe), "'value|with|pipe' | null");
 
     // 3. Deeply nested composite object
     let deep_obj = "{ meta: { details: { sub: string | null } } }";
@@ -176,10 +204,7 @@ fn test_adversarial_format_nullable_complex_type_stress() {
     );
 
     // 6. Already nullable at root level must not double wrap
-    assert_eq!(
-        format_nullable("string | null"),
-        "string | null"
-    );
+    assert_eq!(format_nullable("string | null"), "string | null");
     assert_eq!(
         format_nullable("{ x: number } | null"),
         "{ x: number } | null"
@@ -204,8 +229,9 @@ fn test_adversarial_cross_schema_join_nullability_via_engine() {
 
     // Use nullability engine directly: SELECT * FROM public.tenants t LEFT JOIN custom_audit.logs l ON t.id = l.tenant_id
     let parse_result = pg_query::parse(
-        "SELECT * FROM public.tenants t LEFT JOIN custom_audit.logs l ON t.id = l.tenant_id;"
-    ).unwrap();
+        "SELECT * FROM public.tenants t LEFT JOIN custom_audit.logs l ON t.id = l.tenant_id;",
+    )
+    .unwrap();
     let stmt = parse_result.protobuf.stmts.first().unwrap();
     if let Some(node) = &stmt.stmt
         && let Some(pg_query::NodeEnum::SelectStmt(select)) = &node.node
@@ -214,14 +240,26 @@ fn test_adversarial_cross_schema_join_nullability_via_engine() {
         let t_binding = scope.bindings.get("t").expect("Binding 't' must exist");
         let l_binding = scope.bindings.get("l").expect("Binding 'l' must exist");
 
-        assert!(!t_binding.is_null_producing(), "public.tenants must NOT be null-producing");
-        assert!(l_binding.is_null_producing(), "custom_audit.logs must BE null-producing");
+        assert!(
+            !t_binding.is_null_producing(),
+            "public.tenants must NOT be null-producing"
+        );
+        assert!(
+            l_binding.is_null_producing(),
+            "custom_audit.logs must BE null-producing"
+        );
 
         let domain_col = t_binding.get_column("domain").unwrap();
         let payload_col = l_binding.get_column("payload").unwrap();
 
-        assert!(!domain_col.effective_nullable(t_binding.is_null_producing()), "t.domain must not be nullable");
-        assert!(payload_col.effective_nullable(l_binding.is_null_producing()), "l.payload must be nullable");
+        assert!(
+            !domain_col.effective_nullable(t_binding.is_null_producing()),
+            "t.domain must not be nullable"
+        );
+        assert!(
+            payload_col.effective_nullable(l_binding.is_null_producing()),
+            "l.payload must be nullable"
+        );
     }
 }
 

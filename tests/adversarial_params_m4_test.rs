@@ -61,7 +61,9 @@ fn setup_adv_catalog() -> Catalog {
             created_at TIMESTAMPTZ NOT NULL
         );
     "#;
-    catalog.apply_sql(ddl).expect("Failed to setup test catalog");
+    catalog
+        .apply_sql(ddl)
+        .expect("Failed to setup test catalog");
     catalog
 }
 
@@ -100,7 +102,8 @@ fn test_adv_deeply_nested_binary_expressions() {
 
     // 3. Reverse nested arithmetic comparison: ($1 * 2) <= age
     let sql3 = "SELECT * FROM users WHERE ($1 * 2) <= age;";
-    let a3 = analyze_query(sql3, &catalog, None).expect("Reverse arithmetic comparison should parse");
+    let a3 =
+        analyze_query(sql3, &catalog, None).expect("Reverse arithmetic comparison should parse");
     assert_eq!(a3.params.len(), 1);
     assert_eq!(a3.params[0].ts_type, "number");
 }
@@ -254,7 +257,8 @@ fn test_adv_pattern_matching_operator_encodings() {
 
     // 3. String concatenation in pattern: name LIKE '%' || $1 || '%'
     let sql_cat = "SELECT * FROM users WHERE name LIKE '%' || $1 || '%';";
-    let a_cat = analyze_query(sql_cat, &catalog, None).expect("LIKE with concatenation should parse");
+    let a_cat =
+        analyze_query(sql_cat, &catalog, None).expect("LIKE with concatenation should parse");
     assert_eq!(a_cat.params.len(), 1);
     assert_eq!(a_cat.params[0].name, "name");
     assert_eq!(a_cat.params[0].ts_type, "string");
@@ -326,7 +330,8 @@ fn test_adv_optional_dynamic_filters_comprehensive() {
 
     // 8. Optional symmetrical function: ($1 IS NULL OR lower(email) = lower($1))
     let sql8 = "SELECT * FROM users WHERE ($1 IS NULL OR lower(email) = lower($1));";
-    let a8 = analyze_query(sql8, &catalog, None).expect("Optional symmetrical function should parse");
+    let a8 =
+        analyze_query(sql8, &catalog, None).expect("Optional symmetrical function should parse");
     assert_eq!(a8.params.len(), 1);
     assert_eq!(a8.params[0].name, "email");
     assert_eq!(a8.params[0].ts_type, "string");
@@ -334,7 +339,8 @@ fn test_adv_optional_dynamic_filters_comprehensive() {
 
     // 9. Optional symmetrical function inverted order: (lower(email) = lower($1) OR $1 IS NULL)
     let sql9 = "SELECT * FROM users WHERE (lower(email) = lower($1) OR $1 IS NULL);";
-    let a9 = analyze_query(sql9, &catalog, None).expect("Inverted optional symmetrical func should parse");
+    let a9 = analyze_query(sql9, &catalog, None)
+        .expect("Inverted optional symmetrical func should parse");
     assert_eq!(a9.params.len(), 1);
     assert_eq!(a9.params[0].name, "email");
     assert_eq!(a9.params[0].ts_type, "string");
@@ -342,7 +348,8 @@ fn test_adv_optional_dynamic_filters_comprehensive() {
 
     // 10. Optional symmetrical function with inverted args: ($1 IS NULL OR lower($1) = lower(email))
     let sql10 = "SELECT * FROM users WHERE ($1 IS NULL OR lower($1) = lower(email));";
-    let a10 = analyze_query(sql10, &catalog, None).expect("Optional symmetrical with inverted args should parse");
+    let a10 = analyze_query(sql10, &catalog, None)
+        .expect("Optional symmetrical with inverted args should parse");
     assert_eq!(a10.params.len(), 1);
     assert_eq!(a10.params[0].name, "email");
     assert_eq!(a10.params[0].ts_type, "string");

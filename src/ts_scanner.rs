@@ -55,9 +55,11 @@ impl SourceMap {
 
     /// Maps a byte range in the generated SQL string to the corresponding byte range in the host document.
     pub fn sql_to_host_range(&self, sql_range: std::ops::Range<usize>) -> std::ops::Range<usize> {
-        if let Some(interp) = self.interpolations.iter().find(|i| {
-            sql_range.start >= i.sql_range.start && sql_range.end <= i.sql_range.end
-        }) {
+        if let Some(interp) = self
+            .interpolations
+            .iter()
+            .find(|i| sql_range.start >= i.sql_range.start && sql_range.end <= i.sql_range.end)
+        {
             return interp.host_range.clone();
         }
 
@@ -82,9 +84,9 @@ impl SourceMap {
 
     /// Finds the interpolated parameter at the given host document byte offset, if any.
     pub fn find_interpolated_param(&self, host_offset: usize) -> Option<&InterpolatedParam> {
-        self.interpolations.iter().find(|i| {
-            host_offset >= i.host_range.start && host_offset < i.host_range.end
-        })
+        self.interpolations
+            .iter()
+            .find(|i| host_offset >= i.host_range.start && host_offset < i.host_range.end)
     }
 
     /// Finds the interpolated parameter by 1-based parameter index ($1 -> 1).
@@ -744,8 +746,9 @@ impl<'a> TsScanner<'a> {
                                 }
 
                                 let explicit_name = extract_comment_name(&content);
-                                let final_name = explicit_name
-                                    .or_else(|| pending_var_name.take().map(|v| to_pascal_case(&v)));
+                                let final_name = explicit_name.or_else(|| {
+                                    pending_var_name.take().map(|v| to_pascal_case(&v))
+                                });
 
                                 queries.push(ExtractedQuery {
                                     name: final_name,
@@ -940,18 +943,12 @@ mod tests {
             q.sql.contains("WHERE user_id = $1"),
             "Expected user_id = $1"
         );
-        assert!(
-            q.sql.contains("AND status = $2"),
-            "Expected status = $2"
-        );
+        assert!(q.sql.contains("AND status = $2"), "Expected status = $2");
         assert!(
             q.sql.contains("AND total_amount >= $3"),
             "Expected total_amount >= $3"
         );
-        assert!(
-            q.sql.contains("LIMIT $4;"),
-            "Expected LIMIT $4;"
-        );
+        assert!(q.sql.contains("LIMIT $4;"), "Expected LIMIT $4;");
 
         assert_eq!(q.source_map.interpolations.len(), 4);
         let expected = [
@@ -988,10 +985,22 @@ mod tests {
 
         // Assert no Latin-1 byte mangling (e.g. 🦀 is 4 bytes [0xF0, 0x9F, 0xA6, 0x80])
         assert!(q.sql.contains("'🦀'"), "Emoji must not be corrupted");
-        assert!(q.sql.contains("'café'"), "Accented character must be intact");
-        assert!(q.sql.contains("'München'"), "Umlaut character must be intact");
-        assert!(q.sql.contains("'Привет мир'"), "Cyrillic string must be intact");
-        assert!(q.sql.contains("WHERE emoji = $1"), "Parameter mapped correctly");
+        assert!(
+            q.sql.contains("'café'"),
+            "Accented character must be intact"
+        );
+        assert!(
+            q.sql.contains("'München'"),
+            "Umlaut character must be intact"
+        );
+        assert!(
+            q.sql.contains("'Привет мир'"),
+            "Cyrillic string must be intact"
+        );
+        assert!(
+            q.sql.contains("WHERE emoji = $1"),
+            "Parameter mapped correctly"
+        );
 
         assert_eq!(q.source_map.interpolations.len(), 1);
         assert_eq!(q.source_map.interpolations[0].expr, "userEmoji");
@@ -1024,7 +1033,9 @@ mod tests {
             interp.host_range.start
         );
 
-        let host_param_range = q.source_map.sql_to_host_range(sql_param_start..sql_param_start + 2);
+        let host_param_range = q
+            .source_map
+            .sql_to_host_range(sql_param_start..sql_param_start + 2);
         assert_eq!(host_param_range, interp.host_range);
 
         // 3. After interpolation: "status"
@@ -1101,12 +1112,24 @@ mod tests {
 
         let sql_users_idx = sql.find("users").unwrap();
         let host_users_idx = ts.find("users").unwrap();
-        assert_eq!(q.source_map.sql_to_host_offset(sql_users_idx), host_users_idx);
-        assert_eq!(q.source_map.host_to_sql_offset(host_users_idx), Some(sql_users_idx));
+        assert_eq!(
+            q.source_map.sql_to_host_offset(sql_users_idx),
+            host_users_idx
+        );
+        assert_eq!(
+            q.source_map.host_to_sql_offset(host_users_idx),
+            Some(sql_users_idx)
+        );
 
         let sql_status_idx = sql.find("status").unwrap();
         let host_status_idx = ts.find("status").unwrap();
-        assert_eq!(q.source_map.sql_to_host_offset(sql_status_idx), host_status_idx);
-        assert_eq!(q.source_map.host_to_sql_offset(host_status_idx), Some(sql_status_idx));
+        assert_eq!(
+            q.source_map.sql_to_host_offset(sql_status_idx),
+            host_status_idx
+        );
+        assert_eq!(
+            q.source_map.host_to_sql_offset(host_status_idx),
+            Some(sql_status_idx)
+        );
     }
 }

@@ -4,16 +4,14 @@
 //! scalar array comparisons (`ANY`, `ALL`), set membership (`IN`), range bounds (`BETWEEN`),
 //! literal counterparts (`A_Const`), type casts, and function calls.
 
-use crate::analyzer::{
-    PgType, QueryScope, extract_func_name, extract_string, infer_expr,
-};
+use crate::analyzer::{PgType, QueryScope, extract_func_name, extract_string, infer_expr};
 use crate::catalog::Catalog;
 use crate::params::{
-    extract_column_info, extract_param_info, record_param, resolve_params_in_expr,
-    resolve_type_from_cast, ParamInfo,
+    ParamInfo, extract_column_info, extract_param_info, record_param, resolve_params_in_expr,
+    resolve_type_from_cast,
 };
-use pg_query::protobuf::{AExpr, AExprKind, FuncCall, Node};
 use pg_query::NodeEnum;
+use pg_query::protobuf::{AExpr, AExprKind, FuncCall, Node};
 use std::collections::HashMap;
 
 /// Deduces prepared statement parameters inside an `A_Expr` node.
@@ -102,28 +100,14 @@ pub fn deduce_aexpr(
                     (param_opt_r, col_opt_l)
                 {
                     record_param(
-                        param_num,
-                        cast_opt,
-                        alias_opt,
-                        &col_name,
-                        catalog,
-                        scope,
-                        param_map,
-                        false,
+                        param_num, cast_opt, alias_opt, &col_name, catalog, scope, param_map, false,
                     )?;
                     return Ok(());
                 } else if let (Some((param_num, cast_opt)), Some((alias_opt, col_name))) =
                     (param_opt_l, col_opt_r)
                 {
                     record_param(
-                        param_num,
-                        cast_opt,
-                        alias_opt,
-                        &col_name,
-                        catalog,
-                        scope,
-                        param_map,
-                        false,
+                        param_num, cast_opt, alias_opt, &col_name, catalog, scope, param_map, false,
                     )?;
                     return Ok(());
                 }
@@ -203,9 +187,7 @@ pub fn deduce_aexpr(
                 .map(|c| resolve_type_from_cast(c, catalog))
                 .unwrap_or_else(|| l_inf.pg_type.to_ts(catalog));
             let entry = param_map.entry(*param_num).or_default();
-            if entry.inferred_type.is_none()
-                || entry.inferred_type.as_deref() == Some("unknown")
-            {
+            if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
                 entry.inferred_type = Some(ts_type);
             }
             resolve_params_in_expr(lexpr, catalog, scope, param_map)?;
@@ -220,9 +202,7 @@ pub fn deduce_aexpr(
                 .map(|c| resolve_type_from_cast(c, catalog))
                 .unwrap_or_else(|| r_inf.pg_type.to_ts(catalog));
             let entry = param_map.entry(*param_num).or_default();
-            if entry.inferred_type.is_none()
-                || entry.inferred_type.as_deref() == Some("unknown")
-            {
+            if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
                 entry.inferred_type = Some(ts_type);
             }
             resolve_params_in_expr(rexpr, catalog, scope, param_map)?;
@@ -246,9 +226,7 @@ pub fn deduce_aexpr(
                     }
                 });
             let entry = param_map.entry(param_num).or_default();
-            if entry.inferred_type.is_none()
-                || entry.inferred_type.as_deref() == Some("unknown")
-            {
+            if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
                 entry.inferred_type = Some(ts_type);
             }
             return Ok(());
@@ -268,9 +246,7 @@ pub fn deduce_aexpr(
                     }
                 });
             let entry = param_map.entry(param_num).or_default();
-            if entry.inferred_type.is_none()
-                || entry.inferred_type.as_deref() == Some("unknown")
-            {
+            if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
                 entry.inferred_type = Some(ts_type);
             }
             return Ok(());
@@ -380,11 +356,19 @@ pub fn handle_pattern_matching(
     } else if let (Some((p_l, cast_l)), Some((p_r, cast_r))) = (param_opt_l, param_opt_r) {
         let entry_l = param_map.entry(p_l).or_default();
         if entry_l.inferred_type.is_none() || entry_l.inferred_type.as_deref() == Some("unknown") {
-            entry_l.inferred_type = Some(cast_l.map(|c| resolve_type_from_cast(&c, catalog)).unwrap_or_else(|| "string".to_string()));
+            entry_l.inferred_type = Some(
+                cast_l
+                    .map(|c| resolve_type_from_cast(&c, catalog))
+                    .unwrap_or_else(|| "string".to_string()),
+            );
         }
         let entry_r = param_map.entry(p_r).or_default();
         if entry_r.inferred_type.is_none() || entry_r.inferred_type.as_deref() == Some("unknown") {
-            entry_r.inferred_type = Some(cast_r.map(|c| resolve_type_from_cast(&c, catalog)).unwrap_or_else(|| "string".to_string()));
+            entry_r.inferred_type = Some(
+                cast_r
+                    .map(|c| resolve_type_from_cast(&c, catalog))
+                    .unwrap_or_else(|| "string".to_string()),
+            );
         }
     } else if let Some((_, ref col_name)) = col_opt_l {
         if let Some(rexpr) = &ae.rexpr {
@@ -395,7 +379,9 @@ pub fn handle_pattern_matching(
                 if entry.suggested_name.is_none() {
                     entry.suggested_name = Some(col_name.clone());
                 }
-                if entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown") {
+                if entry.inferred_type.is_none()
+                    || entry.inferred_type.as_deref() == Some("unknown")
+                {
                     entry.inferred_type = Some("string".to_string());
                 }
             }
@@ -860,8 +846,7 @@ pub fn deduce_func_call(
                 .or_else(|| expected_type.map(|t| t.to_ts(catalog)));
 
             let entry = param_map.entry(param_num).or_default();
-            if (entry.inferred_type.is_none()
-                || entry.inferred_type.as_deref() == Some("unknown"))
+            if (entry.inferred_type.is_none() || entry.inferred_type.as_deref() == Some("unknown"))
                 && resolved.is_some()
             {
                 entry.inferred_type = resolved;

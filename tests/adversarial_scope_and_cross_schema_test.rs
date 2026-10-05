@@ -39,14 +39,28 @@ fn test_adversarial_aliased_join_catalog_immutability() {
             j.salary
         FROM (dept d JOIN emp e ON d.dept_id = e.dept_id) AS j;
     "#;
-    let analyzed = analyze_query(query, &catalog, None).expect("Aliased join query must analyze cleanly");
+    let analyzed =
+        analyze_query(query, &catalog, None).expect("Aliased join query must analyze cleanly");
     assert_eq!(analyzed.fields.len(), 3);
 
     // Verify catalog state is completely unchanged
-    assert_eq!(catalog.tables.len(), initial_table_count, "Catalog table count must not increase");
-    assert!(catalog.get_table("j").is_none(), "Alias 'j' must not exist in catalog");
-    assert!(!catalog.tables.contains_key("j"), "catalog.tables must not contain key 'j'");
-    assert!(!catalog.tables.contains_key("public.j"), "catalog.tables must not contain 'public.j'");
+    assert_eq!(
+        catalog.tables.len(),
+        initial_table_count,
+        "Catalog table count must not increase"
+    );
+    assert!(
+        catalog.get_table("j").is_none(),
+        "Alias 'j' must not exist in catalog"
+    );
+    assert!(
+        !catalog.tables.contains_key("j"),
+        "catalog.tables must not contain key 'j'"
+    );
+    assert!(
+        !catalog.tables.contains_key("public.j"),
+        "catalog.tables must not contain 'public.j'"
+    );
 
     // 2. Subsequent query attempting to reference 'j' must fail cleanly with table not found
     let invalid_subsequent = "SELECT id FROM j;";
@@ -83,14 +97,18 @@ fn test_adversarial_range_subquery_catalog_immutability() {
             sub.val
         FROM (SELECT category, val FROM metrics WHERE val > 10.0) AS sub;
     "#;
-    let analyzed = analyze_query(query, &catalog, None).expect("Range subselect query must analyze cleanly");
+    let analyzed =
+        analyze_query(query, &catalog, None).expect("Range subselect query must analyze cleanly");
     assert_eq!(analyzed.fields.len(), 2);
     assert_eq!(analyzed.fields[0].name, "category");
     assert_eq!(analyzed.fields[1].name, "val");
 
     // Verify catalog state is completely unchanged
     assert_eq!(catalog.tables.len(), initial_count);
-    assert!(catalog.get_table("sub").is_none(), "Range subquery alias 'sub' must not exist in catalog");
+    assert!(
+        catalog.get_table("sub").is_none(),
+        "Range subquery alias 'sub' must not exist in catalog"
+    );
     assert!(!catalog.tables.contains_key("sub"));
     assert!(!catalog.tables.contains_key("public.sub"));
 
@@ -132,7 +150,8 @@ fn test_adversarial_column_alias_catalog_immutability() {
             a.c3
         FROM accounts a(c1, c2, c3);
     "#;
-    let analyzed = analyze_query(query, &catalog, None).expect("Column aliased query must analyze cleanly");
+    let analyzed =
+        analyze_query(query, &catalog, None).expect("Column aliased query must analyze cleanly");
     assert_eq!(analyzed.fields.len(), 3);
     assert_eq!(analyzed.fields[0].name, "c1");
     assert_eq!(analyzed.fields[1].name, "c2");
@@ -152,7 +171,8 @@ fn test_adversarial_column_alias_catalog_immutability() {
 
     // 3. Subsequent query without column aliases must see original column names
     let q_orig = "SELECT acc_id, holder_name FROM accounts;";
-    let res_orig = analyze_query(q_orig, &catalog, None).expect("Original columns must still be valid");
+    let res_orig =
+        analyze_query(q_orig, &catalog, None).expect("Original columns must still be valid");
     assert_eq!(res_orig.fields[0].name, "acc_id");
     assert_eq!(res_orig.fields[1].name, "holder_name");
 
@@ -191,7 +211,8 @@ fn test_adversarial_multithreaded_concurrent_query_isolation() {
                 "SELECT j{0}.prod_id, j{0}.title, j{0}.rating FROM (products p JOIN reviews r ON p.prod_id = r.product_id) AS j{0};",
                 i
             );
-            let res_join = analyze_query(&q_join, &cat, None).expect("Concurrent aliased join failed");
+            let res_join =
+                analyze_query(&q_join, &cat, None).expect("Concurrent aliased join failed");
             assert_eq!(res_join.fields.len(), 3);
 
             // Case B: Range subselect with thread-specific alias
@@ -207,7 +228,8 @@ fn test_adversarial_multithreaded_concurrent_query_isolation() {
                 "SELECT p{0}.custom_p_id, p{0}.custom_p_title FROM products p{0}(custom_p_id, custom_p_title, custom_p_price);",
                 i
             );
-            let res_col = analyze_query(&q_col, &cat, None).expect("Concurrent column aliasing failed");
+            let res_col =
+                analyze_query(&q_col, &cat, None).expect("Concurrent column aliasing failed");
             assert_eq!(res_col.fields[0].name, "custom_p_id");
             assert_eq!(res_col.fields[1].name, "custom_p_title");
         });
@@ -260,7 +282,9 @@ fn test_adversarial_cross_schema_alter_table_isolation() {
     assert!(public_users.get_column("email").is_some());
     assert!(public_users.get_column("username").is_none());
 
-    let other_users = catalog.get_table("other_schema.users").expect("other_schema.users must exist");
+    let other_users = catalog
+        .get_table("other_schema.users")
+        .expect("other_schema.users must exist");
     assert_eq!(other_users.columns.len(), 3);
     assert!(other_users.get_column("username").is_some());
     assert!(other_users.get_column("email").is_none());
@@ -292,7 +316,11 @@ fn test_adversarial_cross_schema_alter_table_isolation() {
     assert!(other_after_drop.get_column("bio").is_none());
 
     let public_after_drop = catalog.get_table("users").unwrap();
-    assert_eq!(public_after_drop.columns.len(), 2, "public.users columns count must be completely unaffected");
+    assert_eq!(
+        public_after_drop.columns.len(),
+        2,
+        "public.users columns count must be completely unaffected"
+    );
 
     // 4. Non-existent foreign schema ALTER must NOT alter public.users
     catalog
@@ -311,7 +339,10 @@ fn test_adversarial_cross_schema_alter_table_isolation() {
         .expect("Unqualified ALTER TABLE users must succeed");
 
     let public_has_phone = catalog.get_table("users").unwrap();
-    assert!(public_has_phone.get_column("phone").is_some(), "public.users must have phone column");
+    assert!(
+        public_has_phone.get_column("phone").is_some(),
+        "public.users must have phone column"
+    );
 
     let other_check_phone = catalog.get_table("other_schema.users").unwrap();
     assert!(
@@ -352,7 +383,10 @@ fn test_adversarial_ambiguous_column_in_aliased_join_triggers_clean_error() {
         FROM (t_left l JOIN t_right r ON l.id = r.id) AS j;
     "#;
     let res_ambig_id = analyze_query(q_ambig_id, &catalog, None);
-    assert!(res_ambig_id.is_err(), "Referencing j.id on aliased join must return error");
+    assert!(
+        res_ambig_id.is_err(),
+        "Referencing j.id on aliased join must return error"
+    );
     let err_msg = res_ambig_id.unwrap_err();
     assert!(
         err_msg.to_ascii_lowercase().contains("ambiguous"),
@@ -366,9 +400,15 @@ fn test_adversarial_ambiguous_column_in_aliased_join_triggers_clean_error() {
         FROM (t_left l JOIN t_right r ON l.id = r.id) AS j;
     "#;
     let res_ambig_tag = analyze_query(q_ambig_tag, &catalog, None);
-    assert!(res_ambig_tag.is_err(), "Referencing j.common_tag must return error");
     assert!(
-        res_ambig_tag.unwrap_err().to_ascii_lowercase().contains("ambiguous"),
+        res_ambig_tag.is_err(),
+        "Referencing j.common_tag must return error"
+    );
+    assert!(
+        res_ambig_tag
+            .unwrap_err()
+            .to_ascii_lowercase()
+            .contains("ambiguous"),
         "Expected error message mentioning ambiguous"
     );
 
@@ -378,9 +418,15 @@ fn test_adversarial_ambiguous_column_in_aliased_join_triggers_clean_error() {
         FROM (t_left l JOIN t_right r ON l.id = r.id) AS j;
     "#;
     let res_unqual_id = analyze_query(q_unqual_id, &catalog, None);
-    assert!(res_unqual_id.is_err(), "Referencing unqualified ambiguous id must return error");
     assert!(
-        res_unqual_id.unwrap_err().to_ascii_lowercase().contains("ambiguous"),
+        res_unqual_id.is_err(),
+        "Referencing unqualified ambiguous id must return error"
+    );
+    assert!(
+        res_unqual_id
+            .unwrap_err()
+            .to_ascii_lowercase()
+            .contains("ambiguous"),
         "Expected error mentioning ambiguous"
     );
 
@@ -393,7 +439,8 @@ fn test_adversarial_ambiguous_column_in_aliased_join_triggers_clean_error() {
             j.right_unique
         FROM (t_left l JOIN t_right r ON l.id = r.id) AS j;
     "#;
-    let res_unique = analyze_query(q_unique, &catalog, None).expect("Unique columns in aliased join must resolve cleanly");
+    let res_unique = analyze_query(q_unique, &catalog, None)
+        .expect("Unique columns in aliased join must resolve cleanly");
     assert_eq!(res_unique.fields.len(), 4);
     assert_eq!(res_unique.fields[0].name, "name");
     assert_eq!(res_unique.fields[1].name, "email");
@@ -404,7 +451,8 @@ fn test_adversarial_ambiguous_column_in_aliased_join_triggers_clean_error() {
     let q_unique_unqual = r#"
         SELECT name, email FROM (t_left l JOIN t_right r ON l.id = r.id) AS j;
     "#;
-    let res_unique_unqual = analyze_query(q_unique_unqual, &catalog, None).expect("Unqualified unique columns must resolve");
+    let res_unique_unqual = analyze_query(q_unique_unqual, &catalog, None)
+        .expect("Unqualified unique columns must resolve");
     assert_eq!(res_unique_unqual.fields[0].name, "name");
     assert_eq!(res_unique_unqual.fields[1].name, "email");
 
@@ -444,7 +492,12 @@ fn test_adversarial_nested_aliased_joins_ambiguity_propagation() {
     "#;
     let res_ambig = analyze_query(sql_ambig, &catalog, None);
     assert!(res_ambig.is_err(), "j2.id must be rejected as ambiguous");
-    assert!(res_ambig.unwrap_err().to_ascii_lowercase().contains("ambiguous"));
+    assert!(
+        res_ambig
+            .unwrap_err()
+            .to_ascii_lowercase()
+            .contains("ambiguous")
+    );
 
     let sql_ok = r#"
         SELECT
@@ -454,7 +507,8 @@ fn test_adversarial_nested_aliased_joins_ambiguity_propagation() {
         FROM ((part_a a JOIN part_b b ON a.id = b.id) AS j1
               JOIN part_c c ON j1.a_desc = c.c_desc) AS j2;
     "#;
-    let res_ok = analyze_query(sql_ok, &catalog, None).expect("Non-ambiguous columns in nested aliased join must succeed");
+    let res_ok = analyze_query(sql_ok, &catalog, None)
+        .expect("Non-ambiguous columns in nested aliased join must succeed");
     assert_eq!(res_ok.fields.len(), 3);
     assert_eq!(res_ok.fields[0].name, "a_desc");
     assert_eq!(res_ok.fields[1].name, "b_desc");
@@ -507,9 +561,18 @@ fn test_adversarial_three_way_cross_schema_alter_matrix() {
     let pub_tbl = catalog.get_table("users").unwrap();
     assert!(pub_tbl.get_column("public_col").is_some());
     assert!(pub_tbl.get_column("extra_public").is_some());
-    assert!(pub_tbl.get_column("extra_a").is_none(), "tenant_a column must not leak to public");
-    assert!(pub_tbl.get_column("extra_b").is_none(), "tenant_b column must not leak to public");
-    assert!(pub_tbl.get_column("ghost").is_none(), "ghost column must not leak to public");
+    assert!(
+        pub_tbl.get_column("extra_a").is_none(),
+        "tenant_a column must not leak to public"
+    );
+    assert!(
+        pub_tbl.get_column("extra_b").is_none(),
+        "tenant_b column must not leak to public"
+    );
+    assert!(
+        pub_tbl.get_column("ghost").is_none(),
+        "ghost column must not leak to public"
+    );
     assert_eq!(pub_tbl.columns.len(), 3);
 
     let a_tbl = catalog.get_table("tenant_a.users").unwrap();
@@ -561,7 +624,8 @@ fn test_adversarial_nested_aliased_join_nullability_and_type_projection() {
               FULL JOIN src_c c ON j1.a_id = c.c_id) AS j_outer;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, None).expect("Nested aliased outer join query must analyze");
+    let analyzed =
+        analyze_query(sql, &catalog, None).expect("Nested aliased outer join query must analyze");
     assert_eq!(analyzed.fields.len(), 3);
 
     assert_eq!(analyzed.fields[0].name, "a_val");
@@ -623,7 +687,8 @@ fn test_adversarial_self_join_aliased_ambiguity_detection() {
             ON s1.mentor_id = s2.s2_id
         ) AS pair;
     "#;
-    let analyzed = analyze_query(sql_clean, &catalog, None).expect("Disambiguated self join must succeed");
+    let analyzed =
+        analyze_query(sql_clean, &catalog, None).expect("Disambiguated self join must succeed");
     assert_eq!(analyzed.fields.len(), 2);
     assert_eq!(analyzed.fields[0].name, "junior_name");
     assert_eq!(analyzed.fields[1].name, "senior_name");
@@ -653,7 +718,8 @@ fn test_adversarial_partial_column_aliasing() {
             i.loc
         FROM inventory i(custom_sku, custom_qty);
     "#;
-    let analyzed = analyze_query(sql, &catalog, None).expect("Partial column aliasing must succeed");
+    let analyzed =
+        analyze_query(sql, &catalog, None).expect("Partial column aliasing must succeed");
     assert_eq!(analyzed.fields.len(), 3);
     assert_eq!(analyzed.fields[0].name, "custom_sku");
     assert_eq!(analyzed.fields[1].name, "custom_qty");

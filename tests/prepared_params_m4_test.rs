@@ -56,7 +56,9 @@ fn setup_test_catalog() -> Catalog {
             created_at TIMESTAMPTZ NOT NULL
         );
     "#;
-    catalog.apply_sql(ddl).expect("Failed to setup test catalog");
+    catalog
+        .apply_sql(ddl)
+        .expect("Failed to setup test catalog");
     catalog
 }
 
@@ -157,7 +159,8 @@ fn test_param_pattern_matching_operators() {
 
     // NOT ILIKE
     let sql_not_ilike = "SELECT * FROM users WHERE email NOT ILIKE $1;";
-    let a_not_ilike = analyze_query(sql_not_ilike, &catalog, None).expect("NOT ILIKE should analyze");
+    let a_not_ilike =
+        analyze_query(sql_not_ilike, &catalog, None).expect("NOT ILIKE should analyze");
     assert_eq!(a_not_ilike.params.len(), 1);
     assert_eq!(a_not_ilike.params[0].name, "email");
     assert_eq!(a_not_ilike.params[0].ts_type, "string");
@@ -191,7 +194,8 @@ fn test_param_pattern_matching_operators() {
 
     // String concatenation in pattern: name LIKE '%' || $1 || '%'
     let sql_concat = "SELECT * FROM users WHERE name LIKE '%' || $1 || '%';";
-    let a_concat = analyze_query(sql_concat, &catalog, None).expect("Concat pattern should analyze");
+    let a_concat =
+        analyze_query(sql_concat, &catalog, None).expect("Concat pattern should analyze");
     assert_eq!(a_concat.params.len(), 1);
     assert_eq!(a_concat.params[0].name, "name");
     assert_eq!(a_concat.params[0].ts_type, "string");
@@ -210,7 +214,8 @@ fn test_param_array_and_set_operations() {
 
     // 2. $1 = ANY(tags) -> $1 is scalar element type string
     let sql_scalar_any = "SELECT * FROM posts WHERE $1 = ANY(tags);";
-    let a_scalar_any = analyze_query(sql_scalar_any, &catalog, None).expect("Scalar ANY should analyze");
+    let a_scalar_any =
+        analyze_query(sql_scalar_any, &catalog, None).expect("Scalar ANY should analyze");
     assert_eq!(a_scalar_any.params.len(), 1);
     assert_eq!(a_scalar_any.params[0].name, "tags");
     assert_eq!(a_scalar_any.params[0].ts_type, "string");
@@ -262,7 +267,8 @@ fn test_param_array_and_set_operations() {
 
     // 8. NOT BETWEEN: created_at NOT BETWEEN $1 AND $2
     let sql_not_between = "SELECT * FROM users WHERE created_at NOT BETWEEN $1 AND $2;";
-    let a_not_between = analyze_query(sql_not_between, &catalog, None).expect("NOT BETWEEN should analyze");
+    let a_not_between =
+        analyze_query(sql_not_between, &catalog, None).expect("NOT BETWEEN should analyze");
     assert_eq!(a_not_between.params.len(), 2);
     assert_eq!(a_not_between.params[0].name, "created_at");
     assert_eq!(a_not_between.params[0].ts_type, "Date");
@@ -271,19 +277,22 @@ fn test_param_array_and_set_operations() {
 
     // 9. Parameter subject in BETWEEN: $1 BETWEEN age AND max_age
     let sql_between_subj = "SELECT * FROM users WHERE $1 BETWEEN age AND max_age;";
-    let a_between_subj = analyze_query(sql_between_subj, &catalog, None).expect("BETWEEN subject should analyze");
+    let a_between_subj =
+        analyze_query(sql_between_subj, &catalog, None).expect("BETWEEN subject should analyze");
     assert_eq!(a_between_subj.params.len(), 1);
     assert_eq!(a_between_subj.params[0].ts_type, "number");
 
     // 10. Array overlap && and containment @>
     let sql_overlap = "SELECT * FROM posts WHERE tags && $1;";
-    let a_overlap = analyze_query(sql_overlap, &catalog, None).expect("Array overlap should analyze");
+    let a_overlap =
+        analyze_query(sql_overlap, &catalog, None).expect("Array overlap should analyze");
     assert_eq!(a_overlap.params.len(), 1);
     assert_eq!(a_overlap.params[0].name, "tags");
     assert_eq!(a_overlap.params[0].ts_type, "Array<string>");
 
     let sql_contains = "SELECT * FROM posts WHERE tags @> $1;";
-    let a_contains = analyze_query(sql_contains, &catalog, None).expect("Array containment should analyze");
+    let a_contains =
+        analyze_query(sql_contains, &catalog, None).expect("Array containment should analyze");
     assert_eq!(a_contains.params.len(), 1);
     assert_eq!(a_contains.params[0].name, "tags");
     assert_eq!(a_contains.params[0].ts_type, "Array<string>");
@@ -302,7 +311,8 @@ fn test_param_type_casts_and_functions() {
 
     // 2. Explicit array cast: $1::uuid[]
     let sql_arr_cast = "SELECT * FROM users WHERE id = ANY($1::uuid[]);";
-    let a_arr_cast = analyze_query(sql_arr_cast, &catalog, None).expect("Array cast should analyze");
+    let a_arr_cast =
+        analyze_query(sql_arr_cast, &catalog, None).expect("Array cast should analyze");
     assert_eq!(a_arr_cast.params.len(), 1);
     assert_eq!(a_arr_cast.params[0].name, "id");
     assert_eq!(a_arr_cast.params[0].ts_type, "Array<string>");
@@ -323,7 +333,8 @@ fn test_param_type_casts_and_functions() {
 
     // 5. Symmetrical function: lower(email) = lower($1)
     let sql_sym = "SELECT * FROM users WHERE lower(email) = lower($1);";
-    let a_sym = analyze_query(sql_sym, &catalog, None).expect("Symmetrical function should analyze");
+    let a_sym =
+        analyze_query(sql_sym, &catalog, None).expect("Symmetrical function should analyze");
     assert_eq!(a_sym.params.len(), 1);
     assert_eq!(a_sym.params[0].name, "email");
     assert_eq!(a_sym.params[0].ts_type, "string");
@@ -359,7 +370,8 @@ fn test_param_type_casts_and_functions() {
 
     // 10. LIMIT and OFFSET parameters
     let sql_limit_offset = "SELECT * FROM users LIMIT $1 OFFSET $2;";
-    let a_lo = analyze_query(sql_limit_offset, &catalog, None).expect("LIMIT OFFSET should analyze");
+    let a_lo =
+        analyze_query(sql_limit_offset, &catalog, None).expect("LIMIT OFFSET should analyze");
     assert_eq!(a_lo.params.len(), 2);
     assert_eq!(a_lo.params[0].index, 1);
     assert_eq!(a_lo.params[0].name, "limit");
@@ -375,7 +387,8 @@ fn test_param_optional_dynamic_filter_patterns() {
 
     // 1. Standard optional equality: ($1::text IS NULL OR email = $1)
     let sql_opt_eq = "SELECT * FROM users WHERE ($1::text IS NULL OR email = $1);";
-    let a_opt_eq = analyze_query(sql_opt_eq, &catalog, None).expect("Optional equality should analyze");
+    let a_opt_eq =
+        analyze_query(sql_opt_eq, &catalog, None).expect("Optional equality should analyze");
     assert_eq!(a_opt_eq.params.len(), 1);
     assert_eq!(a_opt_eq.params[0].name, "email");
     assert_eq!(a_opt_eq.params[0].ts_type, "string");
@@ -383,7 +396,8 @@ fn test_param_optional_dynamic_filter_patterns() {
 
     // 2. Inverted order: (email = $1 OR $1 IS NULL)
     let sql_opt_inv = "SELECT * FROM users WHERE (email = $1 OR $1 IS NULL);";
-    let a_opt_inv = analyze_query(sql_opt_inv, &catalog, None).expect("Inverted optional should analyze");
+    let a_opt_inv =
+        analyze_query(sql_opt_inv, &catalog, None).expect("Inverted optional should analyze");
     assert_eq!(a_opt_inv.params.len(), 1);
     assert_eq!(a_opt_inv.params[0].name, "email");
     assert_eq!(a_opt_inv.params[0].ts_type, "string");
@@ -391,7 +405,8 @@ fn test_param_optional_dynamic_filter_patterns() {
 
     // 3. Optional LIKE: ($1 IS NULL OR name LIKE $1)
     let sql_opt_like = "SELECT * FROM users WHERE ($1 IS NULL OR name LIKE $1);";
-    let a_opt_like = analyze_query(sql_opt_like, &catalog, None).expect("Optional LIKE should analyze");
+    let a_opt_like =
+        analyze_query(sql_opt_like, &catalog, None).expect("Optional LIKE should analyze");
     assert_eq!(a_opt_like.params.len(), 1);
     assert_eq!(a_opt_like.params[0].name, "name");
     assert_eq!(a_opt_like.params[0].ts_type, "string");
@@ -399,7 +414,8 @@ fn test_param_optional_dynamic_filter_patterns() {
 
     // 4. Optional ILIKE: ($1 IS NULL OR email ILIKE $1)
     let sql_opt_ilike = "SELECT * FROM users WHERE ($1 IS NULL OR email ILIKE $1);";
-    let a_opt_ilike = analyze_query(sql_opt_ilike, &catalog, None).expect("Optional ILIKE should analyze");
+    let a_opt_ilike =
+        analyze_query(sql_opt_ilike, &catalog, None).expect("Optional ILIKE should analyze");
     assert_eq!(a_opt_ilike.params.len(), 1);
     assert_eq!(a_opt_ilike.params[0].name, "email");
     assert_eq!(a_opt_ilike.params[0].ts_type, "string");
@@ -407,7 +423,8 @@ fn test_param_optional_dynamic_filter_patterns() {
 
     // 5. Optional ANY: ($1 IS NULL OR id = ANY($1))
     let sql_opt_any = "SELECT * FROM users WHERE ($1 IS NULL OR id = ANY($1));";
-    let a_opt_any = analyze_query(sql_opt_any, &catalog, None).expect("Optional ANY should analyze");
+    let a_opt_any =
+        analyze_query(sql_opt_any, &catalog, None).expect("Optional ANY should analyze");
     assert_eq!(a_opt_any.params.len(), 1);
     assert_eq!(a_opt_any.params[0].name, "id");
     assert_eq!(a_opt_any.params[0].ts_type, "Array<string>");
@@ -415,7 +432,8 @@ fn test_param_optional_dynamic_filter_patterns() {
 
     // 6. Optional symmetrical function: ($1 IS NULL OR lower(email) = lower($1))
     let sql_opt_sym = "SELECT * FROM users WHERE ($1 IS NULL OR lower(email) = lower($1));";
-    let a_opt_sym = analyze_query(sql_opt_sym, &catalog, None).expect("Optional sym func should analyze");
+    let a_opt_sym =
+        analyze_query(sql_opt_sym, &catalog, None).expect("Optional sym func should analyze");
     assert_eq!(a_opt_sym.params.len(), 1);
     assert_eq!(a_opt_sym.params[0].name, "email");
     assert_eq!(a_opt_sym.params[0].ts_type, "string");
@@ -464,7 +482,8 @@ fn test_param_collision_free_naming_and_disambiguation() {
     collision_catalog.apply_sql(collision_ddl).unwrap();
 
     let sql_coll = "SELECT * FROM metrics WHERE id = $1 AND id2 = $2 AND id = $3;";
-    let a_coll = analyze_query(sql_coll, &collision_catalog, None).expect("Collision query should analyze");
+    let a_coll =
+        analyze_query(sql_coll, &collision_catalog, None).expect("Collision query should analyze");
     assert_eq!(a_coll.params.len(), 3);
     assert_eq!(a_coll.params[0].name, "id");
     assert_eq!(a_coll.params[1].name, "id2");
@@ -480,7 +499,8 @@ fn test_param_collision_free_naming_and_disambiguation() {
 
     // 4. Out-of-order parameter references in SQL text: WHERE name = $2 AND id = $1
     let sql_order = "SELECT * FROM users WHERE name = $2 AND id = $1;";
-    let a_order = analyze_query(sql_order, &catalog, None).expect("Out-of-order query should analyze");
+    let a_order =
+        analyze_query(sql_order, &catalog, None).expect("Out-of-order query should analyze");
     assert_eq!(a_order.params.len(), 2);
     assert_eq!(a_order.params[0].index, 1);
     assert_eq!(a_order.params[0].name, "id");
@@ -497,7 +517,8 @@ fn test_param_dml_statements() {
         INSERT INTO users (name, email)
         VALUES ($1, $2), ($3, $4);
     "#;
-    let a_mi = analyze_query(sql_multi_insert, &catalog, None).expect("Multi-row INSERT should analyze");
+    let a_mi =
+        analyze_query(sql_multi_insert, &catalog, None).expect("Multi-row INSERT should analyze");
     assert_eq!(a_mi.params.len(), 4);
     assert_eq!(a_mi.params[0].name, "name");
     assert_eq!(a_mi.params[1].name, "email");

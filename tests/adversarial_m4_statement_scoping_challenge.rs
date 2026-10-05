@@ -15,10 +15,10 @@
 //!    - Special/quoted identifier names in SQL & codegen
 //!    - Reused parameter numbers ($1 referenced multiple times)
 
+use sqltype::DriverTarget;
 use sqltype::analyzer::analyze_query;
 use sqltype::catalog::Catalog;
-use sqltype::codegen::{generate_file_ts_with_options, CodegenOptions};
-use sqltype::DriverTarget;
+use sqltype::codegen::{CodegenOptions, generate_file_ts_with_options};
 
 fn setup_adv_catalog() -> Catalog {
     let mut catalog = Catalog::default();
@@ -62,7 +62,9 @@ fn setup_adv_catalog() -> Catalog {
             "default" INT NOT NULL
         );
     "#;
-    catalog.apply_sql(ddl).expect("Failed to setup stress catalog");
+    catalog
+        .apply_sql(ddl)
+        .expect("Failed to setup stress catalog");
     catalog
 }
 
@@ -81,7 +83,8 @@ fn test_insert_on_conflict_do_update_full_lifecycle() {
         RETURNING *;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, Some("UpsertAccount")).expect("Insert query should analyze");
+    let analyzed =
+        analyze_query(sql, &catalog, Some("UpsertAccount")).expect("Insert query should analyze");
 
     assert_eq!(analyzed.params.len(), 10, "Expected exactly 10 parameters");
 
@@ -140,7 +143,8 @@ fn test_insert_on_conflict_do_update_full_lifecycle() {
     assert_eq!(analyzed.fields.len(), 7);
 
     // Verify TS codegen compiles cleanly
-    let ts_code = generate_file_ts_with_options(&[analyzed], &CodegenOptions::new(DriverTarget::Pg, true));
+    let ts_code =
+        generate_file_ts_with_options(&[analyzed], &CodegenOptions::new(DriverTarget::Pg, true));
     assert!(ts_code.contains("export interface UpsertAccountParams {"));
     assert!(ts_code.contains("  name2: string;"));
     assert!(ts_code.contains("  balance2: number;"));
@@ -161,7 +165,8 @@ fn test_insert_on_conflict_do_nothing_and_multi_row() {
         RETURNING id, name;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, Some("BatchInsert")).expect("Batch insert should analyze");
+    let analyzed =
+        analyze_query(sql, &catalog, Some("BatchInsert")).expect("Batch insert should analyze");
     assert_eq!(analyzed.params.len(), 8);
 
     assert_eq!(analyzed.params[0].name, "id");
@@ -192,7 +197,8 @@ fn test_update_statements_with_arithmetic_joins_and_returning() {
         WHERE id = $4 AND is_active = $5
         RETURNING id, balance, is_active;
     "#;
-    let a1 = analyze_query(sql1, &catalog, Some("UpdateAccount")).expect("Update query should analyze");
+    let a1 =
+        analyze_query(sql1, &catalog, Some("UpdateAccount")).expect("Update query should analyze");
     assert_eq!(a1.params.len(), 5);
     assert_eq!(a1.params[0].name, "name");
     assert_eq!(a1.params[0].ts_type, "string");
@@ -213,7 +219,8 @@ fn test_update_statements_with_arithmetic_joins_and_returning() {
         WHERE m.account_id = a.id AND a.tier = $3 AND m.role_id = $4
         RETURNING m.id, m.score, a.name;
     "#;
-    let a2 = analyze_query(sql2, &catalog, Some("UpdateMemberWithFrom")).expect("Update from should analyze");
+    let a2 = analyze_query(sql2, &catalog, Some("UpdateMemberWithFrom"))
+        .expect("Update from should analyze");
     assert_eq!(a2.params.len(), 4);
     assert_eq!(a2.params[0].name, "notes");
     assert_eq!(a2.params[0].ts_type, "string");
@@ -236,7 +243,8 @@ fn test_delete_statements_with_using_and_returning() {
         WHERE balance <= $1 AND is_active = $2
         RETURNING *;
     "#;
-    let a1 = analyze_query(sql1, &catalog, Some("DeleteInactiveAccounts")).expect("Delete should analyze");
+    let a1 = analyze_query(sql1, &catalog, Some("DeleteInactiveAccounts"))
+        .expect("Delete should analyze");
     assert_eq!(a1.params.len(), 2);
     assert_eq!(a1.params[0].name, "balance");
     assert_eq!(a1.params[0].ts_type, "number");
@@ -251,7 +259,8 @@ fn test_delete_statements_with_using_and_returning() {
         WHERE l.account_id = a.id AND a.account_no = $1 AND l.action = $2
         RETURNING l.id, l.logged_at;
     "#;
-    let a2 = analyze_query(sql2, &catalog, Some("DeleteAuditLogs")).expect("Delete with using should analyze");
+    let a2 = analyze_query(sql2, &catalog, Some("DeleteAuditLogs"))
+        .expect("Delete with using should analyze");
     assert_eq!(a2.params.len(), 2);
     assert_eq!(a2.params[0].name, "account_no");
     assert_eq!(a2.params[0].ts_type, "number");
@@ -284,7 +293,8 @@ fn test_ctes_and_subqueries_comprehensive() {
         WHERE aa.tier = $5 AND tm.total_score > $6;
     "#;
 
-    let a1 = analyze_query(sql1, &catalog, Some("ChainedCteQuery")).expect("Chained CTE should analyze");
+    let a1 =
+        analyze_query(sql1, &catalog, Some("ChainedCteQuery")).expect("Chained CTE should analyze");
     assert_eq!(a1.params.len(), 6);
     assert_eq!(a1.params[0].name, "is_active");
     assert_eq!(a1.params[0].ts_type, "boolean");
@@ -309,7 +319,8 @@ fn test_ctes_and_subqueries_comprehensive() {
             SELECT 1 FROM audit_logs l WHERE l.account_id = a.id AND l.action = $2
         ) AND a.tier = $3;
     "#;
-    let a2 = analyze_query(sql2, &catalog, Some("SubqueriesInWhere")).expect("Subqueries in where should analyze");
+    let a2 = analyze_query(sql2, &catalog, Some("SubqueriesInWhere"))
+        .expect("Subqueries in where should analyze");
     assert_eq!(a2.params.len(), 3);
     assert_eq!(a2.params[0].name, "score");
     assert_eq!(a2.params[0].ts_type, "number");
@@ -326,7 +337,8 @@ fn test_ctes_and_subqueries_comprehensive() {
         FROM accounts a
         WHERE a.balance >= $2;
     "#;
-    let a3 = analyze_query(sql3, &catalog, Some("ScalarSubqueryProjection")).expect("Scalar subquery should analyze");
+    let a3 = analyze_query(sql3, &catalog, Some("ScalarSubqueryProjection"))
+        .expect("Scalar subquery should analyze");
     assert_eq!(a3.params.len(), 2);
     assert_eq!(a3.params[0].name, "score");
     assert_eq!(a3.params[0].ts_type, "number");
@@ -349,7 +361,8 @@ fn test_having_and_limit_offset_parameterization() {
         LIMIT $5 OFFSET $6;
     "#;
 
-    let analyzed = analyze_query(sql, &catalog, Some("AggregatedMembers")).expect("Having & limit should analyze");
+    let analyzed = analyze_query(sql, &catalog, Some("AggregatedMembers"))
+        .expect("Having & limit should analyze");
     assert_eq!(analyzed.params.len(), 6);
 
     // $1 in WHERE joined_at >= $1
@@ -387,7 +400,8 @@ fn test_parameter_numbering_out_of_order_and_multi_reference() {
 
     // 1. Out of order parameters: $2 appears before $1 in SQL
     let sql1 = "SELECT * FROM accounts WHERE balance >= $2 AND name = $1;";
-    let a1 = analyze_query(sql1, &catalog, Some("OutOfOrder")).expect("Out of order should analyze");
+    let a1 =
+        analyze_query(sql1, &catalog, Some("OutOfOrder")).expect("Out of order should analyze");
     assert_eq!(a1.params.len(), 2);
     assert_eq!(a1.params[0].index, 1);
     assert_eq!(a1.params[0].name, "name");
@@ -398,7 +412,8 @@ fn test_parameter_numbering_out_of_order_and_multi_reference() {
 
     // 2. Same parameter $1 referenced multiple times in same query
     let sql2 = "SELECT * FROM accounts WHERE name = $1 OR tier::text = $1;";
-    let a2 = analyze_query(sql2, &catalog, Some("MultiRefSameParam")).expect("Multiple ref should analyze");
+    let a2 = analyze_query(sql2, &catalog, Some("MultiRefSameParam"))
+        .expect("Multiple ref should analyze");
     assert_eq!(a2.params.len(), 1, "Should deduplicate parameter 1");
     assert_eq!(a2.params[0].index, 1);
     assert_eq!(a2.params[0].name, "name");
@@ -414,7 +429,8 @@ fn test_property_name_disambiguation_under_extreme_collisions() {
         SELECT * FROM accounts
         WHERE name = $1 OR name = $2 OR name = $3 OR name = $4;
     "#;
-    let a1 = analyze_query(sql1, &catalog, Some("QuadNameCollision")).expect("Quad collision should analyze");
+    let a1 = analyze_query(sql1, &catalog, Some("QuadNameCollision"))
+        .expect("Quad collision should analyze");
     assert_eq!(a1.params.len(), 4);
     assert_eq!(a1.params[0].name, "name");
     assert_eq!(a1.params[1].name, "name2");
@@ -429,11 +445,17 @@ fn test_property_name_disambiguation_under_extreme_collisions() {
         SELECT * FROM collision_table
         WHERE id = $1 AND id2 = $2 AND id3 = $3 AND id = $4 AND id2 = $5 AND id = $6;
     "#;
-    let a2 = analyze_query(sql2, &catalog, Some("InterleavedCollisions")).expect("Interleaved should analyze");
+    let a2 = analyze_query(sql2, &catalog, Some("InterleavedCollisions"))
+        .expect("Interleaved should analyze");
     assert_eq!(a2.params.len(), 6);
     let names: Vec<String> = a2.params.iter().map(|p| p.name.clone()).collect();
     let unique_names: std::collections::HashSet<String> = names.iter().cloned().collect();
-    assert_eq!(unique_names.len(), 6, "All 6 parameter names must be globally unique: {:?}", names);
+    assert_eq!(
+        unique_names.len(),
+        6,
+        "All 6 parameter names must be globally unique: {:?}",
+        names
+    );
 
     // 3. Multi-table join column collisions: a.id vs m.id vs l.id
     let sql3 = r#"
@@ -443,7 +465,8 @@ fn test_property_name_disambiguation_under_extreme_collisions() {
         JOIN audit_logs l ON l.account_id = a.id
         WHERE a.id = $1 AND m.id = $2 AND l.id = $3;
     "#;
-    let a3 = analyze_query(sql3, &catalog, Some("MultiTableIdCollision")).expect("Multi table should analyze");
+    let a3 = analyze_query(sql3, &catalog, Some("MultiTableIdCollision"))
+        .expect("Multi table should analyze");
     assert_eq!(a3.params.len(), 3);
     assert_eq!(a3.params[0].name, "id");
     assert_eq!(a3.params[1].name, "id2");
@@ -454,7 +477,8 @@ fn test_property_name_disambiguation_under_extreme_collisions() {
         SELECT * FROM collision_table
         WHERE "user-id" = $1 OR "user-id" = $2 OR "default" = $3 OR "default" = $4;
     "#;
-    let a4 = analyze_query(sql4, &catalog, Some("SpecialCharsAndKeywords")).expect("Special chars should analyze");
+    let a4 = analyze_query(sql4, &catalog, Some("SpecialCharsAndKeywords"))
+        .expect("Special chars should analyze");
     assert_eq!(a4.params.len(), 4);
     assert_eq!(a4.params[0].name, "user-id");
     assert_eq!(a4.params[1].name, "user-id2");
@@ -462,7 +486,8 @@ fn test_property_name_disambiguation_under_extreme_collisions() {
     assert_eq!(a4.params[3].name, "default2");
 
     // Codegen must correctly quote non-identifier property keys
-    let ts_code = generate_file_ts_with_options(&[a4], &CodegenOptions::new(DriverTarget::Pg, true));
+    let ts_code =
+        generate_file_ts_with_options(&[a4], &CodegenOptions::new(DriverTarget::Pg, true));
     assert!(ts_code.contains(r#""user-id": string;"#));
     assert!(ts_code.contains(r#""user-id2": string;"#));
     assert!(ts_code.contains(r#"params["user-id"]"#));
@@ -497,7 +522,8 @@ fn test_advanced_set_operations_and_subqueries_in_dml() {
         )
         SELECT * FROM combined WHERE name LIKE $3;
     "#;
-    let a2 = analyze_query(sql2, &catalog, Some("CteUnionParams")).expect("CTE Union should analyze");
+    let a2 =
+        analyze_query(sql2, &catalog, Some("CteUnionParams")).expect("CTE Union should analyze");
     assert_eq!(a2.params.len(), 3);
     assert_eq!(a2.params[0].name, "balance");
     assert_eq!(a2.params[0].ts_type, "number");
@@ -516,7 +542,8 @@ fn test_advanced_set_operations_and_subqueries_in_dml() {
         WHERE id = $2
         RETURNING id, balance;
     "#;
-    let a3 = analyze_query(sql3, &catalog, Some("UpdateSubquerySet")).expect("Update with subquery set should analyze");
+    let a3 = analyze_query(sql3, &catalog, Some("UpdateSubquerySet"))
+        .expect("Update with subquery set should analyze");
     assert_eq!(a3.params.len(), 2);
     assert_eq!(a3.params[0].index, 1);
     assert_eq!(a3.params[0].name, "score");
@@ -531,7 +558,8 @@ fn test_advanced_set_operations_and_subqueries_in_dml() {
         WHERE id = $1
         RETURNING id, (balance * $2::numeric) AS scaled_balance;
     "#;
-    let a4 = analyze_query(sql4, &catalog, Some("DeleteReturningExpr")).expect("Delete returning expr should analyze");
+    let a4 = analyze_query(sql4, &catalog, Some("DeleteReturningExpr"))
+        .expect("Delete returning expr should analyze");
     assert_eq!(a4.params.len(), 2);
     assert_eq!(a4.params[0].name, "id");
     assert_eq!(a4.params[0].ts_type, "string");
@@ -543,7 +571,8 @@ fn test_advanced_set_operations_and_subqueries_in_dml() {
         SELECT * FROM accounts
         WHERE id IN ($1, $2, $3) AND balance BETWEEN $4 AND $5;
     "#;
-    let a5 = analyze_query(sql5, &catalog, Some("InBetweenParams")).expect("In between params should analyze");
+    let a5 = analyze_query(sql5, &catalog, Some("InBetweenParams"))
+        .expect("In between params should analyze");
     assert_eq!(a5.params.len(), 5);
     assert_eq!(a5.params[0].name, "id");
     assert_eq!(a5.params[1].name, "id2");
@@ -566,7 +595,8 @@ fn test_advanced_set_operations_and_subqueries_in_dml() {
         WHERE account_id IN (SELECT id FROM target_accounts) AND role_id = $3
         RETURNING id, notes;
     "#;
-    let a6 = analyze_query(sql6, &catalog, Some("UpdateCteTargets")).expect("Update CTE targets should analyze");
+    let a6 = analyze_query(sql6, &catalog, Some("UpdateCteTargets"))
+        .expect("Update CTE targets should analyze");
     assert_eq!(a6.params.len(), 3);
     assert_eq!(a6.params[0].name, "balance");
     assert_eq!(a6.params[0].ts_type, "number");
@@ -575,4 +605,3 @@ fn test_advanced_set_operations_and_subqueries_in_dml() {
     assert_eq!(a6.params[2].name, "role_id");
     assert_eq!(a6.params[2].ts_type, "number");
 }
-
